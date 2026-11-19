@@ -577,7 +577,19 @@ static constexpr __host__ __device__ bool mmvq_gcn_q4_multicol(ggml_type type, i
     return table_id == MMVQ_PARAMETERS_GCN && (type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_1) && ncols_dst >= 2 && ncols_dst <= 8;
 }
 
-static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool small_k = false, bool halve_iters = false) {
+// GCN at 1 column, shape 1..5 replaces the table: warps x rows per block 1x1, 1x2, 2x2, 4x1, 1x4.
+static constexpr __host__ __device__ int mmvq_gcn_1col_nwarps(int shape) {
+    return shape == 3 ? 2 : (shape == 4 ? 4 : 1);
+}
+
+static constexpr __host__ __device__ int mmvq_gcn_1col_rows(int shape) {
+    return shape == 2 || shape == 3 ? 2 : (shape == 5 ? 4 : 1);
+}
+
+static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool small_k = false, bool halve_iters = false, int shape = 0) {
+    if (table_id == MMVQ_PARAMETERS_GCN && ncols_dst == 1 && shape != 0) {
+        return mmvq_gcn_1col_nwarps(shape);
+    }
     if (table_id == MMVQ_PARAMETERS_GENERIC) {
         switch (ncols_dst) {
             case 1:
@@ -723,7 +735,10 @@ static constexpr __host__ __device__ bool mmvq_two_rows_ncols1(ggml_type type) {
     }
 }
 
-static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
+static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1, int shape = 0) {
+    if (table_id == MMVQ_PARAMETERS_GCN && ncols_dst == 1 && shape != 0) {
+        return mmvq_gcn_1col_rows(shape);
+    }
     if (mmvq_gcn_q4_multicol(type, ncols_dst, table_id)) {
         return ncols_dst <= 4 ? GCN_MMVQ_Q4_RPB : GCN_MMVQ_Q4_RPB8;
     }
@@ -752,8 +767,8 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
     return 1;
 }
 
-template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, bool aligned_b2 = false, bool planes = false, bool iq_signs = false, bool grid_lds = false, bool kvdr4 = false>
-__launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
+template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, bool aligned_b2 = false, bool planes = false, bool iq_signs = false, bool grid_lds = false, bool kvdr4 = false, int shape = 0>
+__launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters, shape)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
@@ -772,8 +787,8 @@ static __global__ void mul_mat_vec_q(
     // planes at 1..2 columns: half a block per lane, one 16-byte load
     constexpr int vdr = kvdr4 ? VDR_Q4_K_Q5_K_Q8_1_MMVQ_GCN : planes && ncols_dst <= 2 ? 4 :
         mmvq_gcn_q4_multicol(type, ncols_dst, table_id) && ncols_dst > 4 ? GCN_MMVQ_Q4_VDR8 : get_vdr_mmvq(type);
-    constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
-    constexpr int rows_per_cuda_block = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
+    constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters, shape);
+    constexpr int rows_per_cuda_block = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps, shape);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = kvdr4 ? get_vec_dot_q_cuda_gcn_kvdr4(type) : get_vec_dot_q_cuda(type, aligned_b2, iq_signs, grid_lds);
@@ -2210,9 +2225,10 @@ static __global__ void mul_mat_vec_q_moe(
 template<ggml_type type>
 static std::pair<dim3, dim3> calc_launch_params(
         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
-        const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false, const bool halve_iters = false) {
-    const int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
-    const int rpb = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
+        const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false, const bool halve_iters = false,
+        const int shape = 0) {
+    const int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters, shape);
+    const int rpb = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps, shape);
     const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
     const dim3 block_dims(warp_size, nwarps, 1);
@@ -2432,6 +2448,40 @@ static bool mul_mat_vec_q_gcn_mc_switch_ncols(const int ncols_dst, const int wav
         case 7: mul_mat_vec_q_gcn_mc_switch_wpe<type, 7, gate, false, planes>(waves_per_eu, ngroups, nwarps, p, stream); return true;
         case 8: mul_mat_vec_q_gcn_mc_switch_wpe<type, 8, gate, false, planes>(waves_per_eu, ngroups, nwarps, p, stream); return true;
         default: return false;
+    }
+}
+
+// More rows per wave keep more weight loads in flight for the K-quants, IQ types and Q8_0; below 4096 rows waves run short.
+// GGML_MMVQ_GCN_1COL_SHAPE sets one shape for all types, 0 = the table. A partial last block would read past the last row.
+static int mmvq_gcn_1col_shape(const ggml_type type, const int nrows_x) {
+    static const int env = mmvq_gcn_mc_env("GGML_MMVQ_GCN_1COL_SHAPE", -1);
+    if (nrows_x % 4 != 0) {
+        return 0;
+    }
+    if (env >= 0) {
+        return env;
+    }
+    if (nrows_x < 4096) {
+        return 0;
+    }
+    switch (type) {
+        case GGML_TYPE_Q8_0:
+            return 3;
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+            // with VDR 4 (GGML_MMVQ_GCN_KVDR4) their 1-column lanes keep the 2 warps x 1 row shape
+            return mmvq_gcn_mc_env("GGML_MMVQ_GCN_KVDR4", 1) != 0 ? 0 : 5;
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_IQ4_XS:
+            return 2;
+        default:
+            return 0;
     }
 }
 
@@ -3066,7 +3116,7 @@ void ggml_cuda_q8_0_planes_unpack(const ggml_tensor * tensor, void * dst, cudaSt
 #endif // defined(GGML_USE_HIP)
 }
 
-template<ggml_type type, int c_ncols_dst, bool small_k = false, bool halve_iters = false, bool aligned_b2 = false, bool planes = false, bool iq_signs = false, bool grid_lds = false>
+template<ggml_type type, int c_ncols_dst, bool small_k = false, bool halve_iters = false, bool aligned_b2 = false, bool planes = false, bool iq_signs = false, bool grid_lds = false, int shape = 0>
 static void mul_mat_vec_q_switch_fusion(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
@@ -3106,7 +3156,7 @@ static void mul_mat_vec_q_switch_fusion(
     if constexpr (c_ncols_dst == 1) {
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters, aligned_b2, planes, iq_signs, grid_lds>, launch_params,
+            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters, aligned_b2, planes, iq_signs, grid_lds, false, shape>, launch_params,
                  vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
@@ -3117,7 +3167,7 @@ static void mul_mat_vec_q_switch_fusion(
     GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, aligned_b2, planes, iq_signs, grid_lds>, launch_params,
+    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, aligned_b2, planes, iq_signs, grid_lds, false, shape>, launch_params,
         vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
@@ -3321,8 +3371,9 @@ static void mul_mat_vec_q_switch_ncols_dst(
             static constexpr int c_ncols_dst = 1;
 
             // Tag types keep the flags compile-time, so __launch_bounds__ matches what is launched.
-            const auto launch = [&](auto small_k_tag, auto halve_iters_tag) {
+            const auto launch = [&](auto small_k_tag, auto halve_iters_tag, auto shape_tag) {
                 constexpr bool c_small_k = decltype(small_k_tag)::value;
+                constexpr int  c_shape   = decltype(shape_tag)::value;
                 // Types the table does not promote would compile a second, identical kernel.
                 constexpr bool c_promoted =
                     calc_nwarps(type, c_ncols_dst, MMVQ_PARAMETERS_GB10, false, true) !=
@@ -3331,20 +3382,34 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 constexpr bool c_halve_iters = decltype(halve_iters_tag)::value && c_promoted;
 
                 const std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst + (fusion.shared_up != nullptr),
-                                                                              nsamples_dst, warp_size, table_id, c_small_k, c_halve_iters);
-                mul_mat_vec_q_switch_fusion<type, c_ncols_dst, c_small_k, c_halve_iters, aligned_b2, planes, iq_signs, grid_lds>(
+                                                                              nsamples_dst, warp_size, table_id, c_small_k, c_halve_iters, c_shape);
+                mul_mat_vec_q_switch_fusion<type, c_ncols_dst, c_small_k, c_halve_iters, aligned_b2, planes, iq_signs, grid_lds, c_shape>(
                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                     channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
                     stride_sample_x, stride_sample_y, stride_sample_dst, dims.first, dims.second, 0, ids_stride,
                     stream, kvdr4);
             };
 
+            using shape0 = std::integral_constant<int, 0>;
+#if defined(GGML_USE_HIP)
+            if (GGML_CUDA_CC_IS_GCN(cc) && !has_ids) {
+                using no = std::false_type;
+                switch (mmvq_gcn_1col_shape(type, nrows_x)) {
+                    case 1: launch(no{}, no{}, std::integral_constant<int, 1>{}); return;
+                    case 2: launch(no{}, no{}, std::integral_constant<int, 2>{}); return;
+                    case 3: launch(no{}, no{}, std::integral_constant<int, 3>{}); return;
+                    case 4: launch(no{}, no{}, std::integral_constant<int, 4>{}); return;
+                    case 5: launch(no{}, no{}, std::integral_constant<int, 5>{}); return;
+                    default: break;
+                }
+            }
+#endif // defined(GGML_USE_HIP)
             if (should_use_small_k(c_ncols_dst)) {
-                launch(std::true_type{},  std::false_type{});
+                launch(std::true_type{},  std::false_type{}, shape0{});
             } else if (should_halve_iters()) {
-                launch(std::false_type{}, std::true_type{});
+                launch(std::false_type{}, std::true_type{}, shape0{});
             } else {
-                launch(std::false_type{}, std::false_type{});
+                launch(std::false_type{}, std::false_type{}, shape0{});
             }
         } break;
         case 2: {
