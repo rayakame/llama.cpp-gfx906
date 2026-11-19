@@ -2082,26 +2082,33 @@ char * ggml_cuda_q8_1_cache_begin(ggml_backend_cuda_context & ctx, const ggml_cg
     return nullptr;
 #else
     const ggml_tensor * t = cgraph->nodes[node_idx];
-    if (ctx.cur_cgraph != cgraph || t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || t->ne[0] % MATRIX_ROW_PADDING != 0 ||
-            t->ne[1] > MMVQ_MAX_BATCH_SIZE || t->ne[2] != 1 || t->ne[3] != 1) {
+    if (ctx.cur_cgraph != cgraph || t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) {
         return nullptr;
     }
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
-    bool used_by_mmvq = false;
-    for (int j = node_idx + 1; j < cgraph->n_nodes && j <= node_idx + 64 && !used_by_mmvq; ++j) {
+    const ggml_tensor * src1 = nullptr;
+    for (int j = node_idx + 1; j < cgraph->n_nodes && j <= node_idx + 64 && src1 == nullptr; ++j) {
         const ggml_tensor * n = cgraph->nodes[j];
-        used_by_mmvq = n->op == GGML_OP_MUL_MAT && n->src[1] == t && ggml_is_quantized(n->src[0]->type) &&
-            ggml_cuda_should_use_mmvq(n->src[0]->type, cc, t->ne[1]);
+        if (n->op != GGML_OP_MUL_MAT || !ggml_is_quantized(n->src[0]->type)) {
+            continue;
+        }
+        // the mat-vec may read t through a reshape (the GDN output projection does)
+        const ggml_tensor * y = n->src[1];
+        if ((y == t || (y->op == GGML_OP_RESHAPE && y->src[0] == t)) && ggml_is_contiguous(y) &&
+                y->ne[0] % MATRIX_ROW_PADDING == 0 && y->ne[1] <= MMVQ_MAX_BATCH_SIZE && y->ne[2] == 1 && y->ne[3] == 1 &&
+                ggml_cuda_should_use_mmvq(n->src[0]->type, cc, y->ne[1])) {
+            src1 = y;
+        }
     }
-    if (!used_by_mmvq) {
+    if (src1 == nullptr) {
         return nullptr;
     }
-    const size_t size = t->ne[1] * (t->ne[0] / QK8_1) * sizeof(block_q8_1);
+    const size_t size = src1->ne[1] * (src1->ne[0] / QK8_1) * sizeof(block_q8_1);
     auto & c = ctx.q8_1_cache;
     c.reset();
     c.buf = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), size);
-    c.src1     = t;
-    c.data     = t->data;
+    c.src1     = src1;
+    c.data     = src1->data;
     c.node_idx = node_idx;
     c.stream   = ctx.stream();
     c.size     = size;

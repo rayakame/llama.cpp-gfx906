@@ -303,8 +303,9 @@ void ggml_cuda_op_softplus(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 }
 /* gated ops */
 
-template <float (*op)(float), typename T>
-static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1) {
+template <float (*op)(float), typename T, bool do_q8 = false>
+static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1,
+                                             block_q8_1 * q8) {
     ggml_cuda_pdl_lc();
     const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
 
@@ -318,13 +319,34 @@ static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst, 
 
     ggml_cuda_pdl_sync();
     dst[i] = ggml_cuda_cast<T>(op(ggml_cuda_cast<float>(x[j0])) * ggml_cuda_cast<float>(g[j1]));
+
+    if constexpr (do_q8) {
+        // quantize_q8_1 on dst, the same lanes and reductions
+        const float xi   = dst[i];
+        const float amax = warp_reduce_max<QK8_1>(fabsf(xi));
+        const float d    = amax / 127.0f;
+        const int8_t q   = amax == 0.0f ? 0 : roundf(xi / d);
+        const int sum    = warp_reduce_sum<QK8_1>((int) q);
+        q8[i / QK8_1].qs[i % QK8_1] = q;
+        if (i % QK8_1 == 0) {
+            q8[i / QK8_1].ds = make_half2(d, d * sum);
+        }
+    }
 }
 
 template <float (*op)(float), typename T>
-static void unary_gated_cuda(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, cudaStream_t stream) {
+static void unary_gated_cuda(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, cudaStream_t stream,
+                             block_q8_1 * q8 = nullptr) {
     const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream);
-    ggml_cuda_kernel_launch(unary_gated_op_kernel<op, T>, launch_params, x, g, dst, k, n, o0, o1);
+    if constexpr (std::is_same_v<T, float>) {
+        if (q8 != nullptr) {
+            GGML_ASSERT(k % QK8_1 == 0);
+            ggml_cuda_kernel_launch(unary_gated_op_kernel<op, T, true>, launch_params, x, g, dst, k, n, o0, o1, q8);
+            return;
+        }
+    }
+    ggml_cuda_kernel_launch(unary_gated_op_kernel<op, T>, launch_params, x, g, dst, k, n, o0, o1, (block_q8_1 *) nullptr);
 }
 
 template <float (*op)(float)>
@@ -705,7 +727,7 @@ void ggml_cuda_op_leaky_relu(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
 /* fused unary + mul */
 
 template <float (*op)(float)>
-static void ggml_cuda_op_unary_mul_impl(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node) {
+static bool ggml_cuda_op_unary_mul_impl(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node, void * q8) {
     // unary_node: UNARY op applied to unary_node->src[0]
     // mul_node:   MUL(a, b) where one of a/b is unary_node
     // Output goes to mul_node->data
@@ -739,23 +761,24 @@ static void ggml_cuda_op_unary_mul_impl(ggml_backend_cuda_context & ctx, ggml_te
                              (nv_bfloat16 *) mul_node->data, k, nc,
                              unary_stride / sizeof(nv_bfloat16), other_stride / sizeof(nv_bfloat16), stream);
     } else {
+        const bool write_q8 = q8 != nullptr && k % QK8_1 == 0 && ggml_is_contiguous(mul_node);
         unary_gated_cuda<op>((const float *) unary_src->data, (const float *) other_src->data,
                              (float *) mul_node->data, k, nc,
-                             unary_stride / sizeof(float), other_stride / sizeof(float), stream);
+                             unary_stride / sizeof(float), other_stride / sizeof(float), stream,
+                             write_q8 ? (block_q8_1 *) q8 : nullptr);
+        return write_q8;
     }
+    return false;
 }
 
-void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node) {
+bool ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node, void * q8) {
     switch (ggml_get_unary_op(unary_node)) {
         case GGML_UNARY_OP_SILU:
-            ggml_cuda_op_unary_mul_impl<op_silu>(ctx, unary_node, mul_node);
-            break;
+            return ggml_cuda_op_unary_mul_impl<op_silu>(ctx, unary_node, mul_node, q8);
         case GGML_UNARY_OP_SIGMOID:
-            ggml_cuda_op_unary_mul_impl<op_sigmoid>(ctx, unary_node, mul_node);
-            break;
+            return ggml_cuda_op_unary_mul_impl<op_sigmoid>(ctx, unary_node, mul_node, q8);
         case GGML_UNARY_OP_SOFTPLUS:
-            ggml_cuda_op_unary_mul_impl<op_softplus>(ctx, unary_node, mul_node);
-            break;
+            return ggml_cuda_op_unary_mul_impl<op_softplus>(ctx, unary_node, mul_node, q8);
         default:
             GGML_ABORT("Unsupported unary op for fused unary+mul");
     }

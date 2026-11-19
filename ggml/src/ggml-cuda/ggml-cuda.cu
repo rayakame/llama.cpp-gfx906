@@ -4960,7 +4960,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {
-        ggml_cuda_op_unary_mul(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        char * q8 = ggml_cuda_q8_1_cache_begin(*cuda_ctx, cgraph, i + 1);
+        if (!ggml_cuda_op_unary_mul(*cuda_ctx, node, cgraph->nodes[i + 1], q8) && q8 != nullptr) {
+            cuda_ctx->q8_1_cache.reset();
+        }
         return 1;
     }
 
