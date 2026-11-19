@@ -635,9 +635,10 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llm_graph_params & params)
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w && "QWEN35 MTP: missing LM head (nextn.shared_head_head or model.output)");
 
+    // Qwen's vocabulary holds Latin script and code first; CJK and other scripts start at 95724
     static const int64_t head_rows = [] {
         const char * env = getenv("LLAMA_MTP_HEAD_ROWS");
-        return env ? (int64_t) atoll(env) : (int64_t) 0;
+        return env ? (int64_t) atoll(env) : (int64_t) 100256;
     }();
 
     const int64_t n_head_rows = head_w->ne[1];
