@@ -458,6 +458,18 @@ static __device__ __forceinline__ const block_t * ggml_cuda_mmq_x_row(
     }
 }
 
+// Lanes of a wave along J in the dp4a layout. 1: each lane owns one row and all J/nwarps columns of its wave, so with
+// wave64 and I == 64 every lane reads the same y values and the gfx906 inner loop is bound by LDS bandwidth.
+static constexpr __device__ int ggml_cuda_mmq_dp4a_lanes_j(ggml_type type, int J, bool fallback, ggml_prec prec_src1) {
+#if defined(__gfx906__)
+    const int cols_per_warp = J / (ggml_cuda_mmq_get_nthreads(type, J, fallback, prec_src1) / 64);
+    return type == GGML_TYPE_Q4_1 && J >= 32 && cols_per_warp % 2 == 0 ? 2 : 1;
+#else
+    GGML_UNUSED_VARS(type, J, fallback, prec_src1);
+    return 1;
+#endif // defined(__gfx906__)
+}
+
 #include "mmq-load-tiles.cuh"
 #include "mmq-vec-dot.cuh"
 
@@ -494,6 +506,45 @@ template <ggml_type type, int J, bool fallback, ggml_prec prec_src1> static __de
             } else {
                 dst[ids_dst[j]*stride + i] = sum[(j0/nwarps) * (I/warp_size) + i0/warp_size];
             }
+        }
+    }
+}
+
+// Lane (li, lj) of warp threadIdx.y holds rows li + r*LI and columns threadIdx.y + nwarps*(lj + c*LJ) in sum[c*RI + r].
+template <ggml_type type, int J, bool fallback, ggml_prec prec_src1> static __device__ __forceinline__ void ggml_cuda_mmq_write_back_dp4a_grid(
+        const float * __restrict__ sum, const int32_t * __restrict__ ids_dst, float * __restrict__ dst,
+        const float * __restrict__ y_scale, const int stride, const int i_max, const int j_sup,
+        const ggml_glu_op glu_op, const float glu_limit, const float * __restrict__ x_scale, const float * __restrict__ gate_scale) {
+    GGML_UNUSED_VARS(y_scale, glu_op, glu_limit, x_scale, gate_scale);
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback, prec_src1) / warp_size;
+    constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback, prec_src1);
+    constexpr int LJ        = ggml_cuda_mmq_dp4a_lanes_j(type, J, fallback, prec_src1);
+    constexpr int LI        = warp_size / LJ;
+    constexpr int RI        = I / LI;
+    constexpr int RJ        = J / (nwarps*LJ);
+    static_assert(RI*LI == I && RJ*nwarps*LJ == J, "bad dp4a lane grid");
+
+    const int li = threadIdx.x % LI;
+    const int lj = threadIdx.x / LI;
+
+#pragma unroll
+    for (int c = 0; c < RJ; ++c) {
+        const int j = threadIdx.y + nwarps*(lj + c*LJ);
+
+        if (j >= j_sup) {
+            return;
+        }
+
+#pragma unroll
+        for (int r = 0; r < RI; ++r) {
+            const int i = li + r*LI;
+
+            if (fallback && i > i_max) {
+                continue;
+            }
+
+            dst[ids_dst[j]*stride + i] = sum[c*RI + r];
         }
     }
 }
@@ -606,6 +657,13 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                     ggml_cuda_mmq_vec_dot_q4_0_q8_1_dp4a<type, J, fallback>,
                     ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1>);
             case GGML_TYPE_Q4_1:
+                if constexpr (ggml_cuda_mmq_dp4a_lanes_j(type, J, fallback, prec_src1) > 1) {
+                    return ggml_cuda_mmq_util_funcs(
+                        VDR_Q4_1_Q8_1_MMQ,
+                        ggml_cuda_mmq_load_tiles_q4_1<type, J, fallback>,
+                        ggml_cuda_mmq_vec_dot_q4_1_q8_1_dp4a_grid<type, J, fallback>,
+                        ggml_cuda_mmq_write_back_dp4a_grid<type, J, fallback, prec_src1>);
+                }
                 return ggml_cuda_mmq_util_funcs(
                     VDR_Q4_1_Q8_1_MMQ,
                     ggml_cuda_mmq_load_tiles_q4_1<type, J, fallback>,
