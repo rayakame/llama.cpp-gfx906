@@ -3171,6 +3171,58 @@ static void ggml_cuda_graph_launch_chunk(ggml_backend_cuda_context * cuda_ctx, g
 }
 #endif // USE_CUDA_GRAPH
 
+// ARANGE -> SCALE -> CPY (i32) -> VIEW -> SET_ROWS, with only views in between: the rollback slot order that the
+// recurrent conv-state store rebuilds in every layer. Returns the index of the SET_ROWS, or -1.
+static int ggml_cuda_match_set_rows_arange(const ggml_cgraph * cgraph, int i, set_rows_arange_idx & ar) {
+    if (i + 4 >= cgraph->n_nodes) {
+        return -1;
+    }
+    const ggml_tensor * arange = cgraph->nodes[i];
+    const ggml_tensor * scale  = cgraph->nodes[i + 1];
+    const ggml_tensor * cast   = cgraph->nodes[i + 2];
+    if (arange->op != GGML_OP_ARANGE || scale->op != GGML_OP_SCALE || cast->op != GGML_OP_CPY ||
+            scale->src[0] != arange || cast->src[0] != scale ||
+            arange->type != GGML_TYPE_F32 || scale->type != GGML_TYPE_F32 || cast->type != GGML_TYPE_I32 ||
+            !ggml_is_contiguous(scale) || !ggml_is_contiguous(cast) || ggml_nrows(arange) != 1) {
+        return -1;
+    }
+    // ggml_cast makes the CPY its own src[1]
+    const int cast_self_uses = cast->src[1] == cast ? 1 : 0;
+    if (ggml_node_get_use_count(cgraph, i) != 1 || ggml_node_get_use_count(cgraph, i + 1) != 1 ||
+            ggml_node_get_use_count(cgraph, i + 2) != 1 + cast_self_uses ||
+            ((arange->flags | scale->flags | cast->flags) & GGML_TENSOR_FLAG_OUTPUT)) {
+        return -1;
+    }
+
+    int idx_view = -1;
+    for (int j = i + 3; j < cgraph->n_nodes && j <= i + 8; ++j) {
+        const ggml_tensor * node = cgraph->nodes[j];
+        if (node->op == GGML_OP_SET_ROWS) {
+            if (idx_view < 0 || node->src[1] != cgraph->nodes[idx_view] || ggml_node_get_use_count(cgraph, idx_view) != 1 ||
+                    node->src[0]->type != GGML_TYPE_F32 || node->type != GGML_TYPE_F32 ||
+                    ggml_nrows(node->src[1]) != 1 || node->src[1]->ne[0] != node->src[0]->ne[1]) {
+                return -1;
+            }
+            ar.start  = ggml_get_op_params_f32(arange, 0);
+            ar.step   = ggml_get_op_params_f32(arange, 2);
+            ar.scale  = ggml_get_op_params_f32(scale, 0);
+            ar.bias   = ggml_get_op_params_f32(scale, 1);
+            ar.offset = node->src[1]->view_offs / ggml_element_size(cast);
+            return j;
+        }
+        if (!ggml_cuda_is_view_or_noop(node)) {
+            return -1;
+        }
+        if (node->op == GGML_OP_VIEW && node->src[0] == cast) {
+            if (idx_view >= 0 || (node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                return -1;
+            }
+            idx_view = j;
+        }
+    }
+    return -1;
+}
+
 static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
                                                 const ggml_tensor * view,
                                                 const ggml_tensor * set_rows) {
@@ -4452,6 +4504,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     return ops.size() - 1;
                 }
             }
+        }
+    }
+
+    if (node->op == GGML_OP_ARANGE) {
+        set_rows_arange_idx ar;
+        const int set_rows_idx = ggml_cuda_match_set_rows_arange(cgraph, i, ar);
+        if (set_rows_idx > 0) {
+            ggml_cuda_op_set_rows_arange(*cuda_ctx, cgraph->nodes[set_rows_idx], ar);
+            return set_rows_idx - i;
         }
     }
 

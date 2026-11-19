@@ -110,7 +110,7 @@ static void set_rows_cuda_quant(
     }
 }
 
-template <typename src_t, typename idx_t, typename dst_t>
+template <typename src_t, typename idx_t, typename dst_t, bool arange_idx = false>
 static __global__ void k_set_rows(const src_t * src0_ptr,
                                   const idx_t * src1_ptr,
                                   dst_t * dst_ptr,
@@ -132,7 +132,8 @@ static __global__ void k_set_rows(const src_t * src0_ptr,
                                   const uint3   ne01,
                                   const uint3   ne02,
                                   const uint3   ne11_fd,
-                                  const uint3   ne12_fd) {
+                                  const uint3   ne12_fd,
+                                  const set_rows_arange_idx ar) {
     const src_t * GGML_CUDA_RESTRICT src0 = src0_ptr;
     const idx_t * GGML_CUDA_RESTRICT src1 = src1_ptr;
     dst_t       * GGML_CUDA_RESTRICT dst  = dst_ptr;
@@ -162,7 +163,15 @@ static __global__ void k_set_rows(const src_t * src0_ptr,
     const int64_t i10 = i01;
 
     ggml_cuda_pdl_sync();
-    const int64_t dst_row = *(src1 + i10*s10 + i11*s11 + i12*s12);
+    int64_t dst_row;
+    if constexpr (arange_idx) {
+        // the same float ops as ARANGE, SCALE and the cast to idx_t
+        const int   e = (int) (i10 + ar.offset);
+        const float v = ar.start + ar.step * e;
+        dst_row = ggml_cuda_cast<idx_t>(ar.scale * v + ar.bias);
+    } else {
+        dst_row = *(src1 + i10*s10 + i11*s11 + i12*s12);
+    }
     ggml_cuda_pdl_lc();
 
     const src_t * src0_row = src0 + i01*s01 + i02*s02 + i03*s03;
@@ -176,7 +185,7 @@ static __global__ void k_set_rows(const src_t * src0_ptr,
     GGML_UNUSED(ne13);
 }
 
-template<typename src_t, typename idx_t, typename dst_t>
+template<typename src_t, typename idx_t, typename dst_t, bool arange_idx = false>
 static void set_rows_cuda(
         const src_t * src0_d, const idx_t * src1_d, dst_t * dst_d,
         const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
@@ -184,7 +193,7 @@ static void set_rows_cuda(
         const size_t nb01, const size_t nb02, const size_t nb03,
         const size_t nb10, const size_t nb11, const size_t nb12,
         const size_t nb1, const size_t nb2, const size_t nb3,
-        cudaStream_t stream) {
+        cudaStream_t stream, const set_rows_arange_idx ar = {}) {
 
     const int64_t ne_total = ne00 * ne01 * ne02 * ne03;
     const int num_blocks = (ne_total + CUDA_SET_ROWS_BLOCK_SIZE - 1) / CUDA_SET_ROWS_BLOCK_SIZE;
@@ -210,10 +219,10 @@ static void set_rows_cuda(
         const uint3 ne12_fd = init_fastdiv_values((uint32_t) ne12);
 
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_size, block_size, 0, stream);
-        ggml_cuda_kernel_launch(k_set_rows<src_t, idx_t, dst_t>, launch_params,
+        ggml_cuda_kernel_launch(k_set_rows<src_t, idx_t, dst_t, arange_idx>, launch_params,
             src0_d, src1_d, dst_d, ne_total, ne10, ne11, ne12, ne13, s01,
             s02, s03, s10, s11, s12, s1, s2, s3, ne00_fd, ne01_fd, ne02_fd,
-            ne11_fd, ne12_fd);
+            ne11_fd, ne12_fd, ar);
     }
 }
 
@@ -395,4 +404,22 @@ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     } else {
         GGML_ABORT("unsupported type %s", ggml_type_name(src0->type));
     }
+}
+
+void ggml_cuda_op_set_rows_arange(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const set_rows_arange_idx & ar) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_F32);
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    set_rows_cuda<float, int32_t, float, true>(
+        (const float *) src0->data, nullptr, (float *) dst->data,
+        ne00, ne01, ne02, ne03,
+        ne10, ne11, ne12, ne13,
+        nb01, nb02, nb03,
+        nb10, nb11, nb12,
+        nb1, nb2, nb3,
+        ctx.stream(), ar);
 }
