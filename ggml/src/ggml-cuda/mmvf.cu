@@ -452,6 +452,16 @@ void launch_mul_mat_vec_f_cuda(
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
 
+    // One block per row leaves wave64 GPUs nearly empty for matrices with few rows (Qwen3.8's ssm_alpha/ssm_beta:
+    // 48 rows of 5120), so long rows there get 8 to 16 warps (after JeanP00l/mi50-qwen3.8-fast).
+    if (warp_size == 64 && nrows*nchannels_dst*nsamples_or_ntokens < 2*ggml_cuda_info().devices[device].nsm) {
+        if (ncols/2 >= 2048) {
+            block_size_best = 1024;
+        } else if (ncols/2 >= 1024) {
+            block_size_best = 512;
+        }
+    }
+
     const int nbytes_shared = warp_size*sizeof(float) + (has_fusion ? warp_size*sizeof(float) : 0);
     const dim3 block_nums(nrows, nchannels_dst, nsamples_or_ntokens);
     const dim3 block_dims(block_size_best, 1, 1);
@@ -500,6 +510,18 @@ void launch_mul_mat_vec_f_cuda(
         } break;
         case  256: {
             mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, 256, is_multi_token_id>
+                (x, y, ids, fusion, dst, ncols/2, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
+                 channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream);
+        } break;
+        case 512: {
+            mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, 512, is_multi_token_id>
+                (x, y, ids, fusion, dst, ncols/2, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
+                 channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream);
+        } break;
+        case 1024: {
+            mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, 1024, is_multi_token_id>
                 (x, y, ids, fusion, dst, ncols/2, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream);
