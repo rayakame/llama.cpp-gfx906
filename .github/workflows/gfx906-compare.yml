@@ -41,6 +41,7 @@ jobs:
     needs: refs
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         include:
           - name: upstream
@@ -67,6 +68,8 @@ jobs:
         with:
           context: src
           file: ours/.devops/gfx906.Dockerfile
-          build-args: UPSTREAM_REF=${{ needs.refs.outputs[matrix.name] }}
+          build-args: |
+            UPSTREAM_REF=${{ needs.refs.outputs[matrix.name] }}
+            PREBUILT_UI=OFF
           push: true
           tags: ghcr.io/${{ github.repository }}:compare-${{ matrix.name }}-${{ needs.refs.outputs[format('{0}_tag', matrix.name)] }}
