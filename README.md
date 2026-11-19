@@ -1,3 +1,9 @@
+# llama.cpp-gfx906
+
+A fork of llama.cpp tuned for **Qwen3.8 27B on one AMD Instinct MI50** (gfx906, 32 GB, ROCm 10.1), for as many quantizations as possible. Branch `gfx906` carries the changes as single commits on top of an upstream tag; the image is `ghcr.io/rayakame/llama.cpp-gfx906`. What it changes, its switches and measurements: [docs/gfx906.md](docs/gfx906.md). Below this section is upstream's README.
+
+---
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
