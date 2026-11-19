@@ -78,7 +78,7 @@ def main():
     w = sys.stdout.write
     base, others = labels[0], labels[1:]
     cap = f"power cap fixed at {meta['cap']} W" if meta["cap"] else "power cap not fixed"
-    w(f"Measured {meta['date'][:10]}, {cap}, {meta['reps']} repetitions, both passes (A B C C B A), median.\n\n")
+    w(f"Measured {meta['date'][:10]}, {cap}, {meta['reps']} repetition{'s' if meta['reps'] != 1 else ''} per run, both passes (A B C C B A), median.\n\n")
     for i in meta["images"]:
         w(f"- `{i['label']}`: `{i['image']}` ({i['version'] or 'no version'})\n")
     w("\n### Writing with MTP, tokens/s\n\nOne user: fixed, prose and code at temperature 0. Four users: four requests at once, total.\n\n")
