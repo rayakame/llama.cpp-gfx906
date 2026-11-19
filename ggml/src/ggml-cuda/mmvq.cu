@@ -2028,6 +2028,54 @@ static void mul_mat_vec_q_switch_type(
     }
 }
 
+// Only the graph's own src1 of the node being evaluated is cached: ops that call mat-vecs on temporary tensors
+// could hand over a different tensor at the same address.
+static bool q8_1_cache_usable(const ggml_backend_cuda_context & ctx, const ggml_tensor * src1) {
+#if defined(GGML_USE_VMM)
+    // the VMM pool frees in reverse allocation order only
+    GGML_UNUSED_VARS(ctx, src1);
+    return false;
+#else
+    return ctx.cur_cgraph != nullptr && ctx.cur_node_idx >= 0 && ctx.cur_node_idx < ctx.cur_cgraph->n_nodes &&
+           ctx.cur_cgraph->nodes[ctx.cur_node_idx]->src[1] == src1;
+#endif // defined(GGML_USE_VMM)
+}
+
+static bool q8_1_cache_lookup(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const size_t size) {
+    const auto & c = ctx.q8_1_cache;
+    if (!c.buf || c.src1 != src1 || c.data != src1->data || c.size != size || c.stream != ctx.stream() ||
+            !q8_1_cache_usable(ctx, src1) || c.node_idx > ctx.cur_node_idx) {
+        return false;
+    }
+    // no node between the two mat-vecs may have written into src1
+    const char * lo = (const char *) src1->data;
+    const char * hi = lo + ggml_nbytes(src1);
+    for (int k = c.node_idx + 1; k < ctx.cur_node_idx; ++k) {
+        const ggml_tensor * t = ctx.cur_cgraph->nodes[k];
+        if (ggml_op_is_empty(t->op) || ggml_is_empty(t) || t->data == nullptr) {
+            continue;
+        }
+        const char * t_lo = (const char *) t->data;
+        const char * t_hi = t_lo + ggml_nbytes(t);
+        if (t_lo < hi && lo < t_hi) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static char * q8_1_cache_store(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const size_t size) {
+    auto & c = ctx.q8_1_cache;
+    c.reset();
+    c.buf = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), size);
+    c.src1     = src1;
+    c.data     = src1->data;
+    c.node_idx = ctx.cur_node_idx;
+    c.stream   = ctx.stream();
+    c.size     = size;
+    return c.buf->get();
+}
+
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
@@ -2125,12 +2173,21 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-    {
+    const size_t  nbytes_q8_1 = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
+    ggml_cuda_pool_alloc<char> src1_q8_1_tmp(ctx.pool());
+    char * src1_q8_1 = nullptr;
+    if (!ids && q8_1_cache_lookup(ctx, src1, nbytes_q8_1)) {
+        src1_q8_1 = ctx.q8_1_cache.buf->get();
+    } else {
+        if (!ids && q8_1_cache_usable(ctx, src1)) {
+            src1_q8_1 = q8_1_cache_store(ctx, src1, nbytes_q8_1);
+        } else {
+            src1_q8_1 = src1_q8_1_tmp.alloc(nbytes_q8_1);
+        }
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
@@ -2156,7 +2213,7 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
     mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+        src0->data, src0->type, src1_q8_1, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);

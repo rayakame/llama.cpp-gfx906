@@ -5084,6 +5084,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
+            cuda_ctx->cur_cgraph = cgraph;
+            cuda_ctx->q8_1_cache.reset();
+
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
 #ifdef USE_CUDA_GRAPH
@@ -5135,6 +5138,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                cuda_ctx->cur_node_idx = i;
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
@@ -5174,6 +5179,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     try_launch_concurrent_event(node);
                }
             }
+
+            cuda_ctx->q8_1_cache.reset();
+            cuda_ctx->cur_cgraph   = nullptr;
+            cuda_ctx->cur_node_idx = -1;
         }
 
 #ifdef USE_CUDA_GRAPH

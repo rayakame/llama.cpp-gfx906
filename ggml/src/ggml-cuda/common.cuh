@@ -1575,6 +1575,29 @@ struct ggml_backend_cuda_context {
     ggml_cuda_pool & pool() {
         return pool(device);
     }
+
+    // graph and node being evaluated, so that ops can look at the nodes before them
+    const ggml_cgraph * cur_cgraph   = nullptr;
+    int                 cur_node_idx = -1;
+
+    // q8_1 copy of the src1 of the last mat-vec, for later mat-vecs of the same graph on the same src1
+    struct q8_1_src1_cache {
+        const ggml_tensor * src1     = nullptr;
+        const void *        data     = nullptr;
+        int                 node_idx = -1;
+        cudaStream_t        stream   = nullptr;
+        size_t              size     = 0;
+        std::unique_ptr<ggml_cuda_pool_alloc<char>> buf;
+
+        void reset() {
+            buf.reset();
+            src1     = nullptr;
+            data     = nullptr;
+            node_idx = -1;
+            stream   = nullptr;
+            size     = 0;
+        }
+    } q8_1_cache;
 };
 
 struct ggml_cuda_mm_fusion_args_host {
