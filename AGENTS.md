@@ -9,6 +9,7 @@ This is a fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) wi
 - Never push to ggml-org/llama.cpp, and never open issues, PRs, comments or reviews there. `gh` defaults to this repository; keep it that way.
 - All work is on branch `gfx906`, one commit per change on top of an upstream tag. `UPSTREAM_REF` in `.devops/gfx906.Dockerfile` names the tag. `master` mirrors upstream and gets no commits.
 - Moving to a newer upstream tag is a rebase of `gfx906`. Drop commits upstream has merged; re-read the code a commit touches when it no longer applies.
+- `README.md` is this fork's own, not upstream's; keep it on a rebase.
 - Upstream's CI workflows are deleted on `gfx906`, so the fork runs only its own `gfx906-*.yml`. When a rebase brings back a changed workflow file, delete it again.
 - Commit messages say what changed, why, and what it measured on the MI50. No `Co-authored-by`, `Assisted-by` or other tool lines.
 - Every new kernel path or host behavior gets an environment variable that turns it off, named in its commit message and in `docs/gfx906.md`.
@@ -24,7 +25,7 @@ This is a fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) wi
 1. Tag `gfx906-v<x.y.z>` on `gfx906`; `gfx906-image.yml` publishes `ghcr.io/rayakame/llama.cpp-gfx906:<UPSTREAM_REF>-v<x.y.z>`.
 2. Run `gfx906 compare images` (workflow_dispatch): upstream's newest release and mx-llama.cpp's newest commit, built from the same Dockerfile, as `compare-upstream-<tag>` and `compare-mx-<commit>`.
 3. `scripts/gfx906/leaktest/leaktest.sh` on the release image passes.
-4. `scripts/gfx906/bench/bench.sh` measures the release against both compare images with the card's power cap held at 205 W and its fans at full speed (`CAP=205`); `report.py` makes the tables for the release notes and the README.
+4. `scripts/gfx906/bench/bench.sh` measures the release against both compare images with the card's power cap held at 205 W and its fans at full speed (`CAP=205`); `report.py` makes the tables. They go to `docs/benchmarks/v<x.y.z>.md`, into the results of `README.md` and into the GitHub release's notes.
 
 ## Building and testing
 
