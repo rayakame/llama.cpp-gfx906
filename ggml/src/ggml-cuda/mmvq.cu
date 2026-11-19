@@ -2076,6 +2076,39 @@ static char * q8_1_cache_store(ggml_backend_cuda_context & ctx, const ggml_tenso
     return c.buf->get();
 }
 
+char * ggml_cuda_q8_1_cache_begin(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx) {
+#if defined(GGML_USE_VMM)
+    GGML_UNUSED_VARS(ctx, cgraph, node_idx);
+    return nullptr;
+#else
+    const ggml_tensor * t = cgraph->nodes[node_idx];
+    if (ctx.cur_cgraph != cgraph || t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || t->ne[0] % MATRIX_ROW_PADDING != 0 ||
+            t->ne[1] > MMVQ_MAX_BATCH_SIZE || t->ne[2] != 1 || t->ne[3] != 1) {
+        return nullptr;
+    }
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    bool used_by_mmvq = false;
+    for (int j = node_idx + 1; j < cgraph->n_nodes && j <= node_idx + 64 && !used_by_mmvq; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        used_by_mmvq = n->op == GGML_OP_MUL_MAT && n->src[1] == t && ggml_is_quantized(n->src[0]->type) &&
+            ggml_cuda_should_use_mmvq(n->src[0]->type, cc, t->ne[1]);
+    }
+    if (!used_by_mmvq) {
+        return nullptr;
+    }
+    const size_t size = t->ne[1] * (t->ne[0] / QK8_1) * sizeof(block_q8_1);
+    auto & c = ctx.q8_1_cache;
+    c.reset();
+    c.buf = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), size);
+    c.src1     = t;
+    c.data     = t->data;
+    c.node_idx = node_idx;
+    c.stream   = ctx.stream();
+    c.size     = size;
+    return c.buf->get();
+#endif // defined(GGML_USE_VMM)
+}
+
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
