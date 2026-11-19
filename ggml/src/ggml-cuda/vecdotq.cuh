@@ -54,6 +54,31 @@ static __device__ __forceinline__ void get_ints_b2_aligned(const void * x, const
 #endif // defined(GGML_USE_HIP)
 }
 
+template <int n>
+static __device__ __forceinline__ void get_ints_b2_aligned3(const void * x, const int & i32, int * v) {
+#if defined(GGML_USE_HIP)
+    const char * p     = (const char *) x + 4*i32;
+    const bool   odd   = (uintptr_t) p & 2;
+    const int  * w     = (const int *) __builtin_assume_aligned(p - (odd ? 2 : 4), 4);
+    const uint32_t sel = odd ? 0x05040302u : 0x07060504u;
+
+    int wv[n + 1];
+#pragma unroll
+    for (int i = 0; i <= n; ++i) {
+        wv[i] = w[i];
+    }
+#pragma unroll
+    for (int i = 0; i < n; ++i) {
+        v[i] = ggml_hip_perm(wv[i + 1], wv[i], sel);
+    }
+#else
+#pragma unroll
+    for (int i = 0; i < n; ++i) {
+        v[i] = get_int_b2(x, i32 + i);
+    }
+#endif // defined(GGML_USE_HIP)
+}
+
 // q4 contains 8 indices with 4 bit each.
 // This function selects those bytes from table that are at those indices and returns them as int2.
 // The first int contains the bytes with even indices in q4, the second int contains the bytes with odd indices in q4.
@@ -950,6 +975,23 @@ static __device__ __forceinline__ float vec_dot_q8_0_q8_1_aligned(
     int u[VDR_Q8_0_Q8_1_MMVQ];
 
     get_ints_b2_aligned<VDR_Q8_0_Q8_1_MMVQ>(bq8_0->qs, iqs, v);
+#pragma unroll
+    for (int i = 0; i < VDR_Q8_0_Q8_1_MMVQ; ++i) {
+        u[i] = get_int_b4(bq8_1->qs, iqs + i);
+    }
+
+    return vec_dot_q8_0_q8_1_impl<float, VDR_Q8_0_Q8_1_MMVQ>(v, u, bq8_0->d, __low2half(bq8_1->ds));
+}
+
+static __device__ __forceinline__ float vec_dot_q8_0_q8_1_aligned3(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_q8_0 * bq8_0 = (const block_q8_0 *) vbq + kbx;
+
+    int v[VDR_Q8_0_Q8_1_MMVQ];
+    int u[VDR_Q8_0_Q8_1_MMVQ];
+
+    get_ints_b2_aligned3<VDR_Q8_0_Q8_1_MMVQ>(bq8_0->qs, iqs, v);
 #pragma unroll
     for (int i = 0; i < VDR_Q8_0_Q8_1_MMVQ; ++i) {
         u[i] = get_int_b4(bq8_1->qs, iqs + i);
