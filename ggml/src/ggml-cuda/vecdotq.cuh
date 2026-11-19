@@ -626,7 +626,12 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmq(
             sumi_sc = ggml_cuda_dp4a(v[i], u[i], sumi_sc); // SIMD dot product
         }
 
+#if defined(__gfx906__)
+        // A 32-bit integer multiply is quarter rate on GCN; the 6-bit scale and |sumi_sc| < 2^13 fit 24 bits.
+        sumi += __mul24(sumi_sc, scales[i0 / (QI8_1/2)]);
+#else
         sumi += sumi_sc * scales[i0 / (QI8_1/2)];
+#endif // defined(__gfx906__)
     }
 
     return d3*d8 * sumi;
@@ -821,7 +826,12 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmq(
             sumi_d.y = ggml_cuda_dp4a(v[2*i+5], u[2*i+5], sumi_d.y); // SIMD dot product
         }
 
+#if defined(__gfx906__)
+        // A 32-bit integer multiply is quarter rate on GCN; the 8-bit scale and |sumi_d| < 2^16 fit 24 bits.
+        sumf_d += d8[i0/4] * (__mul24(sc_reg[i0/2+0], sumi_d.x) + __mul24(sc_reg[i0/2+1], sumi_d.y));
+#else
         sumf_d += d8[i0/4] * (sc_reg[i0/2+0]*sumi_d.x + sc_reg[i0/2+1]*sumi_d.y);
+#endif // defined(__gfx906__)
     }
 
     return d6 * sumf_d;
