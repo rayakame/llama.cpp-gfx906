@@ -13810,6 +13810,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // Qwen3.8 27B decode: ffn_up/ffn_gate, ffn_down, attn_k/attn_v
+    for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q3_K,
+                             GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_Q4_1, GGML_TYPE_Q2_K,
+                             GGML_TYPE_IQ2_S, GGML_TYPE_IQ4_NL}) {
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 17408, 1,  5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,  5120, 1, 17408, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,  1024, 1,  5120, {1, 1}, {1, 1}));
+    }
+
     // Q4_K multi-column mat-vec
     for (int64_t m : {4096, 6144, 6272, 14336}) {
         for (int bs : {1, 2, 3, 4, 8}) {
