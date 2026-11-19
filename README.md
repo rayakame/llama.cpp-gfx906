@@ -13,7 +13,6 @@ Against upstream's newest release, v1.0.0, on the same card at the same 205 W, v
 - [Quantizations](#quantizations)
 - [What is changed](#what-is-changed)
 - [How changes are tested](#how-changes-are-tested)
-- [Running an MI50](#running-an-mi50)
 - [Upstream and credits](#upstream-and-credits)
 
 ## Results
@@ -99,13 +98,6 @@ Every new path has an environment variable that turns it off ([list](docs/gfx906
 - The server with MTP: one request and four at once.
 - Before a release: a real workload of document filing and tool calls with its scores compared, the [memory leak test](scripts/gfx906/leaktest/leaktest.sh), and the [release benchmark](scripts/gfx906/bench/bench.sh) against upstream and mx-llama.cpp.
 - CI compiles every kernel for gfx906 and fails when one starts spilling registers ([`gfx906-check`](.github/workflows/gfx906-check.yml)).
-
-## Running an MI50
-
-- **ROCm.** gfx906 is deprecated in current ROCm. The image builds on [mixa3607/ML-gfx906](https://github.com/mixa3607/ML-gfx906)'s ROCm 10.1 image, which still ships gfx906 kernels for rocBLAS.
-- **Cooling.** The card has no fan. It needs a server's front-to-back airflow or a duct and fan; its memory sensor usually limits first. The driver powers the host off at 113 °C, so watch junction and memory temperature both.
-- **Power and clocks.** The card's firmware allows 178 W. The card these numbers come from carries a power table with the memory at 1180 MHz instead of 1000 and a limit of up to 240 W; the benchmarks hold it at 205 W. A stock card is slower in absolute numbers; the comparison between builds holds.
-- **Memory.** 32 GB holds the Q4 files with 131k context for four requests at f16 KV; Q8_0 leaves room for about 32k.
 
 ## Upstream and credits
 
