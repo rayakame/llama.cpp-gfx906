@@ -6,7 +6,56 @@
 
 #include <cstdint>
 
-static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream, const ggml_prec prec_src1) {
+// The types with gfx906 rows in mmq-config-gcn.cuh use them unless GGML_MMQ_GCN_TILES=0 (upstream's GCN table).
+static int ggml_cuda_mmq_get_gcn_variant(const ggml_type type, const int cc) {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_MMQ_GCN_TILES");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    if (!enabled || !GGML_CUDA_CC_IS_GCN(cc)) {
+        return 0;
+    }
+    switch (type) {
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ4_XS:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+static void ggml_cuda_mul_mat_q_switch_type(
+        ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream, const ggml_prec prec_src1, const int gcn_variant) {
+    if (gcn_variant == 1) {
+        GGML_ASSERT(prec_src1 == GGML_PREC_Q8);
+        switch (args.type_x) {
+            case GGML_TYPE_Q3_K:
+                mul_mat_q_case_gcn_variant<GGML_TYPE_Q3_K, 1>(ctx, args, stream);
+                return;
+            case GGML_TYPE_Q5_K:
+                mul_mat_q_case_gcn_variant<GGML_TYPE_Q5_K, 1>(ctx, args, stream);
+                return;
+            case GGML_TYPE_Q6_K:
+                mul_mat_q_case_gcn_variant<GGML_TYPE_Q6_K, 1>(ctx, args, stream);
+                return;
+            case GGML_TYPE_IQ3_XXS:
+                mul_mat_q_case_gcn_variant<GGML_TYPE_IQ3_XXS, 1>(ctx, args, stream);
+                return;
+            case GGML_TYPE_IQ3_S:
+                mul_mat_q_case_gcn_variant<GGML_TYPE_IQ3_S, 1>(ctx, args, stream);
+                return;
+            case GGML_TYPE_IQ4_XS:
+                mul_mat_q_case_gcn_variant<GGML_TYPE_IQ4_XS, 1>(ctx, args, stream);
+                return;
+            default:
+                GGML_ABORT("fatal error");
+        }
+    }
+
     switch (args.type_x) {
         case GGML_TYPE_Q1_0:
             mul_mat_q_case<GGML_TYPE_Q1_0, GGML_PREC_Q8>(ctx, args, stream);
@@ -139,12 +188,12 @@ static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_type type, const ggml_pr
 // Tile width in ne11 (dense) / ne12 (MoE) direction with the fewest tiles that fits into shared memory, 0 if there is none.
 static int ggml_cuda_mmq_get_J_best(
         const ggml_type type, const int64_t ncols, const bool fallback, const int cc, const size_t smpbo, const ggml_prec prec_src1,
-        int * nthreads_best = nullptr) {
+        int * nthreads_best = nullptr, const int gcn_variant = 0) {
     int J_best        = 0;
     int ntiles_J_best = INT_MAX;
 
     for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
-        const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc, prec_src1);
+        const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc, prec_src1, gcn_variant);
         if (config.type == GGML_TYPE_COUNT) {
             continue;
         }
@@ -234,7 +283,8 @@ void ggml_cuda_mul_mat_q(
     const int64_t s03 = src0->nb[3] / ts_src0;
     const int64_t s3  =  dst->nb[3] / ts_dst;
 
-    const bool fallback = ggml_cuda_mmq_needs_fallback(ne01);
+    const bool fallback    = ggml_cuda_mmq_needs_fallback(ne01);
+    const int  gcn_variant = ggml_cuda_mmq_get_gcn_variant(src0->type, cc);
 
     // With fusion dst is the GLU output, not a MUL_MAT; the src1 precision requested by both fused MUL_MATs is in the fusion args.
     const ggml_prec prec_src1 = ggml_cuda_mmq_get_prec_src1(src0->type, gate ? fusion->prec_src1 : ggml_prec_get_src(dst, 1), cc);
@@ -255,7 +305,7 @@ void ggml_cuda_mul_mat_q(
             ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
         }
 
-        J_best = ggml_cuda_mmq_get_J_best(src0->type, ncols_opt, fallback, cc, smpbo, prec_src1, &nthreads_best);
+        J_best = ggml_cuda_mmq_get_J_best(src0->type, ncols_opt, fallback, cc, smpbo, prec_src1, &nthreads_best, gcn_variant);
     }
     GGML_ASSERT(J_best > 0);
 
@@ -306,7 +356,7 @@ void ggml_cuda_mul_mat_q(
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
             ntj, J_best, fusion_device, ggml_cuda_q8_0_planes(src0)};
-        ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
+        ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1, gcn_variant);
         return;
     }
 
@@ -389,7 +439,7 @@ void ggml_cuda_mul_mat_q(
         ntj, J_best, fusion_device};
 
     GGML_ASSERT(!ggml_cuda_q8_0_planes(src0));
-    ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
+    ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1, gcn_variant);
 }
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {

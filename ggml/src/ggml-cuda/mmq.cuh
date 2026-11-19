@@ -12,6 +12,11 @@
 #define MMQ_ITER_K_FP4         512
 #define MMQ_NWARPS               8
 
+// GCN config variant of this translation unit (mmq-config-gcn.cuh): 0 is upstream's table, 1 adds the gfx906 configs.
+#ifndef GGML_MMQ_GCN_VARIANT
+#define GGML_MMQ_GCN_VARIANT 0
+#endif // GGML_MMQ_GCN_VARIANT
+
 typedef void (*ggml_cuda_mmq_load_tiles_t)(const char * __restrict__ x, const char * __restrict__ x_gate, int * x_tile,
     const int kbx0, const int i_max, const int stride);
 typedef void (*ggml_cuda_mmq_vec_dot_t)(const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00);
@@ -230,10 +235,11 @@ struct ggml_cuda_mmq_config {
 
 #undef CASE
 
-static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type type, const int J, const bool fallback, const int cc, const ggml_prec prec_src1) {
+static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(
+        const ggml_type type, const int J, const bool fallback, const int cc, const ggml_prec prec_src1, const int gcn_variant = GGML_MMQ_GCN_VARIANT) {
     if (GGML_CUDA_CC_IS_AMD(cc)) {
         if (GGML_CUDA_CC_IS_GCN(cc)) {
-            return ggml_cuda_mmq_get_config_gcn(type, J, fallback);
+            return ggml_cuda_mmq_get_config_gcn(type, J, fallback, gcn_variant);
         }
         if (GGML_CUDA_CC_IS_CDNA(cc)) {
             return ggml_cuda_mmq_get_config_cdna(type, J, fallback);
@@ -1934,7 +1940,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
 }
 
 template <ggml_type type, bool fallback, ggml_prec prec_src1, bool has_fusion, bool planes, bool y_smem = false, bool unroll_k = true, bool dp4a_grid = true>
-void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
+static void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     switch (args.J_best) {
         case   8:
             launch_mul_mat_q<type,   8, fallback, prec_src1, has_fusion, planes, y_smem, unroll_k, dp4a_grid>(ctx, args, stream);
@@ -2069,8 +2075,9 @@ extern DECL_MMQ_CASE_Y_SMEM(GGML_TYPE_Q5_K);
 extern DECL_MMQ_CASE_Y_SMEM(GGML_TYPE_Q6_K);
 #endif // defined(GGML_USE_HIP)
 
-template <ggml_type type, ggml_prec prec_src1, bool planes = false>
-void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
+// The body of mul_mat_q_case; static, so that each GCN config variant translation unit has its own.
+template <ggml_type type, ggml_prec prec_src1, bool planes>
+static void mul_mat_q_case_impl(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
 #if defined(GGML_USE_HIP)
     if constexpr (prec_src1 == GGML_PREC_Q8 && !planes && ggml_cuda_mmq_y_smem_supported(type)) {
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -2101,6 +2108,21 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
     }
     mul_mat_q_switch_fallback<type, prec_src1, planes, true, true>(ctx, args, stream);
 }
+
+template <ggml_type type, ggml_prec prec_src1, bool planes = false>
+void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
+    mul_mat_q_case_impl<type, prec_src1, planes>(ctx, args, stream);
+}
+
+// Entry of a translation unit built with GGML_MMQ_GCN_VARIANT == gcn_variant; the host code it reaches has internal linkage.
+template <ggml_type type, int gcn_variant>
+void mul_mat_q_case_gcn_variant(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
+    static_assert(gcn_variant == GGML_MMQ_GCN_VARIANT, "a GCN config variant needs its own translation unit");
+    mul_mat_q_case_impl<type, GGML_PREC_Q8, false>(ctx, args, stream);
+}
+
+#define DECL_MMQ_CASE_GCN_VARIANT(type, gcn_variant)                               \
+    template void mul_mat_q_case_gcn_variant<type, gcn_variant>(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) \
 
 #define DECL_MMQ_CASE(type)                                                        \
     template void mul_mat_q_case<type, GGML_PREC_Q8>(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) \
@@ -2141,6 +2163,13 @@ extern DECL_MMQ_CASE(GGML_TYPE_MXFP4);
 extern DECL_MMQ_CASE(GGML_TYPE_NVFP4);
 extern DECL_MMQ_CASE_W4A4(GGML_TYPE_MXFP4);
 extern DECL_MMQ_CASE_W4A4(GGML_TYPE_NVFP4);
+// -----------------------------------------
+extern DECL_MMQ_CASE_GCN_VARIANT(GGML_TYPE_Q3_K,    1);
+extern DECL_MMQ_CASE_GCN_VARIANT(GGML_TYPE_Q5_K,    1);
+extern DECL_MMQ_CASE_GCN_VARIANT(GGML_TYPE_Q6_K,    1);
+extern DECL_MMQ_CASE_GCN_VARIANT(GGML_TYPE_IQ3_XXS, 1);
+extern DECL_MMQ_CASE_GCN_VARIANT(GGML_TYPE_IQ3_S,   1);
+extern DECL_MMQ_CASE_GCN_VARIANT(GGML_TYPE_IQ4_XS,  1);
 
 // -------------------------------------------------------------------------------------------------------------------------
 
