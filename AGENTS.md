@@ -9,6 +9,7 @@ This is a fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) wi
 - Never push to ggml-org/llama.cpp, and never open issues, PRs, comments or reviews there. `gh` defaults to this repository; keep it that way.
 - All work is on branch `gfx906`, one commit per change on top of an upstream tag. `UPSTREAM_REF` in `.devops/gfx906.Dockerfile` names the tag. `master` mirrors upstream and gets no commits.
 - Moving to a newer upstream tag is a rebase of `gfx906`. Drop commits upstream has merged; re-read the code a commit touches when it no longer applies.
+- Upstream's CI workflows are deleted on `gfx906`, so the fork runs only `gfx906-image.yml`. When a rebase brings back a changed workflow file, delete it again.
 - Commit messages say what changed, why, and what it measured on the MI50. No `Co-authored-by`, `Assisted-by` or other tool lines.
 - Every new kernel path or host behavior gets an environment variable that turns it off, named in its commit message and in `docs/gfx906.md`.
 - A change lands only when all of these hold:
