@@ -634,7 +634,38 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llm_graph_params & params)
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w && "QWEN35 MTP: missing LM head (nextn.shared_head_head or model.output)");
-    cur = build_lora_mm(head_w, cur, head_s);
+
+    static const int64_t head_rows = [] {
+        const char * env = getenv("LLAMA_MTP_HEAD_ROWS");
+        return env ? (int64_t) atoll(env) : (int64_t) 0;
+    }();
+
+    const int64_t n_head_rows = head_w->ne[1];
+    // the control tokens (end of turn, think tags) sit at the end of the vocabulary
+    int64_t i_tail = std::min<int64_t>(n_head_rows, model.vocab.n_tokens());
+    while (i_tail > 0 && !model.vocab.is_normal((llama_token) (i_tail - 1))) {
+        --i_tail;
+    }
+
+    if (head_rows > 0 && head_rows < i_tail && loras->empty()) {
+        // a draft only proposes, so its head reads the first head_rows rows and the tail; the rows between get -inf
+        ggml_tensor * x = build_hadamard_input(head_w, cur);
+
+        ggml_tensor * w_lo = ggml_view_2d(ctx0, head_w, head_w->ne[0], head_rows, head_w->nb[1], 0);
+        cur = ggml_mul_mat(ctx0, w_lo, x);
+        cur = ggml_concat(ctx0, cur, ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, i_tail - head_rows, x->ne[1]), -INFINITY), 0);
+
+        if (i_tail < n_head_rows) {
+            ggml_tensor * w_hi = ggml_view_2d(ctx0, head_w, head_w->ne[0], n_head_rows - i_tail, head_w->nb[1], i_tail * head_w->nb[1]);
+            cur = ggml_concat(ctx0, cur, ggml_mul_mat(ctx0, w_hi, x), 0);
+        }
+
+        if (head_s) {
+            cur = ggml_mul(ctx0, cur, head_s);
+        }
+    } else {
+        cur = build_lora_mm(head_w, cur, head_s);
+    }
     cb(cur, "result_output", -1);
 
     res->t_logits = cur;
