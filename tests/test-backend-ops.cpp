@@ -4544,6 +4544,90 @@ struct test_add_unary_mul : public test_case {
     }
 };
 
+// Qwen3.5/3.8 GDN gate in the node order of qwen35.cpp build_layer_attn_linear:
+// gate = softplus(W_alpha*x + dt) * A, beta = sigmoid(W_beta*x)
+struct test_gdn_gate : public test_case {
+    const ggml_type type_w;
+    const int64_t   n_heads;
+    const int64_t   n_embd;
+    const int64_t   n_seq_tokens;
+    const int64_t   n_seqs;
+
+    ggml_tensor * gate_out = nullptr;
+    ggml_tensor * beta_out = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GDN_GATE";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR5(type_w, n_heads, n_embd, n_seq_tokens, n_seqs);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { gate_out, beta_out }; }
+
+    // quantized weights: the CPU quantizes x to q8_0, the GPU to q8_1
+    double max_nmse_err() override { return type_w == GGML_TYPE_F32 ? 1e-6 : 5e-4; }
+
+    test_gdn_gate(ggml_type type_w = GGML_TYPE_F32, int64_t n_heads = 48, int64_t n_embd = 5120, int64_t n_seq_tokens = 4, int64_t n_seqs = 1)
+        : type_w(type_w), n_heads(n_heads), n_embd(n_embd), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * cur     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_seq_tokens*n_seqs);
+        ggml_tensor * w_beta  = ggml_new_tensor_2d(ctx, type_w, n_embd, n_heads);
+        ggml_tensor * w_alpha = ggml_new_tensor_2d(ctx, type_w, n_embd, n_heads);
+        ggml_tensor * dt      = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_heads);
+        ggml_tensor * a       = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_heads);
+        ggml_set_name(cur, "cur");
+        ggml_set_name(w_beta, "w_beta");
+        ggml_set_name(w_alpha, "w_alpha");
+        ggml_set_name(dt, "dt");
+        ggml_set_name(a, "a");
+
+        ggml_tensor * beta = ggml_mul_mat(ctx, w_beta, cur);
+        beta = ggml_reshape_4d(ctx, beta, 1, n_heads, n_seq_tokens, n_seqs);
+        beta = ggml_sigmoid(ctx, beta);
+        ggml_set_name(beta, "beta");
+
+        ggml_tensor * alpha = ggml_mul_mat(ctx, w_alpha, cur);
+        alpha = ggml_reshape_3d(ctx, alpha, n_heads, n_seq_tokens, n_seqs);
+        alpha = ggml_add(ctx, alpha, dt);
+        alpha = ggml_softplus(ctx, alpha);
+        ggml_tensor * gate = ggml_mul(ctx, alpha, a);
+        gate = ggml_reshape_4d(ctx, gate, 1, n_heads, n_seq_tokens, n_seqs);
+        ggml_set_name(gate, "gate");
+
+        gate_out = gate;
+        beta_out = beta;
+
+        // gate before beta, as the GATED_DELTA_NET sources order them
+        ggml_tensor * out = ggml_add(ctx, gate, beta);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op) || t->op != GGML_OP_NONE) {
+                continue;
+            }
+            if (strcmp(t->name, "w_beta") == 0 || strcmp(t->name, "w_alpha") == 0) {
+                // keeps the projections around the sigmoid's slope and both softplus branches in use
+                init_tensor_uniform(t, -0.05f, 0.05f);
+            } else if (strcmp(t->name, "dt") == 0) {
+                init_tensor_uniform(t, -4.0f, 24.0f);
+            } else if (strcmp(t->name, "a") == 0) {
+                init_tensor_uniform(t, -2.0f, -0.1f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // SNAKE activation fusion: y = x + sin(a*x)^2 * inv_b
 // CUDA backend matches the naive 5-op chain (mul, sin, sqr, mul, add)
 // and dispatches a single fused kernel.
@@ -10534,6 +10618,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     // a unary op with no fused kernel must fall back to the three-op chain
     test_cases.emplace_back(new test_add_unary_mul(GGML_UNARY_OP_GELU, GGML_TYPE_F32, { 32, 7, 1, 1 }));
+
+    // GDN gate fusion: decode, verify of 1-4 users (n_seqs > 1 splits the tokens), the column tails of the quantized
+    // path, a head count with a row tail, a shorter K, and column counts it leaves unfused
+    for (ggml_type type_w : { GGML_TYPE_F32, GGML_TYPE_Q8_0 }) {
+        for (auto [t, sq] : std::vector<std::pair<int64_t, int64_t>>{{1, 1}, {2, 1}, {3, 1}, {4, 1}, {1, 4}, {4, 2}, {4, 3},
+                {4, 4}, {5, 3}, {8, 1}, {9, 1}, {12, 1}, {13, 1}, {16, 1}, {17, 1}, {31, 1}, {64, 1}, {512, 1}}) {
+            test_cases.emplace_back(new test_gdn_gate(type_w, 48, 5120, t, sq));
+        }
+        for (int64_t t : {1, 2, 4, 6, 9, 16}) {
+            test_cases.emplace_back(new test_gdn_gate(type_w, 47, 5120, t, 1));
+            test_cases.emplace_back(new test_gdn_gate(type_w, 32, 2048, t, 1));
+        }
+    }
 
     // SNAKE activation fusion: x + sin(a*x)^2 * inv_b
     for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16 }) {
