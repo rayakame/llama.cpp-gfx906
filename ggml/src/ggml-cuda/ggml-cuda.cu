@@ -4102,6 +4102,70 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+// Qwen3.5/3.8 GDN gate (qwen35.cpp build_layer_attn_linear): alpha = MUL_MAT, RESHAPE, ADD(ssm_dt), SOFTPLUS,
+// MUL(ssm_a), RESHAPE; beta = MUL_MAT, RESHAPE, SIGMOID; both from the same input. Six launches become one.
+static bool ggml_cuda_try_fuse_gdn_gate(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    static constexpr int n_ops = 9;
+    static const ggml_op ops[n_ops] = {
+        GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_RESHAPE,
+        GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_UNARY,
+    };
+    if (i + n_ops > cgraph->n_nodes || !cuda_ctx->stream_context().concurrent_events.empty()) {
+        return false;
+    }
+    ggml_tensor ** n = cgraph->nodes + i;
+    for (int k = 0; k < n_ops; ++k) {
+        if (n[k]->op != ops[k]) {
+            return false;
+        }
+    }
+    if (ggml_get_unary_op(n[3]) != GGML_UNARY_OP_SOFTPLUS || ggml_get_unary_op(n[8]) != GGML_UNARY_OP_SIGMOID) {
+        return false;
+    }
+    if (n[1]->src[0] != n[0] || n[2]->src[0] != n[1] || n[3]->src[0] != n[2] || n[4]->src[0] != n[3] ||
+            n[5]->src[0] != n[4] || n[7]->src[0] != n[6] || n[8]->src[0] != n[7]) {
+        return false;
+    }
+
+    const ggml_tensor * mm_a  = n[0];
+    const ggml_tensor * mm_b  = n[6];
+    const ggml_tensor * dt    = n[2]->src[1];
+    const ggml_tensor * a     = n[4]->src[1];
+    const int64_t       nrows = mm_a->ne[0];
+
+    // dt and a are per-row vectors broadcast over all columns.
+    for (const ggml_tensor * t : { dt, a }) {
+        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || t->ne[0] != nrows || ggml_nelements(t) != nrows) {
+            return false;
+        }
+    }
+    for (int k : { 2, 3, 4, 8 }) {
+        if (n[k]->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+    if (n[2]->ne[0] != nrows || !ggml_are_same_shape(n[2], n[1]) || !ggml_are_same_shape(n[4], n[2]) ||
+            !ggml_is_contiguous(n[4]) || ggml_nelements(n[4]) != ggml_nelements(mm_a) ||
+            !ggml_is_contiguous(n[8]) || ggml_nelements(n[8]) != ggml_nelements(mm_b)) {
+        return false;
+    }
+
+    const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+    if (!ggml_cuda_should_use_mmvf_tile_gate(mm_a, mm_b, cc)) {
+        return false;
+    }
+
+    const int subgraph_outputs[] = { i + 5, i + 8 };
+    const int written_outputs[]  = { i + 4, i + 8 };
+    if (!ggml_can_fuse_subgraph(cgraph, i, n_ops, ops, subgraph_outputs, 2) ||
+            !ggml_cuda_check_fusion_memory_ranges(cgraph, i, n_ops, written_outputs, 2)) {
+        return false;
+    }
+
+    ggml_cuda_mul_mat_vec_f_tile_gate(*cuda_ctx, mm_a, mm_b, dt, a, n[4], n[8]);
+    return true;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -4110,6 +4174,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (node->op == GGML_OP_MUL_MAT && ggml_cuda_try_fuse_gdn_gate(cuda_ctx, cgraph, i)) {
+        return 8;
+    }
 
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&

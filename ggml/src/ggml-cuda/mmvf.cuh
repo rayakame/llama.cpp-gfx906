@@ -16,3 +16,9 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
 bool ggml_cuda_should_use_mmvf_tile(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, int cc);
 
 void ggml_cuda_mul_mat_vec_f_tile(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+
+bool ggml_cuda_should_use_mmvf_tile_gate(const ggml_tensor * mm_a, const ggml_tensor * mm_b, int cc);
+
+// dst_a = softplus(mm_a + dt) * a, dst_b = sigmoid(mm_b), both from one launch.
+void ggml_cuda_mul_mat_vec_f_tile_gate(ggml_backend_cuda_context & ctx, const ggml_tensor * mm_a, const ggml_tensor * mm_b,
+        const ggml_tensor * dt, const ggml_tensor * a, ggml_tensor * dst_a, ggml_tensor * dst_b);

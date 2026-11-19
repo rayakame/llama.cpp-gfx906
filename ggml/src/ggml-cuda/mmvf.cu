@@ -966,9 +966,18 @@ static __device__ __forceinline__ int mmvf_tile_reduce_idx(const int lane) {
     return idx;
 }
 
-template <int R, int C, int block_size>
+// Qwen3.5/3.8 GDN gate: grid rows past the first matrix compute the second one (beta) from the same y.
+struct mmvf_tile_gate_args {
+    const float * x_b;
+    float       * dst_b;
+    const float * dt;
+    const float * a;
+    int64_t       stride_col_dst_b;
+};
+
+template <int R, int C, int block_size, bool gate = false>
 static __global__ void __launch_bounds__(block_size, 1) mul_mat_vec_f32_tile(
-        const float * __restrict__ x, const float * __restrict__ y, float * __restrict__ dst,
+        const float * __restrict__ x, const float * __restrict__ y, float * __restrict__ dst, const mmvf_tile_gate_args gargs,
         const int ncols2, const int nrows, const int ncols_dst,
         const int64_t stride_row, const int64_t stride_col_y, const int64_t stride_col_dst) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
@@ -980,8 +989,16 @@ static __global__ void __launch_bounds__(block_size, 1) mul_mat_vec_f32_tile(
     } else {
         const int tid  = threadIdx.x;
         const int lane = tid % warp_size;
-        const int row0 = blockIdx.x*R;
         const int col0 = blockIdx.y*C;
+
+        const int  nrow_blocks = (nrows + R - 1)/R;
+        const bool part_b      = gate && (int) blockIdx.x >= nrow_blocks;
+        const int  row0        = (part_b ? blockIdx.x - nrow_blocks : blockIdx.x)*R;
+        if constexpr (gate) {
+            if (part_b) {
+                x = gargs.x_b;
+            }
+        }
 
         // Tail rows and columns read the last valid one and are not written.
         const float2 * x2[R];
@@ -1047,7 +1064,17 @@ static __global__ void __launch_bounds__(block_size, 1) mul_mat_vec_f32_tile(
         const int row = row0 + idx/C;
         const int col = col0 + idx%C;
         if (row < nrows && col < ncols_dst) {
-            dst[col*stride_col_dst + row] = sum;
+            if constexpr (gate) {
+                // The expressions of op_sigmoid and op_softplus in unary.cu, so the gate matches the unfused graph.
+                if (part_b) {
+                    gargs.dst_b[col*gargs.stride_col_dst_b + row] = 1.0f / (1.0f + expf(-sum));
+                } else {
+                    const float v = sum + gargs.dt[row];
+                    dst[col*stride_col_dst + row] = ((v > 20.0f) ? v : log1pf(expf(v))) * gargs.a[row];
+                }
+            } else {
+                dst[col*stride_col_dst + row] = sum;
+            }
         }
     }
 }
@@ -1158,7 +1185,59 @@ void ggml_cuda_mul_mat_vec_f_tile(ggml_backend_cuda_context & ctx, const ggml_te
     if (cfg.rows == r_ && cfg.cols == c_ && cfg.block_size == bs_) { \
         const dim3 block_nums((nrows + r_ - 1)/r_, (ncols_dst + c_ - 1)/c_, 1); \
         mul_mat_vec_f32_tile<r_, c_, bs_><<<block_nums, bs_, 0, stream>>> \
-            (x_d, y_d, dst_d, ncols/2, nrows, ncols_dst, stride_row, stride_col_y, stride_col_dst); \
+            (x_d, y_d, dst_d, mmvf_tile_gate_args{}, ncols/2, nrows, ncols_dst, stride_row, stride_col_y, stride_col_dst); \
+        return; \
+    }
+    MMVF_TILE_CONFIGS(X)
+#undef X
+    GGML_ABORT("fatal error");
+}
+
+bool ggml_cuda_should_use_mmvf_tile_gate(const ggml_tensor * mm_a, const ggml_tensor * mm_b, int cc) {
+    // GGML_F32_GATE=0 keeps the GDN gate unfused.
+    static const bool enabled = mmvf_tile_env_int("GGML_F32_GATE", 1) != 0;
+
+    const ggml_tensor * x_a = mm_a->src[0];
+    const ggml_tensor * x_b = mm_b->src[0];
+    return enabled && ggml_nrows(mm_a->src[1]) <= mmvf_tile_max_ncols() && mm_a->src[1] == mm_b->src[1] &&
+        mmvf_tile_supported(x_a, mm_a->src[1], mm_a, cc) && mmvf_tile_supported(x_b, mm_b->src[1], mm_b, cc) &&
+        x_a->ne[0] == x_b->ne[0] && x_a->ne[1] == x_b->ne[1] && x_a->nb[1] == x_b->nb[1];
+}
+
+void ggml_cuda_mul_mat_vec_f_tile_gate(ggml_backend_cuda_context & ctx, const ggml_tensor * mm_a, const ggml_tensor * mm_b,
+        const ggml_tensor * dt, const ggml_tensor * a, ggml_tensor * dst_a, ggml_tensor * dst_b) {
+    const ggml_tensor * x_a = mm_a->src[0];
+    const ggml_tensor * y   = mm_a->src[1];
+
+    const int64_t ncols     = x_a->ne[0];
+    const int64_t nrows     = x_a->ne[1];
+    const int64_t ncols_dst = ggml_nrows(y);
+
+    GGML_ASSERT(ggml_is_contiguous(dst_a) && ggml_nelements(dst_a) == nrows*ncols_dst);
+    GGML_ASSERT(ggml_is_contiguous(dst_b) && ggml_nelements(dst_b) == nrows*ncols_dst);
+
+    mmvf_tile_gate_args gargs;
+    gargs.x_b              = (const float *) mm_b->src[0]->data;
+    gargs.dst_b            = (float *) dst_b->data;
+    gargs.dt               = (const float *) dt->data;
+    gargs.a                = (const float *) a->data;
+    gargs.stride_col_dst_b = nrows;
+
+    const float * x_d   = (const float *) x_a->data;
+    const float * y_d   = (const float *) y->data;
+    float       * dst_d = (float       *) dst_a->data;
+
+    const int64_t stride_row   = x_a->nb[1] / sizeof(float);
+    const int64_t stride_col_y = y->nb[1]   / sizeof(float);
+
+    const mmvf_tile_config cfg = mmvf_tile_get_config(ncols_dst);
+    cudaStream_t stream = ctx.stream();
+
+#define X(r_, c_, bs_) \
+    if (cfg.rows == r_ && cfg.cols == c_ && cfg.block_size == bs_) { \
+        const dim3 block_nums(2*((nrows + r_ - 1)/r_), (ncols_dst + c_ - 1)/c_, 1); \
+        mul_mat_vec_f32_tile<r_, c_, bs_, true><<<block_nums, bs_, 0, stream>>> \
+            (x_d, y_d, dst_d, gargs, ncols/2, nrows, ncols_dst, stride_row, stride_col_y, nrows); \
         return; \
     }
     MMVF_TILE_CONFIGS(X)
