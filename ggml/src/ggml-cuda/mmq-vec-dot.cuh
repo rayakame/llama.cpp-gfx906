@@ -1140,6 +1140,68 @@ template <ggml_type type, int J, bool fallback, int JL = J, bool y_smem = false>
     }
 }
 
+// Same sums as ggml_cuda_mmq_vec_dot_q6_K_q8_1_dp4a in the lane grid of ggml_cuda_mmq_write_back_dp4a_grid.
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q6_K_q8_1_dp4a_grid(
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback, GGML_PREC_Q8) / warp_size;
+    constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback, GGML_PREC_Q8);
+    constexpr int LJ        = ggml_cuda_mmq_dp4a_lanes_j(type, J, fallback, GGML_PREC_Q8);
+    constexpr int LI        = warp_size / LJ;
+    constexpr int RI        = I / LI;
+    constexpr int RJ        = J / (nwarps*LJ);
+    constexpr int NV        = QR6_K*VDR_Q6_K_Q8_1_MMQ;
+    static_assert(RI*LI == I && RJ*nwarps*LJ == J, "bad dp4a lane grid");
+
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q6_K, I);
+    const int   * x_qs = (const int   *) x;
+    const float * x_df = (const float *) x_qs + txs.qs;
+    const int   * x_sc = (const int   *) x_df + txs.dm;
+    const int   * y_qs = (const int   *) y + 4;
+    const float * y_df = (const float *) y;
+
+    const int li = threadIdx.x % LI;
+    const int lj = threadIdx.x / LI;
+
+    // Unrolled, the max-ilp schedule spills (206 VGPRs at J = 64).
+#pragma unroll 1
+    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QR6_K*VDR_Q6_K_Q8_1_MMQ) {
+        const int k0 = k00 + k01;
+
+        int   v[RI][NV];
+        int   sc[RI];
+        float d6[RI];
+#pragma unroll
+        for (int r = 0; r < RI; ++r) {
+            const int i = li + r*LI;
+#pragma unroll
+            for (int l = 0; l < NV; ++l) {
+                v[r][l] = x_qs[i*(QR6_K*MMQ_TILE_NE_K + 1) + k0 + l];
+            }
+            sc[r] = x_sc[i*(MMQ_TILE_NE_K/8) + i/8 + k0/16];
+            d6[r] = x_df[i*(MMQ_TILE_NE_K/QI6_K) + i/QI6_K];
+        }
+
+#pragma unroll
+        for (int c = 0; c < RJ; ++c) {
+            const int j = threadIdx.y + nwarps*(lj + c*LJ);
+
+            int u[NV];
+#pragma unroll
+            for (int l = 0; l < NV; l += 4) {
+                ggml_cuda_memcpy_1<16>(u + l, &y_qs[j*MMQ_TILE_Y_K + k01 + l]);
+            }
+            float d8[QR6_K*VDR_Q6_K_Q8_1_MMQ/QI8_1];
+            ggml_cuda_memcpy_1<sizeof(d8)>(d8, &y_df[j*MMQ_TILE_Y_K + k01/QI8_1]);
+
+#pragma unroll
+            for (int r = 0; r < RI; ++r) {
+                sum[c*RI + r] += vec_dot_q6_K_q8_1_impl_mmq(v[r], u, (const int8_t *) &sc[r], d6[r], d8);
+            }
+        }
+    }
+}
+
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q6_K_q8_1_mma(
         const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
 #if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)

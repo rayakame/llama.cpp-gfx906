@@ -463,7 +463,7 @@ static __device__ __forceinline__ const block_t * ggml_cuda_mmq_x_row(
 static constexpr __device__ int ggml_cuda_mmq_dp4a_lanes_j(ggml_type type, int J, bool fallback, ggml_prec prec_src1) {
 #if defined(__gfx906__)
     const int cols_per_warp = J / (ggml_cuda_mmq_get_nthreads(type, J, fallback, prec_src1) / 64);
-    if (J < 32 || cols_per_warp % 2 != 0) {
+    if (cols_per_warp % 2 != 0) {
         return 1;
     }
     switch (type) {
@@ -473,7 +473,9 @@ static constexpr __device__ int ggml_cuda_mmq_dp4a_lanes_j(ggml_type type, int J
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ4_NL:
-            return 2;
+            return J >= 32 ? 2 : 1;
+        case GGML_TYPE_Q6_K:
+            return ggml_cuda_mmq_get_I(type, J, fallback, prec_src1) == 64 ? 2 : 1; // 4 rows per lane (I = 128) spill
         default:
             return 1;
     }
@@ -512,9 +514,10 @@ static __device__ __forceinline__ const int * ggml_cuda_mmq_y_smem_ptr(const int
 #endif // defined(GGML_USE_HIP)
 }
 
-// Types whose lane grid GGML_MMQ_Q8_0_GRID=0 turns off: the Q8_0-layout dot of the Qwen3.8 27B files.
+// Types whose lane grid GGML_MMQ_Q8_0_GRID=0 (the Q8_0-layout dot of the Qwen3.8 27B files) or GGML_MMQ_KQ_GRID=0 (Q6_K) turns off.
 static constexpr __host__ __device__ bool ggml_cuda_mmq_dp4a_grid_switchable(ggml_type type) {
-    return type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_IQ4_NL;
+    return type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_IQ4_NL ||
+        type == GGML_TYPE_Q6_K;
 }
 
 #include "mmq-load-tiles.cuh"
@@ -769,6 +772,13 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                     ggml_cuda_mmq_vec_dot_q5_K_q8_1_dp4a<type, J, fallback, JL, y_smem>,
                     ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1>);
             case GGML_TYPE_Q6_K:
+                if constexpr (!y_smem && use_grid) {
+                    return ggml_cuda_mmq_util_funcs(
+                        VDR_Q6_K_Q8_1_MMQ,
+                        ggml_cuda_mmq_load_tiles_q6_K<type, J, fallback, false>,
+                        ggml_cuda_mmq_vec_dot_q6_K_q8_1_dp4a_grid<type, J, fallback>,
+                        ggml_cuda_mmq_write_back_dp4a_grid<type, J, fallback, prec_src1>);
+                }
                 return ggml_cuda_mmq_util_funcs(
                     VDR_Q6_K_Q8_1_MMQ,
                     ggml_cuda_mmq_load_tiles_q6_K<type, J, fallback, false>,
@@ -1994,9 +2004,10 @@ static void mul_mat_q_switch_fallback(ggml_backend_cuda_context & ctx, const mmq
     }
 }
 
-static bool ggml_cuda_mmq_dp4a_grid_enabled() {
-    static const bool enabled = [] { const char * e = getenv("GGML_MMQ_Q8_0_GRID"); return !e || atoi(e) != 0; }();
-    return enabled;
+static bool ggml_cuda_mmq_dp4a_grid_enabled(const ggml_type type) {
+    static const bool enabled_q8_0 = [] { const char * e = getenv("GGML_MMQ_Q8_0_GRID"); return !e || atoi(e) != 0; }();
+    static const bool enabled_kq   = [] { const char * e = getenv("GGML_MMQ_KQ_GRID");   return !e || atoi(e) != 0; }();
+    return type == GGML_TYPE_Q6_K ? enabled_kq : enabled_q8_0;
 }
 
 // Types whose dp4a dot is ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a; GGML_MMQ_Q8_0_UNROLL=0 gives them the old K loop.
@@ -2064,7 +2075,7 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
 
     if constexpr (ggml_cuda_mmq_unroll_k_switchable(type) || ggml_cuda_mmq_dp4a_grid_switchable(type)) {
         const bool unroll_k  = !ggml_cuda_mmq_unroll_k_switchable(type) || ggml_cuda_mmq_unroll_k_enabled();
-        const bool dp4a_grid = !ggml_cuda_mmq_dp4a_grid_switchable(type) || ggml_cuda_mmq_dp4a_grid_enabled();
+        const bool dp4a_grid = !ggml_cuda_mmq_dp4a_grid_switchable(type) || ggml_cuda_mmq_dp4a_grid_enabled(type);
         if (!unroll_k && !dp4a_grid) {
             mul_mat_q_switch_fallback<type, prec_src1, planes, false, false>(ctx, args, stream);
             return;
