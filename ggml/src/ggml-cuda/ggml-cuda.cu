@@ -4040,7 +4040,9 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         if (other->type != unary->type) {
             return false;
         }
-        if (!ggml_is_contiguous_1(other) || !ggml_is_contiguous_1(unary->src[0]) || !ggml_are_same_shape(other, unary)) {
+        // other may also be one row broadcast over the unary result (GDN: softplus(alpha + dt) * ssm_a)
+        const bool other_bcast = other == mul->src[1] && other->ne[0] == unary->ne[0] && ggml_nrows(other) == 1;
+        if (!ggml_is_contiguous_1(other) || !ggml_is_contiguous_1(unary->src[0]) || !(ggml_are_same_shape(other, unary) || other_bcast)) {
             return false;
         }
 
