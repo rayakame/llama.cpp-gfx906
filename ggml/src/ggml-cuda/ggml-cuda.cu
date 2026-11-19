@@ -4437,8 +4437,9 @@ static bool ggml_cuda_try_fuse_gdn_gate(ggml_backend_cuda_context * cuda_ctx, gg
         return false;
     }
 
-    const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
-    if (!ggml_cuda_should_use_mmvf_tile_gate(mm_a, mm_b, cc)) {
+    const int  cc       = ggml_cuda_info().devices[cuda_ctx->device].cc;
+    const bool use_mmvf = ggml_cuda_should_use_mmvf_tile_gate(mm_a, mm_b, cc);
+    if (!use_mmvf && !ggml_cuda_should_use_mmvq_gdn_gate(mm_a, mm_b, cc)) {
         return false;
     }
 
@@ -4449,7 +4450,11 @@ static bool ggml_cuda_try_fuse_gdn_gate(ggml_backend_cuda_context * cuda_ctx, gg
         return false;
     }
 
-    ggml_cuda_mul_mat_vec_f_tile_gate(*cuda_ctx, mm_a, mm_b, dt, a, n[4], n[8]);
+    if (use_mmvf) {
+        ggml_cuda_mul_mat_vec_f_tile_gate(*cuda_ctx, mm_a, mm_b, dt, a, n[4], n[8]);
+    } else {
+        ggml_cuda_mul_mat_vec_q_gdn_gate(*cuda_ctx, mm_a, mm_b, dt, a, n[4], n[8]);
+    }
     return true;
 }
 

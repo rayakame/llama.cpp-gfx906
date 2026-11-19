@@ -26,6 +26,12 @@ void ggml_cuda_q8_0_planes_unpack(const ggml_tensor * tensor, void * dst, cudaSt
 void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
 
+bool ggml_cuda_should_use_mmvq_gdn_gate(const ggml_tensor * mm_a, const ggml_tensor * mm_b, int cc);
+
+// The Qwen3.5/3.8 GDN gate (see ggml_cuda_try_fuse_gdn_gate) with quantized alpha/beta weights in one launch.
+void ggml_cuda_mul_mat_vec_q_gdn_gate(ggml_backend_cuda_context & ctx, const ggml_tensor * mm_a, const ggml_tensor * mm_b,
+    const ggml_tensor * dt, const ggml_tensor * a, ggml_tensor * dst_a, ggml_tensor * dst_b);
+
 void ggml_cuda_op_mul_mat_vec_q(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,

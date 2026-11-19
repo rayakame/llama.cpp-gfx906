@@ -2250,7 +2250,8 @@ bool ggml_cuda_q8_0_planes_eligible(const ggml_tensor * tensor, const int device
     }
     // the KV cache is in a weights buffer too
     const size_t nlen = strlen(tensor->name);
-    return usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS && tensor->ne[2] == 1 && tensor->ne[3] == 1 &&
+    // the 48-row ssm_alpha/ssm_beta stay canonical for the fused GDN gate (ggml_cuda_should_use_mmvq_gdn_gate)
+    return usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS && tensor->ne[2] == 1 && tensor->ne[3] == 1 && tensor->ne[1] > 64 &&
         nlen > 7 && strcmp(tensor->name + nlen - 7, ".weight") == 0;
 #else
     GGML_UNUSED_VARS(tensor, device);
@@ -3100,4 +3101,237 @@ void ggml_cuda_op_mul_mat_vec_q(
         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, stream);
 
     GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_ncols, src1_padded_row_size);
+}
+
+// Qwen3.5/3.8 GDN gate with quantized ssm_alpha/ssm_beta: grid rows past the first matrix compute beta from the same y.
+// K loop and reduction are those of mul_mat_vec_q with the GCN table's nwarps, so both projections round as unfused.
+template <ggml_type type, int ncols_dst, int nwarps, int rows_per_block>
+__launch_bounds__(nwarps*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_q_gdn_gate(
+        const void * __restrict__ vx_a, const void * __restrict__ vx_b, const block_q8_1 * __restrict__ y,
+        const float * __restrict__ dt, const float * __restrict__ a, float * __restrict__ dst_a, float * __restrict__ dst_b,
+        const int ncols_x, const int nrows_x, const int ncols_y, const int stride_row_x, const int stride_col_y) {
+    constexpr int qk        = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi        = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr       = get_vdr_mmvq(type);
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+
+    const int  tid         = warp_size*threadIdx.y + threadIdx.x;
+    const int  nrow_blocks = (nrows_x + rows_per_block - 1)/rows_per_block;
+    const bool part_b      = (int) blockIdx.x >= nrow_blocks;
+    const int  row0        = (part_b ? blockIdx.x - nrow_blocks : blockIdx.x)*rows_per_block;
+    const int  col0        = blockIdx.y*ncols_dst;
+    const void * vx        = part_b ? vx_b : vx_a;
+
+    const     int blocks_per_row_x = ncols_x / qk;
+    constexpr int blocks_per_iter  = vdr * nwarps*warp_size / qi;
+
+    // Tail rows and columns read the last valid one and are not written.
+    int kbx_row[rows_per_block];
+#pragma unroll
+    for (int i = 0; i < rows_per_block; ++i) {
+        kbx_row[i] = min(row0 + i, nrows_x - 1)*stride_row_x;
+    }
+    const block_q8_1 * y_col[ncols_dst];
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+        y_col[j] = y + min(col0 + j, ncols_y - 1)*stride_col_y;
+    }
+
+    float tmp[ncols_dst][rows_per_block] = {{0.0f}};
+
+    for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kby = kbx * (qk/QK8_1);
+        const int kqs = vdr * (tid % (qi/vdr));
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+            for (int i = 0; i < rows_per_block; ++i) {
+                tmp[j][i] += vec_dot_q_cuda(vx, &y_col[j][kby], kbx_row[i] + kbx, kqs);
+            }
+        }
+    }
+
+    __shared__ float tmp_shared[nwarps-1 > 0 ? nwarps-1 : 1][ncols_dst][rows_per_block][warp_size];
+    if (threadIdx.y > 0) {
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+            for (int i = 0; i < rows_per_block; ++i) {
+                tmp_shared[threadIdx.y-1][j][i][threadIdx.x] = tmp[j][i];
+            }
+        }
+    }
+    __syncthreads();
+    if (threadIdx.y > 0) {
+        return;
+    }
+
+    // Every lane holds all sums after the reduction; lane j*rows_per_block + i takes one, so the epilogue runs once per wave.
+    static_assert(ncols_dst*rows_per_block <= warp_size, "one output per lane");
+    float sum = 0.0f;
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+        for (int i = 0; i < rows_per_block; ++i) {
+#pragma unroll
+            for (int l = 0; l < nwarps-1; ++l) {
+                tmp[j][i] += tmp_shared[l][j][i][threadIdx.x];
+            }
+            tmp[j][i] = warp_reduce_sum<warp_size>(tmp[j][i]);
+            if ((int) threadIdx.x == j*rows_per_block + i) {
+                sum = tmp[j][i];
+            }
+        }
+    }
+
+    const int row = row0 + threadIdx.x % rows_per_block;
+    const int col = col0 + threadIdx.x / rows_per_block;
+    if ((int) threadIdx.x >= ncols_dst*rows_per_block || row >= nrows_x || col >= ncols_y) {
+        return;
+    }
+    // The expressions of op_sigmoid and op_softplus in unary.cu, so the gate matches the unfused graph.
+    if (part_b) {
+        dst_b[col*nrows_x + row] = 1.0f / (1.0f + expf(-sum));
+    } else {
+        const float v = sum + dt[row];
+        dst_a[col*nrows_x + row] = ((v > 20.0f) ? v : log1pf(expf(v))) * a[row];
+    }
+}
+
+struct mmvq_gdn_gate_args {
+    const void       * x_a;
+    const void       * x_b;
+    const block_q8_1 * y;
+    const float      * dt;
+    const float      * a;
+    float            * dst_a;
+    float            * dst_b;
+    int                ncols_x;
+    int                nrows_x;
+    int                ncols_y;
+    int                stride_row_x;
+    int                stride_col_y;
+};
+
+template <ggml_type type, int ncols_dst, int nwarps>
+static void mul_mat_vec_q_gdn_gate_launch(const mmvq_gdn_gate_args & p, const int rows_per_block, const int warp_size, cudaStream_t stream) {
+    const dim3 block_dims(warp_size, nwarps, 1);
+    const int  nblocks_y = (p.ncols_y + ncols_dst - 1)/ncols_dst;
+
+#define LAUNCH(rpb_) \
+    mul_mat_vec_q_gdn_gate<type, ncols_dst, nwarps, rpb_><<<dim3(2*((p.nrows_x + rpb_ - 1)/rpb_), nblocks_y, 1), block_dims, 0, stream>>> \
+        (p.x_a, p.x_b, p.y, p.dt, p.a, p.dst_a, p.dst_b, p.ncols_x, p.nrows_x, p.ncols_y, p.stride_row_x, p.stride_col_y)
+    switch (rows_per_block) {
+        case 1: LAUNCH(1); break;
+        case 2: LAUNCH(2); break;
+        case 4: LAUNCH(4); break;
+        default: GGML_ABORT("fatal error");
+    }
+#undef LAUNCH
+}
+
+static int mmvq_gdn_gate_env_int(const char * name, const int def) {
+    const char * e = getenv(name);
+    return e ? atoi(e) : def;
+}
+
+static int64_t mmvq_gdn_gate_max_ncols() {
+    // GGML_Q8_GATE_MAXN bounds the column counts taken; 9+ columns otherwise run two MMQ calls with a 128-row tile.
+    static const int64_t max_n = std::min(mmvq_gdn_gate_env_int("GGML_Q8_GATE_MAXN", 16), 2*MMVQ_MAX_BATCH_SIZE);
+    return max_n;
+}
+
+bool ggml_cuda_should_use_mmvq_gdn_gate(const ggml_tensor * mm_a, const ggml_tensor * mm_b, int cc) {
+    // GGML_Q8_GATE=0 keeps the GDN gate unfused for Q8_0 projections.
+    static const bool enabled = mmvq_gdn_gate_env_int("GGML_Q8_GATE", 1) != 0;
+
+    const ggml_tensor * x_a = mm_a->src[0];
+    const ggml_tensor * x_b = mm_b->src[0];
+    const ggml_tensor * y   = mm_a->src[1];
+
+    if (!enabled || !GGML_CUDA_CC_IS_GCN(cc) || y != mm_b->src[1]) {
+        return false;
+    }
+    if (x_a->type != GGML_TYPE_Q8_0 || x_b->type != GGML_TYPE_Q8_0 || y->type != GGML_TYPE_F32) {
+        return false;
+    }
+    // the kernel reads the canonical Q8_0 layout
+    if (ggml_cuda_q8_0_planes(x_a) || ggml_cuda_q8_0_planes(x_b)) {
+        return false;
+    }
+    if (!ggml_are_same_shape(x_a, x_b) || x_a->nb[1] != x_b->nb[1] || !ggml_is_contiguous(x_a) || !ggml_is_contiguous(x_b) ||
+            x_a->ne[2] != 1 || x_a->ne[3] != 1 || x_a->ne[1] > 1024) {
+        return false;
+    }
+    if (!ggml_is_contiguous(y) || y->ne[0] != x_a->ne[0] || y->ne[0] % MATRIX_ROW_PADDING != 0) {
+        return false;
+    }
+    const int64_t n = ggml_nrows(y);
+    return n >= 1 && n <= mmvq_gdn_gate_max_ncols() && ggml_nrows(mm_a) == n && ggml_nrows(mm_b) == n;
+}
+
+void ggml_cuda_mul_mat_vec_q_gdn_gate(ggml_backend_cuda_context & ctx, const ggml_tensor * mm_a, const ggml_tensor * mm_b,
+        const ggml_tensor * dt, const ggml_tensor * a, ggml_tensor * dst_a, ggml_tensor * dst_b) {
+    const ggml_tensor * x_a = mm_a->src[0];
+    const ggml_tensor * y   = mm_a->src[1];
+
+    const int64_t ncols_x = x_a->ne[0];
+    const int64_t nrows_x = x_a->ne[1];
+    const int64_t ncols_y = ggml_nrows(y);
+
+    GGML_ASSERT(ggml_is_contiguous(dst_a) && ggml_nelements(dst_a) == nrows_x*ncols_y);
+    GGML_ASSERT(ggml_is_contiguous(dst_b) && ggml_nelements(dst_b) == nrows_x*ncols_y);
+
+    cudaStream_t stream = ctx.stream();
+
+    // the q8_1 copy the qkv mat-vec or the rms_norm before it left, as ggml_cuda_mul_mat_vec_q finds it
+    const size_t nbytes_q8_1 = ncols_y*ncols_x*sizeof(block_q8_1)/QK8_1;
+    ggml_cuda_pool_alloc<char> y_q8_1_tmp(ctx.pool());
+    char * y_q8_1 = nullptr;
+    if (q8_1_cache_lookup(ctx, y, nbytes_q8_1)) {
+        y_q8_1 = ctx.q8_1_cache.buf->get();
+    } else {
+        y_q8_1 = q8_1_cache_usable(ctx, y) ? q8_1_cache_store(ctx, y, nbytes_q8_1) : y_q8_1_tmp.alloc(nbytes_q8_1);
+        quantize_row_q8_1_cuda((const float *) y->data, nullptr, y_q8_1, x_a->type, ncols_x, ncols_x, ncols_x*ncols_y,
+            ncols_x*ncols_y, ncols_x, ncols_y, 1, 1, stream);
+    }
+
+    mmvq_gdn_gate_args p;
+    p.x_a          = x_a->data;
+    p.x_b          = mm_b->src[0]->data;
+    p.y            = (const block_q8_1 *) y_q8_1;
+    p.dt           = (const float *) dt->data;
+    p.a            = (const float *) a->data;
+    p.dst_a        = (float *) dst_a->data;
+    p.dst_b        = (float *) dst_b->data;
+    p.ncols_x      = ncols_x;
+    p.nrows_x      = nrows_x;
+    p.ncols_y      = ncols_y;
+    p.stride_row_x = x_a->nb[1] / ggml_type_size(x_a->type);
+    p.stride_col_y = ncols_x / QK8_1;
+
+    // GGML_Q8_GATE_ROWS=1|2|4 sets the rows per block; mul_mat_vec_q's GCN table uses 1 at one column, else 2.
+    static const int rows_env = mmvq_gdn_gate_env_int("GGML_Q8_GATE_ROWS", 0);
+    const int rows_per_block = rows_env == 1 || rows_env == 2 || rows_env == 4 ? rows_env : (ncols_y == 1 ? 1 : 2);
+
+    const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+
+    constexpr ggml_type type = GGML_TYPE_Q8_0;
+    switch (ncols_y) {
+        case 1: mul_mat_vec_q_gdn_gate_launch<type, 1, calc_nwarps(type, 1, MMVQ_PARAMETERS_GCN)>(p, rows_per_block, warp_size, stream); break;
+        case 2: mul_mat_vec_q_gdn_gate_launch<type, 2, calc_nwarps(type, 2, MMVQ_PARAMETERS_GCN)>(p, rows_per_block, warp_size, stream); break;
+        case 3: mul_mat_vec_q_gdn_gate_launch<type, 3, calc_nwarps(type, 3, MMVQ_PARAMETERS_GCN)>(p, rows_per_block, warp_size, stream); break;
+        case 4: mul_mat_vec_q_gdn_gate_launch<type, 4, calc_nwarps(type, 4, MMVQ_PARAMETERS_GCN)>(p, rows_per_block, warp_size, stream); break;
+        case 5: mul_mat_vec_q_gdn_gate_launch<type, 5, calc_nwarps(type, 5, MMVQ_PARAMETERS_GCN)>(p, rows_per_block, warp_size, stream); break;
+        case 6: mul_mat_vec_q_gdn_gate_launch<type, 6, calc_nwarps(type, 6, MMVQ_PARAMETERS_GCN)>(p, rows_per_block, warp_size, stream); break;
+        case 7: mul_mat_vec_q_gdn_gate_launch<type, 7, calc_nwarps(type, 7, MMVQ_PARAMETERS_GCN)>(p, rows_per_block, warp_size, stream); break;
+        case 8: mul_mat_vec_q_gdn_gate_launch<type, 8, calc_nwarps(type, 8, MMVQ_PARAMETERS_GCN)>(p, rows_per_block, warp_size, stream); break;
+        default:
+            GGML_ASSERT(ncols_y <= 2*MMVQ_MAX_BATCH_SIZE);
+            mul_mat_vec_q_gdn_gate_launch<type, MMVQ_MAX_BATCH_SIZE, 2>(p, rows_per_block, warp_size, stream);
+            break;
+    }
 }
