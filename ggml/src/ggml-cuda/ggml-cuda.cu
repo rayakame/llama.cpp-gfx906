@@ -3091,6 +3091,13 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
 }
 
 static void ggml_cuda_graph_update_executable(cudaGraphExec_t & instance, cudaGraph_t cuda_graph) {
+#if defined(GGML_USE_HIP)
+    // hipGraphExecUpdate takes new kernel argument memory on every call and frees it only when the executable is
+    // destroyed, so an executable that stays in use grows without bound (ROCm/rocm-systems#10713).
+    CUDA_CHECK(cudaGraphExecDestroy(instance));
+    instance = nullptr;
+    CUDA_CHECK(cudaGraphInstantiate(&instance, cuda_graph, nullptr, nullptr, 0));
+#else
 #if CUDART_VERSION >= 12000
     cudaGraphExecUpdateResultInfo result_info;
     cudaError_t stat = cudaGraphExecUpdate(instance, cuda_graph, &result_info);
@@ -3114,6 +3121,7 @@ static void ggml_cuda_graph_update_executable(cudaGraphExec_t & instance, cudaGr
     } else {
         GGML_ASSERT(stat == cudaSuccess);
     }
+#endif // defined(GGML_USE_HIP)
 }
 
 // number of ggml nodes per CUDA graph chunk, 0 captures the whole ggml graph as one CUDA graph
