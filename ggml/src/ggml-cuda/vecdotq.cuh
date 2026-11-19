@@ -563,7 +563,12 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_mmq(
 
         const float2 ds8f = __half22float2(ds8[i]);
 
+#if defined(__gfx906__)
+        // A 32-bit integer multiply is quarter rate on GCN; the 6-bit scale and |sumi_d| < 2^17 fit 24 bits.
+        sumf_d += ds8f.x * __mul24(sc[i], sumi_d);
+#else
         sumf_d += ds8f.x * (sc[i] * sumi_d);
+#endif // defined(__gfx906__)
         sumf_m += ds8f.y *   m[i]; // sum of q8_1 block * q4_K min val
     }
 
@@ -626,7 +631,12 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_mmq(
 
         const float2 ds8f = __half22float2(ds8[i]);
 
+#if defined(__gfx906__)
+        // A 32-bit integer multiply is quarter rate on GCN; the 6-bit scale and |sumi_d| < 2^17 fit 24 bits.
+        sumf_d += ds8f.x * __mul24(sc[i], sumi_d);
+#else
         sumf_d += ds8f.x * (sc[i] * sumi_d);
+#endif // defined(__gfx906__)
         sumf_m += ds8f.y *   m[i]; // sum of q8_1 block * q4_K min val
     }
 
