@@ -3047,7 +3047,23 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 }
 
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    return cgraph->nodes[0];
+    // a rebuilt graph of another batch size keeps its first node pointer; keyed by shape too, a speculative
+    // verify that changes length and back replays its executables instead of running eager and capturing again
+    if (cgraph->n_nodes == 0) {
+        return nullptr;
+    }
+    const ggml_tensor * first = cgraph->nodes[0];
+    const ggml_tensor * last  = cgraph->nodes[cgraph->n_nodes - 1];
+    uint64_t h = (uint64_t) (uintptr_t) first;
+    auto mix = [&h](uint64_t v) {
+        h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+    };
+    mix((uint64_t) cgraph->n_nodes);
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        mix((uint64_t) first->ne[i]);
+        mix((uint64_t) last->ne[i]);
+    }
+    return (const void *) (uintptr_t) h;
 }
 
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
