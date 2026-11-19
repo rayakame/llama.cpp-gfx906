@@ -117,6 +117,10 @@ if (GGML_HIP_EXPORT_METRICS)
     set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -Rpass-analysis=kernel-resource-usage --save-temps")
 endif()
 
+# ROCm 10.1's LLVM 24 spills VGPRs in the head-256 tile kernels' inner loop (exabit-io/mx-llama.cpp@290fc642a).
+set_property(SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/../ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256.cu"
+             APPEND_STRING PROPERTY COMPILE_FLAGS " -mllvm -amdgpu-vgpr-threshold-percent=90")
+
 if (NOT GGML_CUDA_FA)
     add_compile_definitions(GGML_CUDA_NO_FA)
 endif()
