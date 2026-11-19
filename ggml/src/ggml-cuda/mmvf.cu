@@ -908,3 +908,260 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
             return false;
     }
 }
+
+// F32 x F32 with few rows (Qwen3.8's ssm_alpha/ssm_beta: 48 x 5120) and 2+ columns: on GCN, rocBLAS runs these as 2-16
+// workgroups that each walk the whole K, and mmvf pays two barriers per column. Here a block computes an R x C tile of
+// dst with K split over all its threads, so R rows share every y load, C columns share every x load and one reduction
+// serves the tile.
+
+template <int off>
+static __device__ __forceinline__ float mmvf_tile_xor(const float x) {
+#if defined(GGML_USE_HIP)
+    if constexpr (off <= 8) {
+        const int v = __float_as_int(x);
+        int r;
+        if constexpr (off == 1) {
+            r = __builtin_amdgcn_update_dpp(v, v, 0xB1, 0xF, 0xF, false); // quad_perm [1,0,3,2]
+        } else if constexpr (off == 2) {
+            r = __builtin_amdgcn_update_dpp(v, v, 0x4E, 0xF, 0xF, false); // quad_perm [2,3,0,1]
+        } else if constexpr (off == 4) {
+            r = __builtin_amdgcn_update_dpp(__builtin_amdgcn_update_dpp(v, v, 0x104, 0xF, 0x5, false), v, 0x114, 0xF, 0xA, false);
+        } else {
+            r = __builtin_amdgcn_update_dpp(__builtin_amdgcn_update_dpp(v, v, 0x108, 0xF, 0x3, false), v, 0x118, 0xF, 0xC, false);
+        }
+        return __int_as_float(r);
+    }
+#endif // defined(GGML_USE_HIP)
+    return __shfl_xor_sync(0xffffffff, x, off, ggml_cuda_get_physical_warp_size());
+}
+
+// Butterfly over m values: at each level a lane keeps half of its values and trades the other half with its partner,
+// so V values cost V-1 exchanges instead of V*log2(width).
+template <int off, int width, int m, int V>
+static __device__ __forceinline__ void mmvf_tile_warp_reduce(float (&v)[V], const int lane) {
+    if constexpr (off < width) {
+        const bool upper = (lane & off) != 0;
+        if constexpr (m > 1) {
+#pragma unroll
+            for (int k = 0; k < m/2; ++k) {
+                const float lo = v[k];
+                const float hi = v[k + m/2];
+                v[k] = (upper ? hi : lo) + mmvf_tile_xor<off>(upper ? lo : hi);
+            }
+        } else {
+            v[0] += mmvf_tile_xor<off>(v[0]);
+        }
+        mmvf_tile_warp_reduce<2*off, width, (m > 1 ? m/2 : 1), V>(v, lane);
+    }
+}
+
+// Index of the value whose warp sum lane ends up with after mmvf_tile_warp_reduce.
+template <int V>
+static __device__ __forceinline__ int mmvf_tile_reduce_idx(const int lane) {
+    int idx = 0;
+#pragma unroll
+    for (int b = 1; b < V; b *= 2) {
+        idx = 2*idx + ((lane & b) != 0);
+    }
+    return idx;
+}
+
+template <int R, int C, int block_size>
+static __global__ void __launch_bounds__(block_size, 1) mul_mat_vec_f32_tile(
+        const float * __restrict__ x, const float * __restrict__ y, float * __restrict__ dst,
+        const int ncols2, const int nrows, const int ncols_dst,
+        const int64_t stride_row, const int64_t stride_col_y, const int64_t stride_col_dst) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int V         = R*C;
+    constexpr int nwarps    = block_size/warp_size;
+
+    if constexpr (V > warp_size || block_size % warp_size != 0) {
+        NO_DEVICE_CODE;
+    } else {
+        const int tid  = threadIdx.x;
+        const int lane = tid % warp_size;
+        const int row0 = blockIdx.x*R;
+        const int col0 = blockIdx.y*C;
+
+        // Tail rows and columns read the last valid one and are not written.
+        const float2 * x2[R];
+        const float2 * y2[C];
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            x2[r] = (const float2 *) (x + min(row0 + r, nrows - 1)*stride_row);
+        }
+#pragma unroll
+        for (int c = 0; c < C; ++c) {
+            y2[c] = (const float2 *) (y + min(col0 + c, ncols_dst - 1)*stride_col_y);
+        }
+
+        float sumf[V];
+#pragma unroll
+        for (int i = 0; i < V; ++i) {
+            sumf[i] = 0.0f;
+        }
+
+        for (int col2 = tid; col2 < ncols2; col2 += block_size) {
+            float2 tmpx[R];
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                tmpx[r] = x2[r][col2];
+            }
+#pragma unroll
+            for (int c = 0; c < C; ++c) {
+                const float2 tmpy = y2[c][col2];
+#pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    ggml_cuda_mad(sumf[r*C + c], tmpx[r], tmpy);
+                }
+            }
+        }
+
+        mmvf_tile_warp_reduce<1, warp_size, V, V>(sumf, lane);
+
+        int   idx;
+        float sum;
+        if constexpr (nwarps > 1) {
+            __shared__ float buf[nwarps*V];
+            if (lane < V) {
+                buf[(tid/warp_size)*V + mmvf_tile_reduce_idx<V>(lane)] = sumf[0];
+            }
+            __syncthreads();
+            if (tid >= V) {
+                return;
+            }
+            idx = tid;
+            sum = buf[idx];
+#pragma unroll
+            for (int w = 1; w < nwarps; ++w) {
+                sum += buf[w*V + idx];
+            }
+        } else {
+            if (lane >= V) {
+                return;
+            }
+            idx = mmvf_tile_reduce_idx<V>(lane);
+            sum = sumf[0];
+        }
+
+        const int row = row0 + idx/C;
+        const int col = col0 + idx%C;
+        if (row < nrows && col < ncols_dst) {
+            dst[col*stride_col_dst + row] = sum;
+        }
+    }
+}
+
+struct mmvf_tile_config {
+    int rows;
+    int cols;
+    int block_size;
+};
+
+#define MMVF_TILE_CONFIGS(X) \
+    X(2, 1,  512) X(2, 4,  512) X(4, 8,  512) X(8, 8,  256) X(1, 8, 1024) X(2, 8, 512) \
+    X(4, 4,  512) X(4, 8,  256) X(8, 4,  512) X(2, 16, 512) X(4, 16, 256)
+
+static int mmvf_tile_env_int(const char * name, const int def) {
+    const char * e = getenv(name);
+    return e ? atoi(e) : def;
+}
+
+// GGML_F32_TILE=R,C,BS forces one of MMVF_TILE_CONFIGS for every column count.
+static mmvf_tile_config mmvf_tile_get_config(const int64_t ncols_dst) {
+    static const mmvf_tile_config forced = [] {
+        const mmvf_tile_config none = {0, 0, 0};
+        const char * e = getenv("GGML_F32_TILE");
+        mmvf_tile_config c;
+        if (!e || sscanf(e, "%d,%d,%d", &c.rows, &c.cols, &c.block_size) != 3) {
+            return none;
+        }
+#define X(r_, c_, bs_) if (c.rows == r_ && c.cols == c_ && c.block_size == bs_) { return c; }
+        MMVF_TILE_CONFIGS(X)
+#undef X
+        GGML_LOG_WARN("%s: GGML_F32_TILE=%s is not an instantiated config, ignoring it\n", __func__, e);
+        return none;
+    }();
+    if (forced.rows != 0) {
+        return forced;
+    }
+    // Fastest in the MI50 sweep (m=48, k=5120): 4x4 up to 12 columns, 4x8 up to 47, then 8x8.
+    if (ncols_dst <= 12) {
+        return {4, 4, 512};
+    }
+    if (ncols_dst <= 47) {
+        return {4, 8, 512};
+    }
+    return {8, 8, 256};
+}
+
+static int64_t mmvf_tile_max_ncols() {
+    // GGML_F32_TILE_MAXN=0 turns the tiled path off.
+    static const int64_t max_n = mmvf_tile_env_int("GGML_F32_TILE_MAXN", 65535);
+    return max_n;
+}
+
+static bool mmvf_tile_supported(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, const int cc) {
+    if (!GGML_CUDA_CC_IS_GCN(cc)) {
+        return false;
+    }
+    if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    // Few rows only: every row tile reads all of y again.
+    if (src0->ne[1] < 2 || src0->ne[1] > 128 || src0->ne[0] < 1024 || src0->ne[0] % 2 != 0 || src0->ne[0] != src1->ne[0]) {
+        return false;
+    }
+    if (src0->ne[2] != 1 || src0->ne[3] != 1 || src0->nb[0] != sizeof(float) || src0->nb[1] % (2*sizeof(float)) != 0) {
+        return false;
+    }
+    // src1 and dst columns may span dims 1-3 as long as they are evenly strided.
+    if (src1->nb[0] != sizeof(float) || src1->nb[1] % (2*sizeof(float)) != 0 ||
+            src1->nb[2] != src1->ne[1]*src1->nb[1] || src1->nb[3] != src1->ne[2]*src1->nb[2]) {
+        return false;
+    }
+    if (dst->ne[0] != src0->ne[1] || ggml_nrows(dst) != ggml_nrows(src1) ||
+            dst->nb[0] != sizeof(float) || dst->nb[2] != dst->ne[1]*dst->nb[1] || dst->nb[3] != dst->ne[2]*dst->nb[2]) {
+        return false;
+    }
+    if (ggml_nrows(src1) > 65535) {
+        return false;
+    }
+    return (uintptr_t) src0->data % (2*sizeof(float)) == 0 && (uintptr_t) src1->data % (2*sizeof(float)) == 0;
+}
+
+bool ggml_cuda_should_use_mmvf_tile(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, int cc) {
+    // GGML_F32_TILE_MINN / _MAXN bound the column counts taken here; one column stays on mmvf (5.2 vs 5.9 us).
+    static const int64_t min_n = std::max(1, mmvf_tile_env_int("GGML_F32_TILE_MINN", 2));
+
+    const int64_t n = ggml_nrows(src1);
+    return n >= min_n && n <= mmvf_tile_max_ncols() && mmvf_tile_supported(src0, src1, dst, cc);
+}
+
+void ggml_cuda_mul_mat_vec_f_tile(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    const float * x_d   = (const float *) src0->data;
+    const float * y_d   = (const float *) src1->data;
+    float       * dst_d = (float       *)  dst->data;
+
+    const int64_t ncols     = src0->ne[0];
+    const int64_t nrows     = src0->ne[1];
+    const int64_t ncols_dst = ggml_nrows(src1);
+
+    const int64_t stride_row     = src0->nb[1] / sizeof(float);
+    const int64_t stride_col_y   = src1->nb[1] / sizeof(float);
+    const int64_t stride_col_dst =  dst->nb[1] / sizeof(float);
+
+    const mmvf_tile_config cfg = mmvf_tile_get_config(ncols_dst);
+    cudaStream_t stream = ctx.stream();
+
+#define X(r_, c_, bs_) \
+    if (cfg.rows == r_ && cfg.cols == c_ && cfg.block_size == bs_) { \
+        const dim3 block_nums((nrows + r_ - 1)/r_, (ncols_dst + c_ - 1)/c_, 1); \
+        mul_mat_vec_f32_tile<r_, c_, bs_><<<block_nums, bs_, 0, stream>>> \
+            (x_d, y_d, dst_d, ncols/2, nrows, ncols_dst, stride_row, stride_col_y, stride_col_dst); \
+        return; \
+    }
+    MMVF_TILE_CONFIGS(X)
+#undef X
+    GGML_ABORT("fatal error");
+}
