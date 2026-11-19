@@ -76,7 +76,7 @@ gated_delta_net_colthread(const float * q, const float * k, const float * v, con
                           int64_t sq1, int64_t sq2, int64_t sq3, int64_t sv1, int64_t sv2, int64_t sv3,
                           int64_t sb1, int64_t sb2, int64_t sb3,
                           const uint3 neqk1_magic, const uint3 rq3_magic,
-                          float scale, int64_t state_slot_stride, int K) {
+                          float scale, int64_t state_slot_stride, int K, const int32_t * s_rows) {
     constexpr int R       = S_v / LPC;           // state rows per lane
     constexpr int B        = R / 2;               // chunked-kernel leaf pairs per lane
     constexpr int B4       = B / 4;               // leaf float4s per row half
@@ -98,7 +98,8 @@ gated_delta_net_colthread(const float * q, const float * k, const float * v, con
 
     float * attn_data = dst + (sequence * n_tokens * H + h_idx) * S_v;
     state += (sequence * H + h_idx) * S_v * S_v;
-    const float * s_in = curr_state + (int64_t) sequence * H * S_v * S_v + h_idx * S_v * S_v + (int64_t) col * S_v;
+    const int64_t seq_in = s_rows ? (int64_t) s_rows[sequence] : (int64_t) sequence;
+    const float * s_in = curr_state + seq_in * H * S_v * S_v + h_idx * S_v * S_v + (int64_t) col * S_v;
 
     __shared__ float4 sk [GDN_CT_TT][S_v / 4];
     __shared__ float4 sqs[GDN_CT_TT][S_v / 4];
@@ -287,11 +288,11 @@ template <bool keep_rs_t, int COLS, bool KDA = false>
 __global__ void __launch_bounds__(COLS * 16, 1)
 gated_delta_net_decode(const float * __restrict__ q, const float * __restrict__ k, const float * __restrict__ v,
                        const float * __restrict__ g, const float * __restrict__ beta,
-                       const float * __restrict__ curr_state, float * __restrict__ dst, float * __restrict__ state,
+                       const float * curr_state, float * __restrict__ dst, float * state,
                        int64_t H, int64_t sq1, int64_t sq2, int64_t sq3, int64_t sv1, int64_t sv2, int64_t sv3,
                        int64_t sb1, int64_t sb2, int64_t sb3,
                        const uint3 neqk1_magic, const uint3 rq3_magic,
-                       float scale, int64_t state_slot_stride, int K) {
+                       float scale, int64_t state_slot_stride, int K, const int32_t * s_rows) {
     constexpr int S_v = 128, LPC = 16, R = S_v / LPC;
     constexpr int B = R / 2, B4 = B / 4, HI4 = S_v / 8;
     const uint32_t h_idx    = blockIdx.x;
@@ -310,7 +311,8 @@ gated_delta_net_decode(const float * __restrict__ q, const float * __restrict__ 
 
     float * attn_data = dst + (sequence * H + h_idx) * S_v;
     state += (sequence * H + h_idx) * S_v * S_v;
-    const float * s_in = curr_state + (int64_t) sequence * H * S_v * S_v + h_idx * S_v * S_v + (int64_t) col * S_v;
+    const int64_t seq_in = s_rows ? (int64_t) s_rows[sequence] : (int64_t) sequence;
+    const float * s_in = curr_state + seq_in * H * S_v * S_v + h_idx * S_v * S_v + (int64_t) col * S_v;
 
     ggml_cuda_pdl_sync();
     float  s[R];
@@ -452,7 +454,7 @@ bool launch_gated_delta_net_colthread(
         int64_t sv1,   int64_t sv2, int64_t sv3,
         int64_t sb1,   int64_t sb2, int64_t sb3,
         int64_t neqk1, int64_t rq3,
-        float scale, int64_t state_slot_stride, int K, cudaStream_t stream) {
+        float scale, int64_t state_slot_stride, int K, const int32_t * s_rows, cudaStream_t stream) {
     // GGML_GDN_NO_COLTHREAD=1 keeps gated_delta_net_cuda / the chunked kernel
     static const bool no_colthread = [] { const char * e = getenv("GGML_GDN_NO_COLTHREAD"); return e && atoi(e) != 0; }();
     if (no_colthread || S_v != 128 || (sq2 % 4) != 0 ||
@@ -475,7 +477,7 @@ bool launch_gated_delta_net_colthread(
         const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(dim3(H, n_seqs, 128 / C), C * 16, 0, stream);
         ggml_cuda_kernel_launch(gated_delta_net_decode<keep_rs_t, C, KDA>, lp,
             q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, sq1, sq2, sq3, sv1, sv2, sv3,
-            sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+            sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_rows);
         return true;
     }
 
@@ -484,7 +486,7 @@ bool launch_gated_delta_net_colthread(
         const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(dim3(H, n_seqs, 128 / C), C * 16, 0, stream);
         ggml_cuda_kernel_launch(gated_delta_net_colthread<128, keep_rs_t, 16, C, KDA>, lp,
             q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-            sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+            sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_rows);
         return true;
     }
 
@@ -498,19 +500,19 @@ bool launch_gated_delta_net_colthread(
     if (lpc == 16) {
         ggml_cuda_kernel_launch(gated_delta_net_colthread<128, keep_rs_t, 16, GDN_CT_COLS, KDA>, lp,
             q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-            sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+            sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_rows);
     } else if (lpc == 8) {
         ggml_cuda_kernel_launch(gated_delta_net_colthread<128, keep_rs_t, 8, GDN_CT_COLS, KDA>, lp,
             q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-            sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+            sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_rows);
     } else if (lpc == 2) {
         ggml_cuda_kernel_launch(gated_delta_net_colthread<128, keep_rs_t, 2, GDN_CT_COLS, KDA>, lp,
             q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-            sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+            sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_rows);
     } else {
         ggml_cuda_kernel_launch(gated_delta_net_colthread<128, keep_rs_t, 4, GDN_CT_COLS, KDA>, lp,
             q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-            sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+            sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_rows);
     }
     return true;
 }
@@ -525,7 +527,7 @@ template bool launch_gated_delta_net_colthread<true, false>(
         int64_t sv1,   int64_t sv2, int64_t sv3,
         int64_t sb1,   int64_t sb2, int64_t sb3,
         int64_t neqk1, int64_t rq3,
-        float scale, int64_t state_slot_stride, int K, cudaStream_t stream);
+        float scale, int64_t state_slot_stride, int K, const int32_t * s_rows, cudaStream_t stream);
 template bool launch_gated_delta_net_colthread<false, false>(
         const float * q_d, const float * k_d, const float * v_d,
         const float * g_d, const float * b_d, const float * s_d,
@@ -535,7 +537,7 @@ template bool launch_gated_delta_net_colthread<false, false>(
         int64_t sv1,   int64_t sv2, int64_t sv3,
         int64_t sb1,   int64_t sb2, int64_t sb3,
         int64_t neqk1, int64_t rq3,
-        float scale, int64_t state_slot_stride, int K, cudaStream_t stream);
+        float scale, int64_t state_slot_stride, int K, const int32_t * s_rows, cudaStream_t stream);
 template bool launch_gated_delta_net_colthread<true, true>(
         const float * q_d, const float * k_d, const float * v_d,
         const float * g_d, const float * b_d, const float * s_d,
@@ -545,7 +547,7 @@ template bool launch_gated_delta_net_colthread<true, true>(
         int64_t sv1,   int64_t sv2, int64_t sv3,
         int64_t sb1,   int64_t sb2, int64_t sb3,
         int64_t neqk1, int64_t rq3,
-        float scale, int64_t state_slot_stride, int K, cudaStream_t stream);
+        float scale, int64_t state_slot_stride, int K, const int32_t * s_rows, cudaStream_t stream);
 template bool launch_gated_delta_net_colthread<false, true>(
         const float * q_d, const float * k_d, const float * v_d,
         const float * g_d, const float * b_d, const float * s_d,
@@ -555,4 +557,4 @@ template bool launch_gated_delta_net_colthread<false, true>(
         int64_t sv1,   int64_t sv2, int64_t sv3,
         int64_t sb1,   int64_t sb2, int64_t sb3,
         int64_t neqk1, int64_t rq3,
-        float scale, int64_t state_slot_stride, int K, cudaStream_t stream);
+        float scale, int64_t state_slot_stride, int K, const int32_t * s_rows, cudaStream_t stream);

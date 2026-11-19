@@ -3322,6 +3322,111 @@ static int ggml_cuda_try_gdn_cache_fusion(
     return skip;
 }
 
+// The state input of a single-sequence GATED_DELTA_NET is RESHAPE(VIEW(GET_ROWS(states, ids))), a 3 MB gather per
+// layer. When nothing else reads the gather and nothing writes the states before the GDN, the kernel reads the
+// row ids[0] straight from the cache and the GET_ROWS is skipped: each thread reads its state elements before it
+// writes them back, and with one sequence no other block writes them. Returns the GET_ROWS, or nullptr.
+static const ggml_tensor * ggml_cuda_gdn_state_gather(const ggml_cgraph * cgraph, int gdn_idx) {
+    const ggml_tensor * gdn = cgraph->nodes[gdn_idx];
+    if (gdn->op != GGML_OP_GATED_DELTA_NET || gdn->src[2]->ne[3] != 1) {
+        return nullptr;
+    }
+    const int64_t D = gdn->src[2]->ne[0] * gdn->src[2]->ne[0] * gdn->src[2]->ne[1];
+
+    const ggml_tensor * chain[4];
+    int n_chain = 0;
+    const ggml_tensor * gather = gdn->src[5];
+    while (gather != nullptr && (gather->op == GGML_OP_RESHAPE || gather->op == GGML_OP_VIEW) && n_chain < 4) {
+        if (gather->op == GGML_OP_VIEW && gather->view_offs != 0) {
+            return nullptr;
+        }
+        chain[n_chain++] = gather;
+        gather = gather->src[0];
+    }
+    if (gather == nullptr || gather->op != GGML_OP_GET_ROWS || (gather->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return nullptr;
+    }
+    const ggml_tensor * states = gather->src[0];
+    const ggml_tensor * ids    = gather->src[1];
+    if (gather->type != GGML_TYPE_F32 || states->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 ||
+            gather->ne[0] != D || gather->ne[1] != 1 || ggml_nrows(gather) != 1 ||
+            states->ne[0] != D || states->nb[1] != (size_t) D*sizeof(float) || ggml_nrows(ids) != 1 ||
+            states->data == nullptr || ids->data == nullptr) {
+        return nullptr;
+    }
+
+    int gather_idx = -1;
+    for (int j = gdn_idx - 1; j >= 0 && j >= gdn_idx - 256; --j) {
+        if (cgraph->nodes[j] == gather) {
+            gather_idx = j;
+            break;
+        }
+    }
+    if (gather_idx < 0) {
+        return nullptr;
+    }
+
+    // all uses of the gather and the chain lie between the gather and the GDN, other uses are empty views
+    const char * s_lo = (const char *) states->data;
+    const char * s_hi = s_lo + ggml_nbytes(states);
+    int gather_uses = 0;
+    for (int j = gather_idx + 1; j <= gdn_idx; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        bool on_chain = n == gdn;
+        for (int c = 0; c < n_chain; ++c) {
+            on_chain = on_chain || n == chain[c];
+        }
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * src = n->src[s];
+            if (src == nullptr) {
+                continue;
+            }
+            bool src_on_chain = src == gather;
+            for (int c = 0; c < n_chain; ++c) {
+                src_on_chain = src_on_chain || src == chain[c];
+            }
+            if (src == gather) {
+                gather_uses++;
+            }
+            if (src_on_chain && !on_chain && !ggml_is_empty(n)) {
+                return nullptr;
+            }
+        }
+        if (j < gdn_idx && !ggml_op_is_empty(n->op) && !ggml_is_empty(n) && n->data != nullptr) {
+            const char * lo = (const char *) n->data;
+            const char * hi = lo + ggml_nbytes(n);
+            if (lo < s_hi && s_lo < hi) {
+                return nullptr;
+            }
+        }
+    }
+    if (gather_uses != ggml_node_get_use_count(cgraph, gather_idx)) {
+        return nullptr;
+    }
+    for (int c = 0; c < n_chain; ++c) {
+        if (chain[c]->flags & GGML_TENSOR_FLAG_OUTPUT) {
+            return nullptr;
+        }
+        for (int j = gather_idx + 1; j < gdn_idx; ++j) {
+            if (cgraph->nodes[j] == chain[c] && ggml_node_get_use_count(cgraph, j) != 1) {
+                return nullptr;
+            }
+        }
+    }
+    return gather;
+}
+
+static bool ggml_cuda_gdn_state_gather_skippable(const ggml_cgraph * cgraph, int gather_idx) {
+    for (int j = gather_idx + 1; j < cgraph->n_nodes && j <= gather_idx + 256; ++j) {
+        if (cgraph->nodes[j]->op == GGML_OP_GATED_DELTA_NET) {
+            if (ggml_cuda_gdn_state_gather(cgraph, j) == cgraph->nodes[gather_idx]) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 // match ssm_scan + the strided cpy that scatters its state snapshots into the cache, so the kernel writes them and skips the cpy
 static int ggml_cuda_try_ssm_scan_cache_fusion(
         const ggml_cgraph * cgraph, int node_idx, ggml_cuda_ssm_scan_fused_cache & fused_state_cpy) {
@@ -4229,8 +4334,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // -1: this node alone is done (the GDN reads the gathered state in place)
+    if (node->op == GGML_OP_GET_ROWS && ggml_cuda_gdn_state_gather_skippable(cgraph, i)) {
+        return -1;
+    }
+
     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
     if (node->op == GGML_OP_GATED_DELTA_NET) {
+        const ggml_tensor * gather = ggml_cuda_gdn_state_gather(cgraph, i);
+        ggml_cuda_gated_delta_net_state_rows state_rows{};
+        if (gather != nullptr) {
+            state_rows.data = (const float *) gather->src[0]->data;
+            state_rows.rows = (const int32_t *) gather->src[1]->data;
+        }
         ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
         const int nodes_to_skip = ggml_cuda_try_gdn_cache_fusion(cgraph, i, fused_state_cpy);
         if (nodes_to_skip > 0) {
@@ -4238,8 +4354,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             GGML_LOG_INFO("%s: fused gated_delta_net snapshot copies for %s (skipped %d nodes)\n",
                           __func__, node->name, nodes_to_skip);
 #endif
-            ggml_cuda_op_gated_delta_net_fused_cache(*cuda_ctx, node, fused_state_cpy);
+            ggml_cuda_op_gated_delta_net_fused_cache(*cuda_ctx, node, fused_state_cpy, gather ? &state_rows : nullptr);
             return nodes_to_skip;
+        }
+        if (gather != nullptr) {
+            ggml_cuda_op_gated_delta_net(*cuda_ctx, node, &state_rows);
+            return -1;
         }
     }
 
@@ -5149,6 +5269,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
+                    nodes_to_skip = std::max(nodes_to_skip, 0);
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
