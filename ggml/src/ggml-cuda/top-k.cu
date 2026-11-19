@@ -147,25 +147,39 @@ static __global__ void top_k_radix_select(
         int shift) {
     constexpr int NBINS = 1 << RADIX_BITS;
 
+    static_assert(BLOCK_SIZE == NBINS, "one thread per bin");
+
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
-    __shared__ int histogram[NBINS];
+    // suffix[b] = number of keys in bins >= b
+    __shared__ int suffix[NBINS + 1];
+
+    top_k_radix_state state = states[row];
 
     int count = 0;
     for (int row_block = 0; row_block < blocks_per_row; ++row_block) {
         const size_t offset = ((size_t) row * blocks_per_row + row_block) * NBINS;
         count += block_histograms[offset + tid];
     }
-    histogram[tid] = count;
+    suffix[tid] = count;
+    if (tid == 0) {
+        suffix[NBINS] = 0;
+    }
     __syncthreads();
 
-    if (tid == 0) {
-        top_k_radix_state state = states[row];
-        int bin = NBINS - 1;
-        while (bin > 0 && histogram[bin] < state.rank) {
-            state.rank -= histogram[bin--];
-        }
-        state.prefix |= (uint32_t) bin << shift;
+    // a parallel scan instead of one thread walking down the bins, which took ~20 us on gfx906
+    for (int off = 1; off < NBINS; off <<= 1) {
+        const int add = tid + off < NBINS ? suffix[tid + off] : 0;
+        __syncthreads();
+        suffix[tid] += add;
+        __syncthreads();
+    }
+
+    // the highest bin whose suffix reaches the rank, bin 0 if none does, as the walk down found it
+    const bool is_bin = suffix[tid] >= state.rank && suffix[tid + 1] < state.rank;
+    if (is_bin || (tid == 0 && suffix[0] < state.rank)) {
+        state.rank -= suffix[tid + 1];
+        state.prefix |= (uint32_t) tid << shift;
         state.prefix_mask |= (uint32_t) (NBINS - 1) << shift;
         states[row] = state;
     }
