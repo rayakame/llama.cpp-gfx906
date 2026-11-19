@@ -1,0 +1,1 @@
+# VGPR spills of gfx906 kernels (ROCm 10.1, max-ilp) that are known and accepted: <spills> <kernel>
