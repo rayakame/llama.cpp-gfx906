@@ -1,0 +1,72 @@
+name: gfx906 compare images
+
+# What a release is measured against, built exactly as ours: upstream's newest release and mx-llama.cpp's head.
+on:
+  workflow_dispatch:
+    inputs:
+      upstream:
+        description: "upstream tag; empty for the newest release"
+        default: ""
+      mx:
+        description: "mx-llama.cpp commit, all 40 characters; empty for the head of master"
+        default: ""
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  refs:
+    runs-on: ubuntu-latest
+    outputs:
+      upstream: ${{ steps.r.outputs.upstream }}
+      upstream_tag: ${{ steps.r.outputs.upstream }}
+      mx: ${{ steps.r.outputs.mx }}
+      mx_tag: ${{ steps.r.outputs.mx_tag }}
+    steps:
+      - id: r
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM: ${{ inputs.upstream }}
+          MX: ${{ inputs.mx }}
+        run: |
+          [ -n "$UPSTREAM" ] || UPSTREAM=$(gh api repos/ggml-org/llama.cpp/releases/latest --jq .tag_name)
+          [ -n "$MX" ] || MX=$(gh api repos/mxxm-t/mx-llama.cpp/commits/master --jq .sha)
+          [[ $UPSTREAM =~ ^[A-Za-z0-9._-]+$ && $MX =~ ^[0-9a-f]{40}$ ]] || { echo "unusable refs: $UPSTREAM $MX"; exit 1; }
+          echo "upstream=$UPSTREAM" >> "$GITHUB_OUTPUT"
+          echo "mx=$MX" >> "$GITHUB_OUTPUT"
+          echo "mx_tag=${MX:0:9}" >> "$GITHUB_OUTPUT"
+
+  image:
+    needs: refs
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - name: upstream
+            repo: ggml-org/llama.cpp
+          - name: mx
+            repo: mxxm-t/mx-llama.cpp
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: ours
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ matrix.repo }}
+          ref: ${{ needs.refs.outputs[matrix.name] }}
+          path: src
+          fetch-depth: 0
+      - run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v7
+        with:
+          context: src
+          file: ours/.devops/gfx906.Dockerfile
+          build-args: UPSTREAM_REF=${{ needs.refs.outputs[matrix.name] }}
+          push: true
+          tags: ghcr.io/${{ github.repository }}:compare-${{ matrix.name }}-${{ needs.refs.outputs[format('{0}_tag', matrix.name)] }}
