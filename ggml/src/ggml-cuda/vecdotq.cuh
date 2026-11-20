@@ -567,6 +567,15 @@ static __device__ __forceinline__ float vec_dot_q2_K_q8_1_impl_mmq(
     return sumf + d8*sumf_d8;
 }
 
+// A 32-bit integer multiply is quarter rate on GCN; a mat-vec dp4a sum and a K-quant sub-block scale fit 24 bits.
+static __device__ __forceinline__ int mul_sc_mmvq(const int sumi, const int sc) {
+#if defined(__gfx906__)
+    return __mul24(sumi, sc);
+#else
+    return sumi * sc;
+#endif // defined(__gfx906__)
+}
+
 #define VDR_Q3_K_Q8_1_MMVQ 2
 #define VDR_Q3_K_Q8_1_MMQ  2
 
@@ -595,7 +604,7 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmvq(
             sumi = ggml_cuda_dp4a(0xFCFCFCFC, u[VDR_Q3_K_Q8_1_MMVQ*i + j], sumi);
         }
 
-        sumf += d8[i] * (sumi * sc);
+        sumf += d8[i] * mul_sc_mmvq(sumi, sc);
     }
 
     return d3 * sumf;
@@ -642,8 +651,8 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_vmmq(
         const int dot1 = ggml_cuda_dp4a(v1i, u[2*i+1], ggml_cuda_dp4a(v0i, u[2*i+0], 0)); // SIMD dot product
         const int dot2 = ggml_cuda_dp4a(0x01010101, u[2*i+1], ggml_cuda_dp4a(0x01010101, u[2*i+0], 0)); // sum of u
 
-        sumf_d += d8[i] * (dot1 * sc[i]);
-        sumf_m += d8[i] * (dot2 * m[i]);  // multiply constant part of q4_K with sum of q8_1 values
+        sumf_d += d8[i] * mul_sc_mmvq(dot1, sc[i]);
+        sumf_m += d8[i] * mul_sc_mmvq(dot2, m[i]);  // multiply constant part of q4_K with sum of q8_1 values
     }
 
     const float2 dm4f = __half22float2(dm4);
@@ -709,8 +718,8 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_vmmq(
         const int dot1 = ggml_cuda_dp4a(v0i, u[2*i+0], ggml_cuda_dp4a(v1i, u[2*i+1], 0)); // SIMD dot product
         const int dot2 = ggml_cuda_dp4a(0x01010101, u[2*i+0], ggml_cuda_dp4a(0x01010101, u[2*i+1], 0)); // sum of u
 
-        sumf_d += d8[i] * (dot1 * sc[i]);
-        sumf_m += d8[i] * (dot2 * m[i]);
+        sumf_d += d8[i] * mul_sc_mmvq(dot1, sc[i]);
+        sumf_m += d8[i] * mul_sc_mmvq(dot2, m[i]);
 
     }
 
@@ -783,7 +792,7 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
             sumi = ggml_cuda_dp4a(0xE0E0E0E0, u[VDR_Q6_K_Q8_1_MMVQ*i + j], sumi);
         }
 
-        sumf += d8[i] * (sumi * sc);
+        sumf += d8[i] * mul_sc_mmvq(sumi, sc);
     }
 
     return d*sumf;
