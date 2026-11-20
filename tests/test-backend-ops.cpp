@@ -12799,6 +12799,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_concat(GGML_TYPE_Q8_0, {8192, 2, 1, 1}, dim == 0 ? 4096 : 1, dim, 0));
     }
 
+    // delta-net conv input: conv state followed by the transposed qkv of the ubatch
+    for (int64_t n : { 1, 4, 16, 61, 62, 512 }) {
+        test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 10240, 1, 1}, n, 0, 16));
+    }
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 10240, 4, 1}, 4, 0, 16));
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 1000, 2, 1}, 130, 0, 17));
+
     for (ggml_sort_order order : {GGML_SORT_ORDER_ASC, GGML_SORT_ORDER_DESC}) {
         for (uint32_t i = 4; i <= 1024*1024; i *= 2) {
             test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {i-1, 1, 1, 1}));
@@ -13619,6 +13626,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // delta-net conv input: conv state followed by the transposed qkv of the ubatch
     test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 8192, 1, 1}, 512, 0, 16));
+    for (int64_t n : { 1, 4, 16, 512 }) {
+        test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 10240, 1, 1}, n, 0, 16));
+    }
 
     // Qwen3.8 27B Q6_K output head of the target and the MTP drafts, 1..16 columns (GGML_CUDA_Q6K_PLANES=2 for any name)
     for (int64_t n = 1; n <= 16; ++n) {
