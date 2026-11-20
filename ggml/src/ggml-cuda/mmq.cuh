@@ -480,8 +480,9 @@ static constexpr __device__ int ggml_cuda_mmq_dp4a_lanes_j(ggml_type type, int J
         return 1;
     }
     switch (type) {
-        case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
+            return J >= 16 ? 2 : 1;
+        case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_IQ3_XXS:
         case GGML_TYPE_IQ3_S:
@@ -533,6 +534,11 @@ static __device__ __forceinline__ const int * ggml_cuda_mmq_y_smem_ptr(const int
 static constexpr __host__ __device__ bool ggml_cuda_mmq_dp4a_grid_switchable(ggml_type type) {
     return type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_IQ4_NL ||
         type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q4_0;
+}
+
+// Lane grid tiles that GGML_MMQ_GRID_SMALL_J=0 turns off.
+static constexpr __host__ __device__ bool ggml_cuda_mmq_dp4a_grid_small_j(ggml_type type, int J) {
+    return type == GGML_TYPE_Q4_1 && J >= 16 && J < 32;
 }
 
 // Lane grid tiles with the column-pipelined Q4_1 dot, which GGML_MMQ_Q4_1_PF=0 turns off.
@@ -1962,6 +1968,14 @@ static void launch_mul_mat_q_impl(ggml_backend_cuda_context & ctx, const mmq_arg
             (type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K)) {
         if (ggml_cuda_mmq_gcn_kq_loader(cc)) {
             launch_mul_mat_q_impl<type, J, fallback, prec_src1, has_fusion, planes, partial_j, y_smem, unroll_k, dp4a_grid, grid_lds, pipeline, y_b128, dp4a_pf, true>(ctx, args, stream);
+            return;
+        }
+    }
+
+    if constexpr (dp4a_grid && ggml_cuda_mmq_dp4a_grid_small_j(type, J)) {
+        static const bool grid = [] { const char * e = getenv("GGML_MMQ_GRID_SMALL_J"); return !e || atoi(e) != 0; }();
+        if (!grid) {
+            launch_mul_mat_q_impl<type, J, fallback, prec_src1, has_fusion, planes, partial_j, y_smem, unroll_k, false, grid_lds, pipeline, y_b128, dp4a_pf, gcn_loader>(ctx, args, stream);
             return;
         }
     }

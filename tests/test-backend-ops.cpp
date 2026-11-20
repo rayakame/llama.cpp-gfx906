@@ -12593,6 +12593,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // MMQ tiles of 9..24 columns: partial row tiles, stream-k with fixup, tiled
+    for (int m : {200, 640, 17408}) {
+        for (int n : {9, 16, 17, 24}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_1, GGML_TYPE_F32, m, n, 5120, {1, 1}, {1, 1}));
+        }
+    }
+
     // SIMD K boundaries, including tails shorter than one vector.
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}) {
         for (int k : {1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 48}) {
