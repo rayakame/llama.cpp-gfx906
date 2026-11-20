@@ -76,16 +76,17 @@ gated_delta_net_colthread(const float * q, const float * k, const float * v, con
                           int64_t sq1, int64_t sq2, int64_t sq3, int64_t sv1, int64_t sv2, int64_t sv3,
                           int64_t sb1, int64_t sb2, int64_t sb3,
                           const uint3 neqk1_magic, const uint3 rq3_magic,
-                          float scale, int64_t state_slot_stride, int K, const int32_t * s_rows) {
+                          float scale, int64_t state_slot_stride, int K, const int32_t * s_rows, const bool cols_first) {
     constexpr int R       = S_v / LPC;           // state rows per lane
     constexpr int B        = R / 2;               // chunked-kernel leaf pairs per lane
     constexpr int B4       = B / 4;               // leaf float4s per row half
     constexpr int HI4      = S_v / 8;            // float4 offset of the +S_v/2 row half
     constexpr int NT      = COLS * LPC;   // threads per block
-    const uint32_t h_idx    = blockIdx.x;
-    const uint32_t sequence = blockIdx.y;
+    const uint32_t cblk     = cols_first ? blockIdx.x : blockIdx.z;
+    const uint32_t h_idx    = cols_first ? blockIdx.y : blockIdx.x;
+    const uint32_t sequence = cols_first ? blockIdx.z : blockIdx.y;
     const int      sub      = threadIdx.x % LPC; // lane within the column group
-    const int      col      = blockIdx.z * COLS + threadIdx.x / LPC;
+    const int      col      = cblk * COLS + threadIdx.x / LPC;
 
     const uint32_t iq1 = fastmodulo(h_idx, neqk1_magic);
     const uint32_t iq3 = fastdiv(sequence, rq3_magic);
@@ -141,7 +142,7 @@ gated_delta_net_colthread(const float * q, const float * k, const float * v, con
         for (int idx = threadIdx.x; idx < nt * COLS; idx += NT) {
             const int tt = idx / COLS;
             const int c  = idx % COLS;
-            sv[tt][c] = v_base[(t0 + tt) * sv2 + blockIdx.z * COLS + c];
+            sv[tt][c] = v_base[(t0 + tt) * sv2 + cblk * COLS + c];
         }
         __syncthreads();
 
@@ -444,6 +445,99 @@ gated_delta_net_decode(const float * __restrict__ q, const float * __restrict__ 
     }
 }
 
+struct gdn_ct_shape {
+    int lpc;  // lanes per column
+    int cols; // columns per block
+};
+
+static bool gdn_ct_supported(const gdn_ct_shape sh) {
+    switch (sh.lpc * 100 + sh.cols) {
+        case 232: case 264:
+        case 416: case 432: case 464:
+        case 808: case 816: case 832: case 864:
+        case 1608: case 1616: case 1632: case 1664:
+            return true;
+        default:
+            return false;
+    }
+}
+
+template <bool KDA, bool keep_rs_t, int LPC, int COLS, typename... Args>
+static void gdn_ct_launch(const int64_t H, const int64_t n_seqs, cudaStream_t stream, Args... args) {
+    // Head-first order makes the resident blocks store the same column range of each head, 64 KB apart (4 sequences x 4 tokens with snapshots: 141 -> 80 us)
+    static const bool cols_first = [] { const char * e = getenv("GGML_GDN_COLS_FIRST"); return !e || atoi(e) != 0; }();
+    const dim3 grid = cols_first ? dim3(128 / COLS, H, n_seqs) : dim3(H, n_seqs, 128 / COLS);
+    const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(grid, LPC * COLS, 0, stream);
+    ggml_cuda_kernel_launch(gated_delta_net_colthread<128, keep_rs_t, LPC, COLS, KDA>, lp, args..., cols_first);
+}
+
+template <bool KDA, bool keep_rs_t, typename... Args>
+static bool gdn_ct_dispatch(const gdn_ct_shape sh, const int64_t H, const int64_t n_seqs, cudaStream_t stream, Args... args) {
+    // KDA keeps 32 columns per block, only the lane count follows the table
+    if constexpr (!KDA) {
+        switch (sh.lpc * 100 + sh.cols) {
+            case  264: gdn_ct_launch<KDA, keep_rs_t,  2, 64>(H, n_seqs, stream, args...); return true;
+            case  416: gdn_ct_launch<KDA, keep_rs_t,  4, 16>(H, n_seqs, stream, args...); return true;
+            case  464: gdn_ct_launch<KDA, keep_rs_t,  4, 64>(H, n_seqs, stream, args...); return true;
+            case  808: gdn_ct_launch<KDA, keep_rs_t,  8,  8>(H, n_seqs, stream, args...); return true;
+            case  816: gdn_ct_launch<KDA, keep_rs_t,  8, 16>(H, n_seqs, stream, args...); return true;
+            case  864: gdn_ct_launch<KDA, keep_rs_t,  8, 64>(H, n_seqs, stream, args...); return true;
+            case 1608: gdn_ct_launch<KDA, keep_rs_t, 16,  8>(H, n_seqs, stream, args...); return true;
+            case 1616: gdn_ct_launch<KDA, keep_rs_t, 16, 16>(H, n_seqs, stream, args...); return true;
+            case 1664: gdn_ct_launch<KDA, keep_rs_t, 16, 64>(H, n_seqs, stream, args...); return true;
+            default: break;
+        }
+    }
+    switch (sh.lpc) {
+        case  2: gdn_ct_launch<KDA, keep_rs_t,  2, 32>(H, n_seqs, stream, args...); return true;
+        case  4: gdn_ct_launch<KDA, keep_rs_t,  4, 32>(H, n_seqs, stream, args...); return true;
+        case  8: gdn_ct_launch<KDA, keep_rs_t,  8, 32>(H, n_seqs, stream, args...); return true;
+        case 16: gdn_ct_launch<KDA, keep_rs_t, 16, 32>(H, n_seqs, stream, args...); return true;
+        default: return false;
+    }
+}
+
+// "<min tokens>:<lanes>x<columns>,..." with ascending min tokens
+static std::vector<std::pair<int64_t, gdn_ct_shape>> gdn_ct_parse_table(const char * s) {
+    std::vector<std::pair<int64_t, gdn_ct_shape>> table;
+    while (*s) {
+        long long n = 0;
+        int lpc = 0, cols = 0, len = 0;
+        if (sscanf(s, "%lld:%dx%d%n", &n, &lpc, &cols, &len) != 3 || !gdn_ct_supported({lpc, cols}) ||
+                (!table.empty() && n <= table.back().first)) {
+            GGML_LOG_WARN("%s: GGML_GDN_TABLE: cannot use \"%s\", using the default\n", __func__, s);
+            return {};
+        }
+        table.push_back({(int64_t) n, {lpc, cols}});
+        s += len;
+        if (*s == ',') {
+            ++s;
+        }
+    }
+    return table;
+}
+
+// Launch shape by tokens per sequence, from GGML_GDN_TABLE. The default is within 5 % of the best shape of the gfx906 sweep at every token count.
+static gdn_ct_shape gdn_ct_pick(const int64_t n_tokens) {
+    static const std::vector<std::pair<int64_t, gdn_ct_shape>> table = [] {
+        const char * e = getenv("GGML_GDN_TABLE");
+        std::vector<std::pair<int64_t, gdn_ct_shape>> t = e ? gdn_ct_parse_table(e) : std::vector<std::pair<int64_t, gdn_ct_shape>>{};
+        if (t.empty()) {
+            const char * l   = getenv("GGML_GDN_LPC");
+            const int    lpc = l ? atoi(l) : (GGML_CUDA_CC_IS_GCN(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) ? 8 : 4);
+            t = { {2, {16, 32}}, {8, {lpc == 16 || lpc == 8 || lpc == 2 ? lpc : 4, 32}} };
+        }
+        return t;
+    }();
+    gdn_ct_shape sh = table.front().second;
+    for (const auto & e : table) {
+        if (n_tokens >= e.first) {
+            sh = e.second;
+        }
+    }
+    return sh;
+}
+
 template <bool KDA, bool keep_rs_t>
 bool launch_gated_delta_net_colthread(
         const float * q_d, const float * k_d, const float * v_d,
@@ -481,38 +575,11 @@ bool launch_gated_delta_net_colthread(
         return true;
     }
 
-    if (n_tokens < 8) {
-        constexpr int C = 32;
-        const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(dim3(H, n_seqs, 128 / C), C * 16, 0, stream);
-        ggml_cuda_kernel_launch(gated_delta_net_colthread<128, keep_rs_t, 16, C, KDA>, lp,
+    const gdn_ct_shape sh = gdn_ct_pick(n_tokens);
+    if (!gdn_ct_dispatch<KDA, keep_rs_t>(sh, H, n_seqs, stream,
             q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-            sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_rows);
-        return true;
-    }
-
-    // lanes per column: 8 on GCN (gfx906, 384 tokens: 317 -> 290 ms per run), 4 elsewhere
-    static const int lpc = [] {
-        const char * e = getenv("GGML_GDN_LPC");
-        return e ? atoi(e) : (GGML_CUDA_CC_IS_GCN(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) ? 8 : 4);
-    }();
-    const dim3 grid(H, n_seqs, 128 / GDN_CT_COLS);
-    const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(grid, GDN_CT_COLS * lpc, 0, stream);
-    if (lpc == 16) {
-        ggml_cuda_kernel_launch(gated_delta_net_colthread<128, keep_rs_t, 16, GDN_CT_COLS, KDA>, lp,
-            q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-            sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_rows);
-    } else if (lpc == 8) {
-        ggml_cuda_kernel_launch(gated_delta_net_colthread<128, keep_rs_t, 8, GDN_CT_COLS, KDA>, lp,
-            q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-            sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_rows);
-    } else if (lpc == 2) {
-        ggml_cuda_kernel_launch(gated_delta_net_colthread<128, keep_rs_t, 2, GDN_CT_COLS, KDA>, lp,
-            q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-            sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_rows);
-    } else {
-        ggml_cuda_kernel_launch(gated_delta_net_colthread<128, keep_rs_t, 4, GDN_CT_COLS, KDA>, lp,
-            q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-            sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_rows);
+            sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_rows)) {
+        GGML_ABORT("gated_delta_net_colthread: no instance for %d lanes x %d columns", sh.lpc, sh.cols);
     }
     return true;
 }
