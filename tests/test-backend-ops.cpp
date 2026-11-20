@@ -12297,6 +12297,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int64_t n : {16, 512}) {
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 17408, n, 1024, {1, 1}, {1, 1}));
         }
+        // stream-k blocks that cover several whole tiles: 2..3 rounds at 16 columns, 5..6 at 512
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 17408,  16, 2048, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,  5120, 512, 2048, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 10240, 512, 2048, {1, 1}, {1, 1}));
     }
     for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_1}) {
         for (int64_t n : {16, 24, 40, 64, 200, 512}) {
