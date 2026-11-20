@@ -3748,10 +3748,11 @@ static bool q8_1_cache_usable(const ggml_backend_cuda_context & ctx, const ggml_
 #endif // defined(GGML_USE_VMM)
 }
 
-static bool q8_1_cache_lookup(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const size_t size) {
+static bool q8_1_cache_lookup(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const int layout, const size_t size, const size_t size_alloc) {
     const auto & c = ctx.q8_1_cache;
-    if (!c.buf || c.src1 != src1 || c.data != src1->data || c.size != size || c.stream != ctx.stream() ||
-            !q8_1_cache_usable(ctx, src1) || c.node_idx > ctx.cur_node_idx) {
+    if (!c.buf || c.src1 != src1 || c.data != src1->data || c.layout != layout || c.size != size || c.size_alloc < size_alloc ||
+            c.stream != ctx.stream() || !q8_1_cache_usable(ctx, src1) || c.node_idx > ctx.cur_node_idx) {
         return false;
     }
     // no node between the two mat-vecs may have written into src1
@@ -3771,16 +3772,29 @@ static bool q8_1_cache_lookup(ggml_backend_cuda_context & ctx, const ggml_tensor
     return true;
 }
 
-static char * q8_1_cache_store(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const size_t size) {
+static char * q8_1_cache_store(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const int layout, const size_t size, const size_t size_alloc) {
     auto & c = ctx.q8_1_cache;
     c.reset();
-    c.buf = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), size);
-    c.src1     = src1;
-    c.data     = src1->data;
-    c.node_idx = ctx.cur_node_idx;
-    c.stream   = ctx.stream();
-    c.size     = size;
+    c.buf = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), size_alloc);
+    c.src1       = src1;
+    c.data       = src1->data;
+    c.node_idx   = ctx.cur_node_idx;
+    c.stream     = ctx.stream();
+    c.layout     = layout;
+    c.size       = size;
+    c.size_alloc = size_alloc;
     return c.buf->get();
+}
+
+char * ggml_cuda_q8_1_cache_find(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const int layout, const size_t size, const size_t size_alloc) {
+    return q8_1_cache_lookup(ctx, src1, layout, size, size_alloc) ? ctx.q8_1_cache.buf->get() : nullptr;
+}
+
+char * ggml_cuda_q8_1_cache_new(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const int layout, const size_t size, const size_t size_alloc) {
+    return q8_1_cache_usable(ctx, src1) ? q8_1_cache_store(ctx, src1, layout, size, size_alloc) : nullptr;
 }
 
 char * ggml_cuda_q8_1_cache_begin(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx) {
@@ -3814,11 +3828,12 @@ char * ggml_cuda_q8_1_cache_begin(ggml_backend_cuda_context & ctx, const ggml_cg
     auto & c = ctx.q8_1_cache;
     c.reset();
     c.buf = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), size);
-    c.src1     = src1;
-    c.data     = src1->data;
-    c.node_idx = node_idx;
-    c.stream   = ctx.stream();
-    c.size     = size;
+    c.src1       = src1;
+    c.data       = src1->data;
+    c.node_idx   = node_idx;
+    c.stream     = ctx.stream();
+    c.size       = size;
+    c.size_alloc = size;
     return c.buf->get();
 #endif // defined(GGML_USE_VMM)
 }
@@ -3985,11 +4000,11 @@ void ggml_cuda_mul_mat_vec_q(
     const size_t  nbytes_q8_1 = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
     ggml_cuda_pool_alloc<char> src1_q8_1_tmp(ctx.pool());
     char * src1_q8_1 = nullptr;
-    if (!ids && q8_1_cache_lookup(ctx, src1, nbytes_q8_1)) {
+    if (!ids && q8_1_cache_lookup(ctx, src1, 0, nbytes_q8_1, nbytes_q8_1)) {
         src1_q8_1 = ctx.q8_1_cache.buf->get();
     } else {
         if (!ids && q8_1_cache_usable(ctx, src1)) {
-            src1_q8_1 = q8_1_cache_store(ctx, src1, nbytes_q8_1);
+            src1_q8_1 = q8_1_cache_store(ctx, src1, 0, nbytes_q8_1, nbytes_q8_1);
         } else {
             src1_q8_1 = src1_q8_1_tmp.alloc(nbytes_q8_1);
         }
@@ -4271,10 +4286,10 @@ void ggml_cuda_mul_mat_vec_q_gdn_gate(ggml_backend_cuda_context & ctx, const ggm
     const size_t nbytes_q8_1 = ncols_y*ncols_x*sizeof(block_q8_1)/QK8_1;
     ggml_cuda_pool_alloc<char> y_q8_1_tmp(ctx.pool());
     char * y_q8_1 = nullptr;
-    if (q8_1_cache_lookup(ctx, y, nbytes_q8_1)) {
+    if (q8_1_cache_lookup(ctx, y, 0, nbytes_q8_1, nbytes_q8_1)) {
         y_q8_1 = ctx.q8_1_cache.buf->get();
     } else {
-        y_q8_1 = q8_1_cache_usable(ctx, y) ? q8_1_cache_store(ctx, y, nbytes_q8_1) : y_q8_1_tmp.alloc(nbytes_q8_1);
+        y_q8_1 = q8_1_cache_usable(ctx, y) ? q8_1_cache_store(ctx, y, 0, nbytes_q8_1, nbytes_q8_1) : y_q8_1_tmp.alloc(nbytes_q8_1);
         quantize_row_q8_1_cuda((const float *) y->data, nullptr, y_q8_1, x_a->type, ncols_x, ncols_x, ncols_x*ncols_y,
             ncols_x*ncols_y, ncols_x, ncols_y, 1, 1, stream);
     }
