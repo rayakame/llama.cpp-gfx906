@@ -1817,10 +1817,11 @@ static bool mul_mat_vec_q_gcn_mc_switch_ncols(const int ncols_dst, const int wav
         case 2: mul_mat_vec_q_gcn_mc_switch_wpe<type, 2, gate, aligned_b2>(waves_per_eu, ngroups, nwarps, p, stream); return true;
         case 3: mul_mat_vec_q_gcn_mc_switch_wpe<type, 3, gate, aligned_b2>(waves_per_eu, ngroups, nwarps, p, stream); return true;
         case 4: mul_mat_vec_q_gcn_mc_switch_wpe<type, 4, gate, aligned_b2>(waves_per_eu, ngroups, nwarps, p, stream); return true;
-        case 5: mul_mat_vec_q_gcn_mc_switch_wpe<type, 5, gate, aligned_b2>(waves_per_eu, ngroups, nwarps, p, stream); return true;
-        case 6: mul_mat_vec_q_gcn_mc_switch_wpe<type, 6, gate, aligned_b2>(waves_per_eu, ngroups, nwarps, p, stream); return true;
-        case 7: mul_mat_vec_q_gcn_mc_switch_wpe<type, 7, gate, aligned_b2>(waves_per_eu, ngroups, nwarps, p, stream); return true;
-        case 8: mul_mat_vec_q_gcn_mc_switch_wpe<type, 8, gate, aligned_b2>(waves_per_eu, ngroups, nwarps, p, stream); return true;
+        // the aligned Q4_0 loads lose at 5..8 columns (pp8 -9 %)
+        case 5: mul_mat_vec_q_gcn_mc_switch_wpe<type, 5, gate, false>(waves_per_eu, ngroups, nwarps, p, stream); return true;
+        case 6: mul_mat_vec_q_gcn_mc_switch_wpe<type, 6, gate, false>(waves_per_eu, ngroups, nwarps, p, stream); return true;
+        case 7: mul_mat_vec_q_gcn_mc_switch_wpe<type, 7, gate, false>(waves_per_eu, ngroups, nwarps, p, stream); return true;
+        case 8: mul_mat_vec_q_gcn_mc_switch_wpe<type, 8, gate, false>(waves_per_eu, ngroups, nwarps, p, stream); return true;
         default: return false;
     }
 }
