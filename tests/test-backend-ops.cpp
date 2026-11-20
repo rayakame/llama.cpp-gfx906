@@ -5034,6 +5034,61 @@ struct test_ssm_conv_step : public test_case {
     }
 };
 
+// SSM_CONV + SILU and the q/k l2 norms of the Gated DeltaNet (qwen35.cpp, models.h build_gdn_l2_norm): RMS_NORM +
+// SCALE of head-wide views of the silu output, q from channel 0 and k right after it
+struct test_ssm_conv_l2_norm : public test_case {
+    const int64_t nr;
+    const int64_t n_t;
+    const int64_t n_s;
+    const int64_t nh;
+
+    ggml_tensor * y_node  = nullptr;
+    ggml_tensor * qn_node = nullptr;
+    ggml_tensor * kn_node = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SSM_CONV_L2_NORM";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(nr, n_t, n_s, nh);
+    }
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { y_node, qn_node, kn_node }; }
+
+    test_ssm_conv_l2_norm(int64_t nr = 10240, int64_t n_t = 4, int64_t n_s = 1, int64_t nh = 16)
+        : nr(nr), n_t(n_t), n_s(n_s), nh(nh) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t d_conv = 4;
+        const int64_t hd     = 128;
+        const float   eps    = 1e-6f;
+
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_conv - 1 + n_t, nr, n_s);
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, nr);
+        ggml_set_name(x, "x");
+        ggml_set_name(w, "w");
+
+        y_node = ggml_silu(ctx, ggml_ssm_conv(ctx, x, w));
+        ggml_set_name(y_node, "y");
+
+        ggml_tensor * q = ggml_view_4d(ctx, y_node, hd, nh, n_t, n_s, ggml_row_size(GGML_TYPE_F32, hd), y_node->nb[1], y_node->nb[2], 0);
+        ggml_tensor * k = ggml_view_4d(ctx, y_node, hd, nh, n_t, n_s, ggml_row_size(GGML_TYPE_F32, hd), y_node->nb[1], y_node->nb[2],
+                ggml_row_size(GGML_TYPE_F32, hd*nh));
+
+        qn_node = ggml_scale(ctx, ggml_rms_norm(ctx, q, eps/hd), 1.0f/sqrtf(hd));
+        kn_node = ggml_scale(ctx, ggml_rms_norm(ctx, k, eps/hd), 1.0f/sqrtf(hd));
+        ggml_set_name(qn_node, "qn");
+        ggml_set_name(kn_node, "kn");
+
+        // one consumer of both, so the nodes follow each other as in the model
+        ggml_tensor * out = ggml_add(ctx, qn_node, kn_node);
+        return out;
+    }
+};
+
 // GGML_OP_SSM_SCAN
 struct test_ssm_scan : public test_case {
     const ggml_type type;
@@ -11948,6 +12003,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_ssm_conv_step(128, 4, 1, 3, 1, 1));
     test_cases.emplace_back(new test_ssm_conv_step(128, 4, 4, 3, 1, 7));
+
+    for (int64_t n_t : {1, 2, 4, 5, 8, 16, 32, 33}) {
+        test_cases.emplace_back(new test_ssm_conv_l2_norm(10240, n_t, 1, 16));
+    }
+    test_cases.emplace_back(new test_ssm_conv_l2_norm(10240, 4, 4, 16));
+    test_cases.emplace_back(new test_ssm_conv_l2_norm(10240, 16, 2, 16));
+    test_cases.emplace_back(new test_ssm_conv_l2_norm(512, 4, 1, 1));
 
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 16, 1, 1024, 1, 32, 4)); // Mamba-1
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 64, 64, 112, 2, 32, 4)); // Zamba2 (real hparams: d_inner=7168, dt_rank=112, n_group=2 -> head_dim=7168/112=64)
