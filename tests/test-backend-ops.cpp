@@ -11811,6 +11811,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 17408, 12, 1024, {1, 1}, {1, 1}));
     }
 
+    // MMQ dp4a lane grid of the Q8_0-layout dot: tile widths from 32 columns, whole and partial row tiles
+    for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL}) {
+        for (int64_t n : {32, 37, 48, 64, 80, 112, 128, 300}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1024, n, 1024, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1000, n, 1024, {1, 1}, {1, 1}));
+        }
+    }
+
 #if 0
     {
         // Test paths in OpenCL
