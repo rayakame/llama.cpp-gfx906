@@ -173,6 +173,65 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE) concat_non_cont
     *(T *)(dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0) = *x;
 }
 
+#define CUDA_CONCAT_TILE 64
+
+// dim-0 concat with src1 contiguous along dim 1 (the transposed qkv of the Gated DeltaNet conv input): row-wise reads of src1 touch one cache line per element.
+template <typename T>
+static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE) concat_dim0_tile(
+        const char * src0, const char * src1, char * dst,
+        const int ne00, const int ne0, const int ne1, const int ne2, const uint3 w_last_fd,
+        const uint64_t nb00, const uint64_t nb01, const uint64_t nb02, const uint64_t nb03,
+        const uint64_t nb10, const uint64_t nb11, const uint64_t nb12, const uint64_t nb13,
+        const uint64_t nb1, const uint64_t nb2, const uint64_t nb3) {
+    constexpr int rows = CUDA_CONCAT_BLOCK_SIZE/CUDA_CONCAT_TILE;
+    __shared__ T tile[CUDA_CONCAT_TILE][CUDA_CONCAT_TILE + 1];
+
+    const int i0_0 = blockIdx.x*CUDA_CONCAT_TILE;
+    const int i1_0 = blockIdx.y*CUDA_CONCAT_TILE;
+    const int i2   = blockIdx.z % ne2;
+    const int i3   = blockIdx.z / ne2;
+    const int w    = min(CUDA_CONCAT_TILE, ne0 - i0_0);
+    const int h    = min(CUDA_CONCAT_TILE, ne1 - i1_0);
+    const int lane = threadIdx.x % CUDA_CONCAT_TILE;
+    const int row  = threadIdx.x / CUDA_CONCAT_TILE;
+
+    if (lane < h) {
+        const char * x0 = src0 + i3*nb03 + i2*nb02 + (i1_0 + lane)*nb01;
+        const char * x1 = src1 + i3*nb13 + i2*nb12 + (i1_0 + lane)*nb11;
+#pragma unroll
+        for (int k = 0; k < CUDA_CONCAT_TILE/rows; ++k) {
+            const int il = row + k*rows;
+            const int i0 = i0_0 + il;
+            if (il < w) {
+                tile[il][lane] = i0 < ne00 ? *(const T *)(x0 + i0*nb00) : *(const T *)(x1 + (i0 - ne00)*nb10);
+            }
+        }
+    }
+    __syncthreads();
+
+    char * y = dst + i3*nb3 + i2*nb2 + i1_0*nb1 + i0_0*sizeof(T);
+    if (w == CUDA_CONCAT_TILE) {
+#pragma unroll
+        for (int k = 0; k < CUDA_CONCAT_TILE/rows; ++k) {
+            const int cl = row + k*rows;
+            if (cl < h) {
+                *(T *)(y + cl*nb1 + lane*sizeof(T)) = tile[lane][cl];
+            }
+        }
+    } else {
+        // only the last tile of a row is narrower, so w_last_fd divides by w
+        for (int j = threadIdx.x; j < h*w; j += CUDA_CONCAT_BLOCK_SIZE) {
+            const uint2 cl_il = fast_div_modulo(j, w_last_fd);
+            *(T *)(y + cl_il.x*nb1 + cl_il.y*sizeof(T)) = tile[cl_il.y][cl_il.x];
+        }
+    }
+}
+
+static bool concat_tile_enabled() {
+    static const bool enabled = [] { const char * e = getenv("GGML_CONCAT_TILE"); return !e || atoi(e) != 0; }();
+    return enabled;
+}
+
 template <typename T>
 static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream) {
     if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
@@ -196,6 +255,20 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
         CUDA_CHECK(cudaMemcpyAsync((char *) dst->data + size0, src1->data, size1, cudaMemcpyDeviceToDevice, stream));
     } else {
         GGML_ASSERT(!ggml_is_quantized(src0->type));
+
+        if (dim == 0 && sizeof(T) <= 4 && src1->nb[1] == sizeof(T) && src1->nb[0] != sizeof(T) && ggml_is_contiguous(dst) &&
+                dst->ne[0] <= std::numeric_limits<int>::max() && dst->ne[1] <= 65535*CUDA_CONCAT_TILE && dst->ne[2]*dst->ne[3] <= 65535 &&
+                concat_tile_enabled()) {
+            const int64_t ntiles0 = (dst->ne[0] + CUDA_CONCAT_TILE - 1)/CUDA_CONCAT_TILE;
+            const dim3 grid(ntiles0, (dst->ne[1] + CUDA_CONCAT_TILE - 1)/CUDA_CONCAT_TILE, dst->ne[2]*dst->ne[3]);
+            concat_dim0_tile<T><<<grid, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(
+                (const char *) src0->data, (const char *) src1->data, (char *) dst->data,
+                src0->ne[0], dst->ne[0], dst->ne[1], dst->ne[2], init_fastdiv_values(dst->ne[0] - (ntiles0 - 1)*CUDA_CONCAT_TILE),
+                src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
+                src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3],
+                dst->nb[1], dst->nb[2], dst->nb[3]);
+            return;
+        }
 
         dim3 grid_dim(dst->ne[1], dst->ne[2], dst->ne[3]);
         const bool short_rows = dst->ne[0] < CUDA_CONCAT_BLOCK_SIZE/4;
