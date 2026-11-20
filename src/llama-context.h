@@ -84,7 +84,7 @@ struct llama_context {
     float * get_logits();
     float * get_logits_ith(int32_t i);
 
-    llama_token get_logits_argmax_ith(int32_t i, float * logit);
+    int32_t get_logits_top_ith(int32_t i, const llama_token ** tokens, const float ** logits);
 
     float * get_embeddings();
     float * get_embeddings_ith(int32_t i);
@@ -341,9 +341,10 @@ private:
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
 
-    // the two largest logits of each output row and their ids ([n_outputs][2]), id -1 if not computed
-    buffer_view<llama_token> logits_top2_ids = {nullptr, 0};
-    buffer_view<float>       logits_top2_val = {nullptr, 0};
+    // the largest logits of each output row and their ids ([n_outputs][logits_top_n]), first id -1 if not computed
+    int64_t                  logits_top_n   = 0;
+    buffer_view<llama_token> logits_top_ids = {nullptr, 0};
+    buffer_view<float>       logits_top_val = {nullptr, 0};
 
     // the logits rows of the last ubatch stay in its graph until they are read
     ggml_tensor *        logits_dev         = nullptr;

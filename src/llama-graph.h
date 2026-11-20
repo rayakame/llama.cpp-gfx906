@@ -986,8 +986,8 @@ public:
     std::vector<ggml_tensor *> t_sampled_logits;
     std::vector<ggml_tensor *> t_candidates;
 
-    ggml_tensor * t_logits_top2     = nullptr; // I32 [2, n_outputs]
-    ggml_tensor * t_logits_top2_val = nullptr; // F32 [1, 2, n_outputs]
+    ggml_tensor * t_logits_top     = nullptr; // I32 [n_top, n_outputs]
+    ggml_tensor * t_logits_top_val = nullptr; // F32 [1, n_top, n_outputs]
 
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
@@ -1522,8 +1522,8 @@ struct llm_graph_context {
 
     void build_sampling() const;
 
-    // the two largest logits of each output row, so the host can take the argmax without the row
-    void build_logits_top2() const;
+    // the largest logits of each output row, so a top-k sampler does not need the row, see llama_logits_top_n()
+    void build_logits_top() const;
 
     // write enabled layer inputs into layer_inp_dev at their batch rows
     void build_layer_inp_dev() const;

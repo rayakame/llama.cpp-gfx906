@@ -7,6 +7,13 @@
 
 #define LLAMA_MAX_SEQ 256
 
+// largest logits per output row found on the device: a top-k sampler with k <= 128 needs k + 1 to see ties
+#define LLAMA_LOGITS_TOP_MAX 129
+
+static inline int64_t llama_logits_top_n(int64_t n_vocab) {
+    return n_vocab/2 < LLAMA_LOGITS_TOP_MAX ? n_vocab/2 : LLAMA_LOGITS_TOP_MAX;
+}
+
 struct llama_cparams {
     uint32_t n_ctx;           // context size used during inference
     uint32_t n_ctx_seq;       // context for a single sequence
@@ -58,7 +65,7 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
     bool training;           // set by llama_opt_init()
-    bool logits_on_device = false; // top-2 of each logits row on the device; rows of the last ubatch copied only when read
+    bool logits_on_device = false; // top logits of each row on the device; rows of the last ubatch copied only when read
 
     size_t moe_cache_size;
     float  moe_cache_cpu_share;

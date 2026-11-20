@@ -1148,10 +1148,10 @@ extern "C" {
     // returns NULL for invalid ids.
     LLAMA_API float * llama_get_logits_ith(struct llama_context * ctx, int32_t i);
 
-    // The token with the largest logit of the ith output, found on the device without copying the row.
-    // Returns LLAMA_TOKEN_NULL when the context did not compute it or when the largest logit is not unique.
-    // If logit is not NULL, it receives that logit.
-    LLAMA_API llama_token llama_get_logits_argmax_ith(struct llama_context * ctx, int32_t i, float * logit);
+    // The largest logits of the ith output and their tokens, found on the device without copying the row.
+    // Returns their number n, 0 if the context did not compute them; tokens and logits get n entries in no order.
+    // The pointers stay valid until the next decode.
+    LLAMA_API int32_t llama_get_logits_top_ith(struct llama_context * ctx, int32_t i, const llama_token ** tokens, const float ** logits);
 
     // Get all output token embeddings.
     // when pooling_type == LLAMA_POOLING_TYPE_NONE or when using a generative model,

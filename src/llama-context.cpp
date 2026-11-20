@@ -1187,11 +1187,11 @@ float * llama_context::get_logits_ith(int32_t i) {
     }
 }
 
-llama_token llama_context::get_logits_argmax_ith(int32_t i, float * logit) {
+int32_t llama_context::get_logits_top_ith(int32_t i, const llama_token ** tokens, const float ** logits) {
     output_reorder();
 
-    if (!logits_top2_ids.has_data()) {
-        return LLAMA_TOKEN_NULL;
+    if (!logits_top_ids.has_data()) {
+        return 0;
     }
 
     int64_t j = -1;
@@ -1199,31 +1199,17 @@ llama_token llama_context::get_logits_argmax_ith(int32_t i, float * logit) {
         j = output_resolve_row(i);
     } catch (const std::exception & err) {
         GGML_UNUSED(err);
-        return LLAMA_TOKEN_NULL;
+        return 0;
     }
 
-    if ((size_t) 2*j + 1 >= logits_top2_ids.size) {
-        return LLAMA_TOKEN_NULL;
+    if ((size_t) (j + 1)*logits_top_n > logits_top_ids.size || logits_top_ids.data[j*logits_top_n] < 0) {
+        return 0;
     }
 
-    const llama_token * ids = logits_top2_ids.data + 2*j;
-    const float       * val = logits_top2_val.data + 2*j;
+    *tokens = logits_top_ids.data + j*logits_top_n;
+    *logits = logits_top_val.data + j*logits_top_n;
 
-    if (ids[0] < 0 || ids[1] < 0) {
-        return LLAMA_TOKEN_NULL;
-    }
-
-    // equal logits are ordered by the sampler's sort, which needs the full row
-    const int k = val[1] > val[0] ? 1 : 0;
-    if (!(val[k] > val[1 - k])) {
-        return LLAMA_TOKEN_NULL;
-    }
-
-    if (logit) {
-        *logit = val[k];
-    }
-
-    return ids[k];
+    return (int32_t) logits_top_n;
 }
 
 float * llama_context::get_embeddings() {
@@ -2514,19 +2500,20 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
 
-                auto * t_top2     = res->t_logits_top2;
-                auto * t_top2_val = res->t_logits_top2_val;
+                auto * t_top     = res->t_logits_top;
+                auto * t_top_val = res->t_logits_top_val;
 
-                if (t_top2 && logits_top2_ids.has_data()) {
-                    GGML_ASSERT(2*(n_outputs_prev + n_outputs) <= (int64_t) logits_top2_ids.size);
-                    ggml_backend_tensor_get_async(ggml_backend_sched_get_tensor_backend(sched.get(), t_top2),
-                            t_top2, logits_top2_ids.data + 2*n_outputs_prev, 0, 2*n_outputs*sizeof(llama_token));
-                    ggml_backend_tensor_get_async(ggml_backend_sched_get_tensor_backend(sched.get(), t_top2_val),
-                            t_top2_val, logits_top2_val.data + 2*n_outputs_prev, 0, 2*n_outputs*sizeof(float));
+                const bool has_top = t_top && logits_top_ids.has_data() && t_top->ne[0] == logits_top_n;
+                if (has_top) {
+                    GGML_ASSERT((n_outputs_prev + n_outputs)*logits_top_n <= (int64_t) logits_top_ids.size);
+                    ggml_backend_tensor_get_async(ggml_backend_sched_get_tensor_backend(sched.get(), t_top),
+                            t_top, logits_top_ids.data + n_outputs_prev*logits_top_n, 0, n_outputs*logits_top_n*sizeof(llama_token));
+                    ggml_backend_tensor_get_async(ggml_backend_sched_get_tensor_backend(sched.get(), t_top_val),
+                            t_top_val, logits_top_val.data + n_outputs_prev*logits_top_n, 0, n_outputs*logits_top_n*sizeof(float));
                 }
 
                 // the next ubatch overwrites the graph, so only the last one can keep its rows on the device
-                if (t_top2 && logits_top2_ids.has_data() && n_tokens_prev + ubatch.n_tokens == n_tokens_all) {
+                if (has_top && n_tokens_prev + ubatch.n_tokens == n_tokens_all) {
                     logits_dev         = t_logits;
                     logits_dev_backend = backend_res;
                     for (int64_t r = 0; r < n_outputs; ++r) {
@@ -2752,7 +2739,9 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     size_t backend_token_count = 0;
     size_t embd_layer_inp_float_count = 0;
 
-    const size_t top2_count = has_logits && cparams.logits_on_device ? 2*n_outputs_max : 0;
+    logits_top_n = has_logits && cparams.logits_on_device ? llama_logits_top_n(n_vocab) : 0;
+
+    const size_t top_count = logits_top_n*n_outputs_max;
 
     logits.size     = has_logits     ? n_vocab*n_outputs_max     : 0;
     embd.size       = has_embd       ? n_embd_out*n_outputs_max  : 0;
@@ -2784,8 +2773,8 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     const size_t prev_size = buf_output ? ggml_backend_buffer_get_size(buf_output.get()) : 0;
     const size_t new_size  =
-        (logits.size + embd.size + embd_nextn.size + embd_layer_inp_float_count + backend_float_count + top2_count) * sizeof(float) +
-        (                                                                         backend_token_count + top2_count) * sizeof(llama_token);
+        (logits.size + embd.size + embd_nextn.size + embd_layer_inp_float_count + backend_float_count + top_count) * sizeof(float) +
+        (                                                                         backend_token_count + top_count) * sizeof(llama_token);
 
     // alloc only when more than the current capacity is required
     // TODO: also consider shrinking the buffer
@@ -2830,13 +2819,13 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     logits = has_logits ? buffer_view<float>{output_base, logits.size} : buffer_view<float>{nullptr, 0};
     offset += logits.size * sizeof(float);
 
-    logits_top2_val = {top2_count ? (float *) (base + offset) : nullptr, top2_count};
-    offset += top2_count * sizeof(float);
+    logits_top_val = {top_count ? (float *) (base + offset) : nullptr, top_count};
+    offset += top_count * sizeof(float);
 
-    logits_top2_ids = {top2_count ? (llama_token *) (base + offset) : nullptr, top2_count};
-    offset += top2_count * sizeof(llama_token);
+    logits_top_ids = {top_count ? (llama_token *) (base + offset) : nullptr, top_count};
+    offset += top_count * sizeof(llama_token);
 
-    std::fill_n(logits_top2_ids.data, top2_count, -1);
+    std::fill_n(logits_top_ids.data, top_count, -1);
 
     logits_dev = nullptr;
     logits_dev_rows.assign(n_outputs_max, -1);
@@ -2966,11 +2955,10 @@ void llama_context::output_reorder() {
             }
         }
 
-        if (logits_top2_ids.has_data()) {
-            for (uint64_t k = 0; k < 2; k++) {
-                std::swap(logits_top2_ids.data[2*i0 + k], logits_top2_ids.data[2*i1 + k]);
-                std::swap(logits_top2_val.data[2*i0 + k], logits_top2_val.data[2*i1 + k]);
-            }
+        if (logits_top_ids.has_data()) {
+            const uint64_t n_top = logits_top_n;
+            std::swap_ranges(logits_top_ids.data + i0*n_top, logits_top_ids.data + (i0 + 1)*n_top, logits_top_ids.data + i1*n_top);
+            std::swap_ranges(logits_top_val.data + i0*n_top, logits_top_val.data + (i0 + 1)*n_top, logits_top_val.data + i1*n_top);
         }
 
         if (embd.size > 0) {
@@ -4834,10 +4822,10 @@ float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
     return res;
 }
 
-llama_token llama_get_logits_argmax_ith(llama_context * ctx, int32_t i, float * logit) {
+int32_t llama_get_logits_top_ith(llama_context * ctx, int32_t i, const llama_token ** tokens, const float ** logits) {
     ctx->synchronize();
 
-    return ctx->get_logits_argmax_ith(i, logit);
+    return ctx->get_logits_top_ith(i, tokens, logits);
 }
 
 float * llama_get_embeddings(llama_context * ctx) {

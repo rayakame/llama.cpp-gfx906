@@ -1433,8 +1433,8 @@ void llm_graph_result::reset() {
     t_sampled_logits.clear();
     t_candidates.clear();
 
-    t_logits_top2     = nullptr;
-    t_logits_top2_val = nullptr;
+    t_logits_top     = nullptr;
+    t_logits_top_val = nullptr;
 
     params = {};
 
@@ -1503,9 +1503,9 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
             ggml_set_output(tensor);
         }
     }
-    if (t_logits_top2 != nullptr) {
-        ggml_set_output(t_logits_top2);
-        ggml_set_output(t_logits_top2_val);
+    if (t_logits_top != nullptr) {
+        ggml_set_output(t_logits_top);
+        ggml_set_output(t_logits_top_val);
     }
 }
 
@@ -4575,23 +4575,28 @@ void llm_graph_context::build_sampling() const {
     */
 }
 
-void llm_graph_context::build_logits_top2() const {
+void llm_graph_context::build_logits_top() const {
     ggml_tensor * logits = res->t_logits;
 
-    // a batch with many outputs (perplexity) reads every row, so the top-2 would only add work
+    // a batch with many outputs (perplexity) reads every row, so the top would only add work
     if (!cparams.logits_on_device || !samplers.empty() || logits == nullptr ||
             logits->ne[1] < 1 || logits->ne[1] > 64 || !ggml_is_contiguous(logits)) {
         return;
     }
 
-    ggml_tensor * ids = ggml_top_k(ctx0, logits, 2);
+    const int64_t n_top = llama_logits_top_n(logits->ne[0]);
+    if (n_top < 2) {
+        return;
+    }
+
+    ggml_tensor * ids = ggml_top_k(ctx0, logits, n_top);
     ggml_tensor * val = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, logits, 1, logits->ne[0], logits->ne[1]), ids);
 
     ggml_build_forward_expand(gf, ids);
     ggml_build_forward_expand(gf, val);
 
-    res->t_logits_top2     = ids;
-    res->t_logits_top2_val = val;
+    res->t_logits_top     = ids;
+    res->t_logits_top_val = val;
 }
 
 int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t n_buckets, bool bidirectional) {

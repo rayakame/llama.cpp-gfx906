@@ -128,9 +128,6 @@ struct common_sampler {
     // k of a top-k sampler that sees the full vocabulary unchanged, see common_sampler_top_k_first()
     int32_t top_k_first = 0;
 
-    // the chain selects the largest logit, so the context's argmax can stand in for the row, see common_sampler_greedy_argmax()
-    bool greedy_argmax = false;
-
     void reset() {
         prev.clear();
 
@@ -160,11 +157,11 @@ struct common_sampler {
                 cur[i] = llama_token_data{sampled_ids[i], sampled_logits[i], 0.0f};
             }
         } else {
-            if (top_k_only && greedy_argmax) {
-                float logit = 0.0f;
-                const llama_token id = llama_get_logits_argmax_ith(ctx, idx, &logit);
-                if (id != LLAMA_TOKEN_NULL) {
-                    cur.assign(1, llama_token_data{id, logit, 0.0f});
+            if (top_k_only && top_k_first > 0) {
+                const llama_token * top_ids = nullptr;
+                const float       * top_val = nullptr;
+                const int32_t n_top = llama_get_logits_top_ith(ctx, idx, &top_ids, &top_val);
+                if (top_k_first < n_top && top_k_device(top_ids, top_val, n_top, top_k_first, cur)) {
                     cur_p = { cur.data(), cur.size(), -1, true };
                     return;
                 }
@@ -243,6 +240,28 @@ struct common_sampler {
         return true;
     }
 
+    // what top_k_unique() returns, from the n > k largest logits that the context found on the device
+    static bool top_k_device(const llama_token * ids, const float * val, int32_t n, int32_t k, std::vector<llama_token_data> & out) {
+        out.resize(n);
+        for (int32_t i = 0; i < n; ++i) {
+            if (std::isnan(val[i])) {
+                return false;
+            }
+            out[i] = llama_token_data{ids[i], val[i], 0.0f};
+        }
+
+        std::partial_sort(out.begin(), out.begin() + k + 1, out.end(), [](const llama_token_data & a, const llama_token_data & b) {
+            return a.logit > b.logit;
+        });
+        for (int32_t j = 1; j <= k; ++j) {
+            if (!(out[j - 1].logit > out[j].logit)) {
+                return false;
+            }
+        }
+        out.resize(k);
+        return true;
+    }
+
     mutable int64_t t_total_us = 0;
 };
 
@@ -293,51 +312,6 @@ static int32_t common_sampler_top_k_first(const common_params_sampling & params)
         }
     }
     return 0;
-}
-
-// true if the chain built from params selects the largest logit of the candidates that its first top-k leaves
-// (as built by common_sampler_init without a logit bias, see common_sampler_top_k_first())
-static bool common_sampler_greedy_argmax(const common_params_sampling & params) {
-    const bool greedy = params.n_probs == 0 && !params.samplers.empty() &&
-        ((params.samplers.back() == COMMON_SAMPLER_TYPE_TEMPERATURE && params.temp == 0.0f && params.dynatemp_range == 0.0f) ||
-         (params.samplers.back() == COMMON_SAMPLER_TYPE_TOP_K && params.top_k == 1));
-    if (!greedy) {
-        return false;
-    }
-    for (const auto & type : params.samplers) {
-        switch (type) {
-            case COMMON_SAMPLER_TYPE_TOP_K:
-            case COMMON_SAMPLER_TYPE_TOP_P:
-            case COMMON_SAMPLER_TYPE_MIN_P:
-            case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:
-            case COMMON_SAMPLER_TYPE_TEMPERATURE:
-                break;
-            case COMMON_SAMPLER_TYPE_TYPICAL_P:
-                if (params.typ_p < 1.0f) {
-                    return false;
-                }
-                break;
-            case COMMON_SAMPLER_TYPE_XTC:
-                if (params.xtc_probability > 0.0f && params.xtc_threshold <= 0.5f) {
-                    return false;
-                }
-                break;
-            case COMMON_SAMPLER_TYPE_PENALTIES:
-                if (std::max(params.penalty_last_n, 0) != 0 &&
-                    (params.penalty_repeat != 1.0f || params.penalty_freq != 0.0f || params.penalty_present != 0.0f)) {
-                    return false;
-                }
-                break;
-            case COMMON_SAMPLER_TYPE_DRY:
-                if (params.dry_multiplier != 0.0f && params.dry_base >= 1.0f && std::max(params.dry_penalty_last_n, 0) != 0) {
-                    return false;
-                }
-                break;
-            default:
-                return false;
-        }
-    }
-    return true;
 }
 
 struct common_sampler * common_sampler_init(
@@ -598,7 +572,6 @@ struct common_sampler * common_sampler_init(
     };
 
     result->top_k_first = has_logit_bias ? 0 : common_sampler_top_k_first(params);
-    result->greedy_argmax = result->top_k_first > 0 && common_sampler_greedy_argmax(params);
 
     return result;
 }
@@ -683,7 +656,6 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .cur_p   = */ gsmpl->cur_p,
         /* .rng     = */ gsmpl->rng,
         /* .top_k_first = */ gsmpl->top_k_first,
-        /* .greedy_argmax = */ gsmpl->greedy_argmax,
     };
 }
 
@@ -706,7 +678,6 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
     dst->rng        = src->rng;
     dst->top_k_first = src->top_k_first;
-    dst->greedy_argmax = src->greedy_argmax;
     dst->t_total_us = src->t_total_us;
 }
 
