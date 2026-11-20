@@ -4291,6 +4291,57 @@ struct test_add_rms_norm : public test_case {
     }
 };
 
+// GGML_OP_ADD + GGML_OP_RMS_NORM + GGML_OP_MUL, the sum checked too as it is the residual of the next layer (fused operation)
+struct test_add_rms_norm_mul : public test_case {
+    const std::array<int64_t, 4> ne;
+    const bool inplace;
+    const ggml_type type_mm; // GGML_TYPE_COUNT: no mat-mul on the result
+    ggml_tensor * sum = nullptr;
+    ggml_tensor * out = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "ADD_RMS_NORM_MUL";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { sum, out }; }
+
+    std::string vars() override {
+        return VARS_TO_STR2(ne, inplace) + ",type_mm=" + (type_mm == GGML_TYPE_COUNT ? "none" : ggml_type_name(type_mm));
+    }
+
+    double max_nmse_err() override {
+        return type_mm == GGML_TYPE_COUNT ? 1e-7 : 5e-4;
+    }
+
+    test_add_rms_norm_mul(std::array<int64_t, 4> ne = {64, 5, 4, 3}, bool inplace = false, ggml_type type_mm = GGML_TYPE_COUNT)
+        : ne(ne), inplace(inplace), type_mm(type_mm) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * b = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+        ggml_set_name(a, "a");
+        ggml_set_name(b, "b");
+        ggml_set_name(w, "w");
+
+        sum = inplace ? ggml_add_inplace(ctx, a, b) : ggml_add(ctx, a, b);
+        ggml_set_name(sum, "sum");
+
+        out = ggml_mul(ctx, ggml_rms_norm(ctx, sum, 1e-6f), w);
+        if (type_mm != GGML_TYPE_COUNT) {
+            ggml_tensor * m = ggml_new_tensor_2d(ctx, type_mm, ne[0], 256);
+            ggml_set_name(m, "m");
+            out = ggml_mul_mat(ctx, m, out);
+        }
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_UNARY(RELU) + GGML_OP_SQR (fused operation)
 struct test_relu_sqr : public test_case {
     const ggml_type type;
@@ -11916,6 +11967,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, {n, 1, 1, 1}, 1e-6f, false, multi_add));
         }
         test_cases.emplace_back(new test_add_rms_norm(GGML_TYPE_F32, {n, 1, 1, 1}, 1e-6f, false));
+    }
+    for (bool inplace : {false, true}) {
+        for (int64_t n : {1, 2, 4, 16, 512}) {
+            test_cases.emplace_back(new test_add_rms_norm_mul({5120, n, 1, 1}, inplace));
+        }
+        test_cases.emplace_back(new test_add_rms_norm_mul({64, 5, 4, 3}, inplace));
+        test_cases.emplace_back(new test_add_rms_norm_mul({1025, 3, 2, 1}, inplace));
+        test_cases.emplace_back(new test_add_rms_norm_mul({20480, 2, 1, 1}, inplace));
+    }
+    for (ggml_type type_mm : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
+        for (int64_t n : {1, 2, 4, 8, 16}) {
+            test_cases.emplace_back(new test_add_rms_norm_mul({5120, n, 1, 1}, false, type_mm));
+        }
     }
     for (uint32_t n : {64, 1025}) {
         test_cases.emplace_back(new test_add_add(GGML_TYPE_F32, GGML_TYPE_F32, { n, 5, 4, 3 }, false, false));
