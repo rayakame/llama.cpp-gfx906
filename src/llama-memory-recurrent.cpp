@@ -1348,6 +1348,21 @@ uint32_t llama_memory_recurrent_context::get_size() const {
     return mem->size;
 }
 
+bool llama_memory_recurrent_context::get_rs_in_place(uint32_t n_seqs) const {
+    if (is_full) {
+        return false;
+    }
+    // s_copy(i) is src0 in rollback group rs_idx and sequence i writes cell head + i in every group
+    const int32_t head = (int32_t) mem->head;
+    for (int32_t i = 0; i < (int32_t) n_seqs; ++i) {
+        const int32_t src0 = mem->cells[head + i].src0;
+        if (src0 != head + i && src0 >= head && src0 < head + (int32_t) n_seqs) {
+            return false;
+        }
+    }
+    return true;
+}
+
 ggml_tensor * llama_memory_recurrent_context::get_r_l(int32_t il) const {
     return mem->r_l[il];
 }

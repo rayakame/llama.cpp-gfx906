@@ -5457,6 +5457,109 @@ struct test_gated_delta_net_cache_fusion : public test_case {
     }
 };
 
+// GET_ROWS state gather + GATED_DELTA_NET + snapshot CPY into the same cache, as build_rs and build_recurrent_attn
+// make them for Qwen3.8 27B; with the hint the GDN may read the cache rows in place
+struct test_gdn_state_in_place : public test_case {
+    const int64_t n_seq_tokens;
+    const int64_t K;
+    const int64_t mem_size;
+    const int64_t head;
+    const std::vector<int32_t> rows; // the cache row each sequence reads its state from
+    const bool hint;
+
+    ggml_tensor * attn_node  = nullptr;
+    ggml_tensor * store_node = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GDN_STATE_IN_PLACE";
+    }
+
+    std::string vars() override {
+        std::string r;
+        for (size_t i = 0; i < rows.size(); ++i) {
+            r += (i ? "/" : "") + std::to_string(rows[i]);
+        }
+        return VARS_TO_STR5(n_seq_tokens, K, mem_size, head, hint) + ",rows=" + r;
+    }
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { attn_node, store_node }; }
+
+    test_gdn_state_in_place(int64_t n_seq_tokens = 4, int64_t K = 4, int64_t mem_size = 4, int64_t head = 0,
+            std::vector<int32_t> rows = { 0, 1, 2, 3 }, bool hint = true)
+        : n_seq_tokens(n_seq_tokens), K(K), mem_size(mem_size), head(head), rows(rows), hint(hint) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t S_v       = 128;
+        const int64_t H_k       = 16;
+        const int64_t H_v       = 48;
+        const int64_t D         = S_v * S_v * H_v;
+        const int64_t T         = n_seq_tokens;
+        const int64_t n_seqs    = rows.size();
+        const int64_t n_written = std::min(T, K);
+
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, mem_size * K);
+        ggml_tensor * ids   = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
+        ggml_tensor * q     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_v, H_k, T, n_seqs);
+        ggml_tensor * k     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_v, H_k, T, n_seqs);
+        ggml_tensor * v     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_v, H_v, T, n_seqs);
+        ggml_tensor * g     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H_v, T, n_seqs);
+        ggml_tensor * beta  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H_v, T, n_seqs);
+        ggml_set_name(cache, "cache");
+        ggml_set_name(ids,   "ids");
+        ggml_set_name(q,     "q");
+        ggml_set_name(k,     "k");
+        ggml_set_name(v,     "v");
+        ggml_set_name(g,     "g");
+        ggml_set_name(beta,  "beta");
+
+        q = ggml_l2_norm(ctx, q, 1e-6f);
+        k = ggml_l2_norm(ctx, k, 1e-6f);
+
+        ggml_tensor * state = ggml_get_rows(ctx, cache, ids);
+        if (hint) {
+            ggml_get_rows_set_hint(state, GGML_HINT_ROWS_IN_PLACE);
+        }
+        state = ggml_view_2d(ctx, state, D, n_seqs, state->nb[1], 0);
+        state = ggml_reshape_4d(ctx, state, S_v, S_v, H_v, n_seqs);
+
+        ggml_tensor * gdn = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
+
+        attn_node = ggml_view_4d(ctx, gdn, S_v, H_v, T, n_seqs,
+                ggml_row_size(GGML_TYPE_F32, S_v), ggml_row_size(GGML_TYPE_F32, S_v * H_v),
+                ggml_row_size(GGML_TYPE_F32, S_v * H_v * T), 0);
+        ggml_set_name(attn_node, "attn");
+
+        ggml_tensor * snaps = ggml_view_3d(ctx, gdn, D, n_seqs, n_written,
+                ggml_row_size(GGML_TYPE_F32, D), ggml_row_size(GGML_TYPE_F32, D * n_seqs),
+                ggml_row_size(GGML_TYPE_F32, S_v * H_v * T * n_seqs));
+        ggml_tensor * cells = ggml_view_3d(ctx, cache, D, n_seqs, n_written,
+                cache->nb[1], mem_size * cache->nb[1], head * cache->nb[1]);
+        store_node = ggml_cpy(ctx, snaps, cells);
+        ggml_set_name(store_node, "store");
+
+        return ggml_add(ctx, ggml_sum(ctx, ggml_cont(ctx, store_node)), ggml_sum(ctx, attn_node));
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op) || t->view_src != nullptr) { continue; }
+            if (strcmp(t->name, "ids") == 0) {
+                ggml_backend_tensor_set(t, rows.data(), 0, rows.size() * sizeof(int32_t));
+            } else if (strcmp(t->name, "g") == 0) {
+                init_tensor_uniform(t, -20.0f, -1e-4f);
+            } else if (strcmp(t->name, "beta") == 0) {
+                init_tensor_uniform(t, 0.0f, 1.0f);
+            } else if (strcmp(t->name, "v") == 0) {
+                init_tensor_uniform(t, -0.3f, 5.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_GATED_LINEAR_ATTN
 struct test_gla : public test_case {
     const ggml_type type;
@@ -13455,6 +13558,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   4, 1, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 32,   4, 2, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   8, 1, 4));
+
+    // state gather read in place: identity rows, rollback groups, rows outside the written cells, no hint
+    test_cases.emplace_back(new test_gdn_state_in_place( 4, 4, 4, 0, { 0, 1, 2, 3 }, true));
+    test_cases.emplace_back(new test_gdn_state_in_place( 4, 4, 4, 0, { 4, 9, 2, 15 }, true));
+    test_cases.emplace_back(new test_gdn_state_in_place( 1, 4, 4, 1, { 1, 2 }, true));
+    test_cases.emplace_back(new test_gdn_state_in_place(16, 4, 6, 2, { 0, 0, 4 }, true));
+    test_cases.emplace_back(new test_gdn_state_in_place( 2, 1, 4, 0, { 0, 1 }, true));
+    test_cases.emplace_back(new test_gdn_state_in_place( 4, 4, 4, 0, { 1, 0, 2, 3 }, false));
+    test_cases.emplace_back(new test_gdn_state_in_place( 4, 4, 4, 1, { 5 }, false));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging

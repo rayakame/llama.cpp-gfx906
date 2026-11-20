@@ -522,6 +522,7 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
 
     res &= head == mctx->get_head();
     res &= rs_z == mctx->get_rs_z();
+    res &= rs_in_place == mctx->get_rs_in_place(params.ubatch.n_seqs);
 
     return res;
 }
@@ -1241,6 +1242,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->rs_in_place == mctx->get_recr()->get_rs_in_place(params.ubatch.n_seqs);
 
     return res;
 }
@@ -1286,6 +1288,7 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->rs_in_place == mctx->get_recr()->get_rs_in_place(params.ubatch.n_seqs);
 
     return res;
 }
@@ -1357,6 +1360,7 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->rs_in_place == mctx->get_recr()->get_rs_in_place(params.ubatch.n_seqs);
 
     return res;
 }
@@ -4017,7 +4021,8 @@ ggml_tensor * llm_graph_context::build_rs(
            uint32_t   rs_head,
            uint32_t   rs_size,
             int32_t   rs_zero,
-        const llm_graph_get_rows_fn & get_state_rows) const {
+        const llm_graph_get_rows_fn & get_state_rows,
+               bool   rows_in_place) const {
 
     GGML_UNUSED(rs_size);
     ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, s->ne[1]);
@@ -4034,6 +4039,9 @@ ggml_tensor * llm_graph_context::build_rs(
     const int64_t i0 = n_rs - state_copy->ne[0];
 
     ggml_tensor * states_all = ggml_get_rows(ctx0, states, state_copy);
+    if (rows_in_place && !get_state_rows && state_copy->ne[0] == n_seqs) {
+        ggml_get_rows_set_hint(states_all, GGML_HINT_ROWS_IN_PLACE);
+    }
 
     ggml_tensor * output_states = get_state_rows ?
         get_state_rows(ctx0, states, state_copy_main) :
@@ -4069,6 +4077,7 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
 
     inp->head = mctx_cur->get_head();
     inp->rs_z = mctx_cur->get_rs_z();
+    inp->rs_in_place = mctx_cur->get_rs_in_place(n_seqs);
 
     return inp;
 }
@@ -4095,7 +4104,7 @@ ggml_tensor * llm_graph_context::build_rs(
 
     return build_rs(s, state_copy, inp->s_copy_main, state_size, n_seqs,
                     kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z(),
-                    get_state_rows);
+                    get_state_rows, inp->rs_in_place);
 }
 
 void llm_graph_context::build_conv_state_store(

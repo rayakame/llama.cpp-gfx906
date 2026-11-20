@@ -3543,10 +3543,17 @@ static int ggml_cuda_try_gdn_cache_fusion(
 // The state input of a single-sequence GATED_DELTA_NET is RESHAPE(VIEW(GET_ROWS(states, ids))), a 3 MB gather per
 // layer. When nothing else reads the gather and nothing writes the states before the GDN, the kernel reads the
 // row ids[0] straight from the cache and the GET_ROWS is skipped: each thread reads its state elements before it
-// writes them back, and with one sequence no other block writes them. Returns the GET_ROWS, or nullptr.
+// writes them back, and with one sequence no other block writes them. Several sequences need the host's
+// GGML_HINT_ROWS_IN_PLACE: no sequence reads a row that another one writes. Returns the GET_ROWS, or nullptr.
 static const ggml_tensor * ggml_cuda_gdn_state_gather(const ggml_cgraph * cgraph, int gdn_idx) {
     const ggml_tensor * gdn = cgraph->nodes[gdn_idx];
-    if (gdn->op != GGML_OP_GATED_DELTA_NET || gdn->src[2]->ne[3] != 1) {
+    if (gdn->op != GGML_OP_GATED_DELTA_NET) {
+        return nullptr;
+    }
+    // GGML_GDN_STATE_MULTISEQ=0 keeps the gather for several sequences
+    static const bool multiseq = [] { const char * e = getenv("GGML_GDN_STATE_MULTISEQ"); return !e || atoi(e) != 0; }();
+    const int64_t n_seqs = gdn->src[2]->ne[3];
+    if (n_seqs != 1 && !multiseq) {
         return nullptr;
     }
     const int64_t D = gdn->src[2]->ne[0] * gdn->src[2]->ne[0] * gdn->src[2]->ne[1];
@@ -3567,9 +3574,12 @@ static const ggml_tensor * ggml_cuda_gdn_state_gather(const ggml_cgraph * cgraph
     const ggml_tensor * states = gather->src[0];
     const ggml_tensor * ids    = gather->src[1];
     if (gather->type != GGML_TYPE_F32 || states->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 ||
-            gather->ne[0] != D || gather->ne[1] != 1 || ggml_nrows(gather) != 1 ||
+            gather->ne[0] != D || gather->ne[1] != n_seqs || ggml_nrows(gather) != n_seqs ||
             states->ne[0] != D || states->nb[1] != (size_t) D*sizeof(float) || ggml_nrows(ids) != 1 ||
             states->data == nullptr || ids->data == nullptr) {
+        return nullptr;
+    }
+    if (n_seqs != 1 && ggml_get_op_params_i32(gather, 0) != GGML_HINT_ROWS_IN_PLACE) {
         return nullptr;
     }
 

@@ -181,6 +181,9 @@ public:
     int32_t  get_rs_z() const;
     uint32_t get_size() const;
 
+    // no sequence of the ubatch reads its state from the cell another one writes
+    bool get_rs_in_place(uint32_t n_seqs) const;
+
     ggml_tensor * get_r_l(int32_t il) const;
     ggml_tensor * get_s_l(int32_t il) const;
     ggml_tensor * get_p_l(int32_t il) const;

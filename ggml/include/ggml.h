@@ -457,6 +457,7 @@ extern "C" {
     enum ggml_op_hint {
         GGML_HINT_NONE             = 0,
         GGML_HINT_SRC0_IS_HADAMARD = 1,
+        GGML_HINT_ROWS_IN_PLACE    = 2,
     };
 
     // model file types
@@ -1750,6 +1751,11 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,  // data
             struct ggml_tensor  * b); // row indices
+
+    // GGML_HINT_ROWS_IN_PLACE: a consumer of row i that writes only its own rows may read row b[i] of a in place
+    GGML_API void ggml_get_rows_set_hint(
+            struct ggml_tensor * a,
+            enum ggml_op_hint    hint);
 
     GGML_API struct ggml_tensor * ggml_get_rows_back(
             struct ggml_context * ctx,

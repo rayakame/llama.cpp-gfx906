@@ -316,6 +316,8 @@ public:
     // used in view offsets, need to match for valid graph reuse
     uint32_t head;
     int32_t rs_z;
+
+    bool rs_in_place;
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {
@@ -1455,7 +1457,8 @@ struct llm_graph_context {
                uint32_t   rs_head,
                uint32_t   rs_size,
                 int32_t   rs_zero,
-            const llm_graph_get_rows_fn & get_state_rows = nullptr) const;
+            const llm_graph_get_rows_fn & get_state_rows = nullptr,
+                   bool   rows_in_place = false) const;
 
     llm_graph_input_rs * build_rs_inp() const;
 

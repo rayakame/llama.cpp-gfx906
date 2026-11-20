@@ -4035,6 +4035,14 @@ struct ggml_tensor * ggml_get_rows(
     return result;
 }
 
+void ggml_get_rows_set_hint(
+        struct ggml_tensor * a,
+        enum ggml_op_hint    hint) {
+    GGML_ASSERT(a->op == GGML_OP_GET_ROWS);
+
+    ggml_set_op_params_i32(a, 0, (int32_t) hint);
+}
+
 // ggml_get_rows_back
 
 struct ggml_tensor * ggml_get_rows_back(
