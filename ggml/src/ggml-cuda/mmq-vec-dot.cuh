@@ -170,7 +170,7 @@ template <ggml_type type, int J, bool fallback, int JL = J> static __device__ __
     }
 }
 
-template <ggml_type type, int J, bool fallback, int JL = J, bool y_smem = false> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a(
+template <ggml_type type, int J, bool fallback, int JL = J, bool y_smem = false, bool unroll_k = true> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a(
         const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback, GGML_PREC_Q8) / warp_size;
@@ -182,8 +182,7 @@ template <ggml_type type, int J, bool fallback, int JL = J, bool y_smem = false>
     const int   * y_qs = (const int   *) y + 4;
     const float * y_df = (const float *) y;
 
-// #pragma unroll
-    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += VDR_Q8_0_Q8_1_MMQ) {
+    const auto dot_k01 = [&](const int k01) {
         const int k0 = k00 + k01;
 
 #pragma unroll
@@ -199,6 +198,22 @@ template <ggml_type type, int J, bool fallback, int JL = J, bool y_smem = false>
                      x_df[i*(2*MMQ_TILE_NE_K/QI8_0) + i/(QI8_0/2) + k0/QI8_0], y_df[j*MMQ_TILE_Y_K + (k0/QI8_1) % (MMQ_TILE_NE_K/QI8_1)]);
             }
         }
+    };
+
+#if defined(__gfx906__)
+    if constexpr (unroll_k) {
+        // Two k01 steps share each y address (the j stride is past the ds_read2 offset range); a full unroll, ROCm's default at J <= 16, spills.
+#pragma unroll 2
+        for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += VDR_Q8_0_Q8_1_MMQ) {
+            dot_k01(k01);
+        }
+        return;
+    }
+#endif // defined(__gfx906__)
+
+// #pragma unroll
+    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += VDR_Q8_0_Q8_1_MMQ) {
+        dot_k01(k01);
     }
 }
 
