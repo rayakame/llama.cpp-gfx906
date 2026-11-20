@@ -84,6 +84,8 @@ struct llama_context {
     float * get_logits();
     float * get_logits_ith(int32_t i);
 
+    llama_token get_logits_argmax_ith(int32_t i, float * logit);
+
     float * get_embeddings();
     float * get_embeddings_ith(int32_t i);
     float * get_embeddings_seq(llama_seq_id seq_id);
@@ -252,6 +254,9 @@ private:
 
     void output_reorder();
 
+    // copy the output rows that are still on the device to the host
+    void logits_fetch();
+
     // map the output row index `i` to batch index
     int64_t output_resolve_row(int32_t i) const;
 
@@ -335,6 +340,15 @@ private:
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
+
+    // the two largest logits of each output row and their ids ([n_outputs][2]), id -1 if not computed
+    buffer_view<llama_token> logits_top2_ids = {nullptr, 0};
+    buffer_view<float>       logits_top2_val = {nullptr, 0};
+
+    // the logits rows of the last ubatch stay in its graph until they are read
+    ggml_tensor *        logits_dev         = nullptr;
+    ggml_backend_t       logits_dev_backend = nullptr;
+    std::vector<int32_t> logits_dev_rows; // per output row: its row in logits_dev, -1 if on the host
 
     // embeddings output (2-dimensional array: [n_outputs][n_embd])
     // populated only when pooling_type == LLAMA_POOLING_TYPE_NONE

@@ -414,6 +414,11 @@ llama_context::llama_context(
     cparams.training = false;
 
     {
+        const char * LLAMA_LOGITS_ON_DEVICE = getenv("LLAMA_LOGITS_ON_DEVICE");
+        cparams.logits_on_device = LLAMA_LOGITS_ON_DEVICE ? atoi(LLAMA_LOGITS_ON_DEVICE) != 0 : true;
+    }
+
+    {
         const char * LLAMA_GRAPH_REUSE_DISABLE = getenv("LLAMA_GRAPH_REUSE_DISABLE");
         graph_reuse_disable = LLAMA_GRAPH_REUSE_DISABLE ? (atoi(LLAMA_GRAPH_REUSE_DISABLE) != 0) : graph_reuse_disable;
 
@@ -1050,6 +1055,8 @@ bool llama_context::memory_update(bool optimize) {
                 }
         }
 
+        logits_fetch();
+
         // reset the previous graph results to make sure that they won't be reused
         // TODO: make mctx->apply() report if a graph reserve is needed, then reset graph results only if the memory module reset the scheduler
         for (auto & res : gf_res_prev) {
@@ -1092,7 +1099,42 @@ enum llama_pooling_type llama_context::pooling_type() const {
 float * llama_context::get_logits() {
     output_reorder();
 
+    logits_fetch();
+
     return logits.data;
+}
+
+void llama_context::logits_fetch() {
+    if (logits_dev == nullptr) {
+        return;
+    }
+
+    const size_t row_size = model.vocab.n_tokens()*sizeof(float);
+    const int64_t n_rows  = logits_dev_rows.size();
+
+    // all rows at once: callers read neighbouring rows through the pointer of one row
+    bool copied = false;
+    for (int64_t r = 0; r < n_rows; ) {
+        const int32_t d = logits_dev_rows[r];
+        if (d < 0) {
+            ++r;
+            continue;
+        }
+        int64_t n = 1;
+        while (r + n < n_rows && logits_dev_rows[r + n] == d + n) {
+            ++n;
+        }
+        ggml_backend_tensor_get_async(logits_dev_backend, logits_dev, (uint8_t *) logits.data + r*row_size, d*row_size, n*row_size);
+        std::fill_n(logits_dev_rows.begin() + r, n, -1);
+        copied = true;
+        r += n;
+    }
+
+    if (copied) {
+        ggml_backend_synchronize(logits_dev_backend);
+    }
+
+    logits_dev = nullptr;
 }
 
 int64_t llama_context::output_resolve_row(int32_t i) const {
@@ -1133,6 +1175,7 @@ float * llama_context::get_logits_ith(int32_t i) {
         }
 
         const int64_t j = output_resolve_row(i);
+        logits_fetch();
         return logits.data + j*model.vocab.n_tokens();
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: invalid logits id %d, reason: %s\n", __func__, i, err.what());
@@ -1142,6 +1185,45 @@ float * llama_context::get_logits_ith(int32_t i) {
         return nullptr;
 #endif
     }
+}
+
+llama_token llama_context::get_logits_argmax_ith(int32_t i, float * logit) {
+    output_reorder();
+
+    if (!logits_top2_ids.has_data()) {
+        return LLAMA_TOKEN_NULL;
+    }
+
+    int64_t j = -1;
+    try {
+        j = output_resolve_row(i);
+    } catch (const std::exception & err) {
+        GGML_UNUSED(err);
+        return LLAMA_TOKEN_NULL;
+    }
+
+    if ((size_t) 2*j + 1 >= logits_top2_ids.size) {
+        return LLAMA_TOKEN_NULL;
+    }
+
+    const llama_token * ids = logits_top2_ids.data + 2*j;
+    const float       * val = logits_top2_val.data + 2*j;
+
+    if (ids[0] < 0 || ids[1] < 0) {
+        return LLAMA_TOKEN_NULL;
+    }
+
+    // equal logits are ordered by the sampler's sort, which needs the full row
+    const int k = val[1] > val[0] ? 1 : 0;
+    if (!(val[k] > val[1 - k])) {
+        return LLAMA_TOKEN_NULL;
+    }
+
+    if (logit) {
+        *logit = val[k];
+    }
+
+    return ids[k];
 }
 
 float * llama_context::get_embeddings() {
@@ -1943,6 +2025,8 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
         t_compute_start_us = ggml_time_us();
     }
 
+    logits_dev = nullptr;
+
     sched_reserve();
 
     n_queued_tokens += n_tokens;
@@ -2248,6 +2332,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     output_swaps.clear();
     embd_batch_idxs.clear();
 
+    // the new batch replaces the outputs, so rows still on the device are not needed
+    logits_dev = nullptr;
+
     sched_reserve();
 
     bool did_optimize = false;
@@ -2426,7 +2513,28 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             if (n_outputs) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
-                ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+
+                auto * t_top2     = res->t_logits_top2;
+                auto * t_top2_val = res->t_logits_top2_val;
+
+                if (t_top2 && logits_top2_ids.has_data()) {
+                    GGML_ASSERT(2*(n_outputs_prev + n_outputs) <= (int64_t) logits_top2_ids.size);
+                    ggml_backend_tensor_get_async(ggml_backend_sched_get_tensor_backend(sched.get(), t_top2),
+                            t_top2, logits_top2_ids.data + 2*n_outputs_prev, 0, 2*n_outputs*sizeof(llama_token));
+                    ggml_backend_tensor_get_async(ggml_backend_sched_get_tensor_backend(sched.get(), t_top2_val),
+                            t_top2_val, logits_top2_val.data + 2*n_outputs_prev, 0, 2*n_outputs*sizeof(float));
+                }
+
+                // the next ubatch overwrites the graph, so only the last one can keep its rows on the device
+                if (t_top2 && logits_top2_ids.has_data() && n_tokens_prev + ubatch.n_tokens == n_tokens_all) {
+                    logits_dev         = t_logits;
+                    logits_dev_backend = backend_res;
+                    for (int64_t r = 0; r < n_outputs; ++r) {
+                        logits_dev_rows[n_outputs_prev + r] = r;
+                    }
+                } else {
+                    ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                }
             }
         }
 
@@ -2644,6 +2752,8 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     size_t backend_token_count = 0;
     size_t embd_layer_inp_float_count = 0;
 
+    const size_t top2_count = has_logits && cparams.logits_on_device ? 2*n_outputs_max : 0;
+
     logits.size     = has_logits     ? n_vocab*n_outputs_max     : 0;
     embd.size       = has_embd       ? n_embd_out*n_outputs_max  : 0;
     embd_nextn.size = has_embd_nextn ? n_embd_out*n_outputs_max  : 0;
@@ -2674,8 +2784,8 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     const size_t prev_size = buf_output ? ggml_backend_buffer_get_size(buf_output.get()) : 0;
     const size_t new_size  =
-        (logits.size + embd.size + embd_nextn.size + embd_layer_inp_float_count + backend_float_count) * sizeof(float) +
-        (                                                                         backend_token_count) * sizeof(llama_token);
+        (logits.size + embd.size + embd_nextn.size + embd_layer_inp_float_count + backend_float_count + top2_count) * sizeof(float) +
+        (                                                                         backend_token_count + top2_count) * sizeof(llama_token);
 
     // alloc only when more than the current capacity is required
     // TODO: also consider shrinking the buffer
@@ -2719,6 +2829,17 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     logits = has_logits ? buffer_view<float>{output_base, logits.size} : buffer_view<float>{nullptr, 0};
     offset += logits.size * sizeof(float);
+
+    logits_top2_val = {top2_count ? (float *) (base + offset) : nullptr, top2_count};
+    offset += top2_count * sizeof(float);
+
+    logits_top2_ids = {top2_count ? (llama_token *) (base + offset) : nullptr, top2_count};
+    offset += top2_count * sizeof(llama_token);
+
+    std::fill_n(logits_top2_ids.data, top2_count, -1);
+
+    logits_dev = nullptr;
+    logits_dev_rows.assign(n_outputs_max, -1);
 
     embd = has_embd ? buffer_view<float>{(float *) (base + offset), embd.size} : buffer_view<float>{nullptr, 0};
     offset += embd.size * sizeof(float);
@@ -2827,8 +2948,28 @@ void llama_context::output_reorder() {
         const uint64_t i1 = output_swaps[s].i1;
 
         if (logits.size > 0) {
-            for (uint64_t k = 0; k < n_vocab; k++) {
-                std::swap(logits.data[i0*n_vocab + k], logits.data[i1*n_vocab + k]);
+            const int32_t d0 = i0 < logits_dev_rows.size() ? logits_dev_rows[i0] : -1;
+            const int32_t d1 = i1 < logits_dev_rows.size() ? logits_dev_rows[i1] : -1;
+
+            // a row still on the device moves by its index, a row on the host by its data
+            if (d0 < 0 && d1 < 0) {
+                for (uint64_t k = 0; k < n_vocab; k++) {
+                    std::swap(logits.data[i0*n_vocab + k], logits.data[i1*n_vocab + k]);
+                }
+            } else if (d0 < 0) {
+                std::copy_n(logits.data + i0*n_vocab, n_vocab, logits.data + i1*n_vocab);
+            } else if (d1 < 0) {
+                std::copy_n(logits.data + i1*n_vocab, n_vocab, logits.data + i0*n_vocab);
+            }
+            if (d0 >= 0 || d1 >= 0) {
+                std::swap(logits_dev_rows[i0], logits_dev_rows[i1]);
+            }
+        }
+
+        if (logits_top2_ids.has_data()) {
+            for (uint64_t k = 0; k < 2; k++) {
+                std::swap(logits_top2_ids.data[2*i0 + k], logits_top2_ids.data[2*i1 + k]);
+                std::swap(logits_top2_val.data[2*i0 + k], logits_top2_val.data[2*i1 + k]);
             }
         }
 
@@ -3029,6 +3170,8 @@ ggml_cgraph * llama_context::graph_reserve(
         n_tokens = ((n_tokens + (n_seqs - 1)) / n_seqs) * n_seqs; // round to next multiple of n_seqs
         LLAMA_LOG_DEBUG("%s: making n_tokens a multiple of n_seqs - n_tokens = %u, n_seqs = %u, n_outputs = %u\n", __func__, n_tokens, n_seqs, n_outputs);
     }
+
+    logits_fetch();
 
     ggml_backend_sched_reset(sched.get());
 
@@ -4274,6 +4417,8 @@ void llama_context::opt_epoch_iter(
     const uint32_t n_batch  = std::min(this->n_batch(),  n_ctx);
     const uint32_t n_ubatch = std::min(this->n_ubatch(), n_batch);
 
+    logits_dev = nullptr;
+
     memory->clear(true);
 
     for (uint32_t pos_ctx = 0; pos_ctx < n_ctx; pos_ctx += n_batch) {
@@ -4687,6 +4832,12 @@ float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
     }
 
     return res;
+}
+
+llama_token llama_get_logits_argmax_ith(llama_context * ctx, int32_t i, float * logit) {
+    ctx->synchronize();
+
+    return ctx->get_logits_argmax_ith(i, logit);
 }
 
 float * llama_get_embeddings(llama_context * ctx) {

@@ -128,6 +128,9 @@ struct common_sampler {
     // k of a top-k sampler that sees the full vocabulary unchanged, see common_sampler_top_k_first()
     int32_t top_k_first = 0;
 
+    // the chain selects the largest logit, so the context's argmax can stand in for the row, see common_sampler_greedy_argmax()
+    bool greedy_argmax = false;
+
     void reset() {
         prev.clear();
 
@@ -157,6 +160,15 @@ struct common_sampler {
                 cur[i] = llama_token_data{sampled_ids[i], sampled_logits[i], 0.0f};
             }
         } else {
+            if (top_k_only && greedy_argmax) {
+                float logit = 0.0f;
+                const llama_token id = llama_get_logits_argmax_ith(ctx, idx, &logit);
+                if (id != LLAMA_TOKEN_NULL) {
+                    cur.assign(1, llama_token_data{id, logit, 0.0f});
+                    cur_p = { cur.data(), cur.size(), -1, true };
+                    return;
+                }
+            }
             const auto * logits = llama_get_logits_ith(ctx, idx);
             GGML_ASSERT(logits != nullptr);
             if (top_k_only && top_k_first > 0 && top_k_first < n_vocab && top_k_unique(logits, n_vocab, top_k_first, cur)) {
@@ -281,6 +293,51 @@ static int32_t common_sampler_top_k_first(const common_params_sampling & params)
         }
     }
     return 0;
+}
+
+// true if the chain built from params selects the largest logit of the candidates that its first top-k leaves
+// (as built by common_sampler_init without a logit bias, see common_sampler_top_k_first())
+static bool common_sampler_greedy_argmax(const common_params_sampling & params) {
+    const bool greedy = params.n_probs == 0 && !params.samplers.empty() &&
+        ((params.samplers.back() == COMMON_SAMPLER_TYPE_TEMPERATURE && params.temp == 0.0f && params.dynatemp_range == 0.0f) ||
+         (params.samplers.back() == COMMON_SAMPLER_TYPE_TOP_K && params.top_k == 1));
+    if (!greedy) {
+        return false;
+    }
+    for (const auto & type : params.samplers) {
+        switch (type) {
+            case COMMON_SAMPLER_TYPE_TOP_K:
+            case COMMON_SAMPLER_TYPE_TOP_P:
+            case COMMON_SAMPLER_TYPE_MIN_P:
+            case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:
+            case COMMON_SAMPLER_TYPE_TEMPERATURE:
+                break;
+            case COMMON_SAMPLER_TYPE_TYPICAL_P:
+                if (params.typ_p < 1.0f) {
+                    return false;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_XTC:
+                if (params.xtc_probability > 0.0f && params.xtc_threshold <= 0.5f) {
+                    return false;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_PENALTIES:
+                if (std::max(params.penalty_last_n, 0) != 0 &&
+                    (params.penalty_repeat != 1.0f || params.penalty_freq != 0.0f || params.penalty_present != 0.0f)) {
+                    return false;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_DRY:
+                if (params.dry_multiplier != 0.0f && params.dry_base >= 1.0f && std::max(params.dry_penalty_last_n, 0) != 0) {
+                    return false;
+                }
+                break;
+            default:
+                return false;
+        }
+    }
+    return true;
 }
 
 struct common_sampler * common_sampler_init(
@@ -541,6 +598,7 @@ struct common_sampler * common_sampler_init(
     };
 
     result->top_k_first = has_logit_bias ? 0 : common_sampler_top_k_first(params);
+    result->greedy_argmax = result->top_k_first > 0 && common_sampler_greedy_argmax(params);
 
     return result;
 }
@@ -625,6 +683,7 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .cur_p   = */ gsmpl->cur_p,
         /* .rng     = */ gsmpl->rng,
         /* .top_k_first = */ gsmpl->top_k_first,
+        /* .greedy_argmax = */ gsmpl->greedy_argmax,
     };
 }
 
@@ -647,6 +706,7 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
     dst->rng        = src->rng;
     dst->top_k_first = src->top_k_first;
+    dst->greedy_argmax = src->greedy_argmax;
     dst->t_total_us = src->t_total_us;
 }
 

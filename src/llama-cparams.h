@@ -58,6 +58,7 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
     bool training;           // set by llama_opt_init()
+    bool logits_on_device = false; // top-2 of each logits row on the device; rows of the last ubatch copied only when read
 
     size_t moe_cache_size;
     float  moe_cache_cpu_share;
