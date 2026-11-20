@@ -627,6 +627,72 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     }
 }
+// Half of the dp4a Q8_0 x tile in registers, so that its global loads can overlap the dot of the other half.
+template <int I, int nwarps, int warp_size, bool fallback>
+struct ggml_cuda_mmq_x_half_q8_0 {
+    static constexpr int blocks_per_half = MMQ_TILE_NE_K / QI8_0;
+    static constexpr int rows_qs         = nwarps * (warp_size / MMQ_TILE_NE_K);
+    static constexpr int rows_d          = nwarps * (warp_size / blocks_per_half);
+    static constexpr int nqs             = (I + rows_qs - 1) / rows_qs;
+    static constexpr int nd              = (I + rows_d  - 1) / rows_d;
+
+    int  qs[nqs];
+    half d[nd];
+
+    static __device__ __forceinline__ int row_qs(const int l) {
+        return l*rows_qs + threadIdx.y*(warp_size / MMQ_TILE_NE_K) + threadIdx.x / MMQ_TILE_NE_K;
+    }
+    static __device__ __forceinline__ int row_d(const int l) {
+        return l*rows_d + threadIdx.y*(warp_size / blocks_per_half) + threadIdx.x / blocks_per_half;
+    }
+
+    __device__ __forceinline__ void load(const char * __restrict__ x, const int kbx0, const int i_max, const int stride, const int h) {
+        const int txi  = threadIdx.x % MMQ_TILE_NE_K;
+        const int kbxd = threadIdx.x % blocks_per_half;
+#pragma unroll
+        for (int l = 0; l < nqs; ++l) {
+            if (nqs*rows_qs > I && row_qs(l) >= I) {
+                break;
+            }
+            const int i = fallback ? min(row_qs(l), i_max) : row_qs(l);
+            const block_q8_0 * bxi = (const block_q8_0 *) x + kbx0 + i*stride + h*blocks_per_half + txi / QI8_0;
+            qs[l] = get_int_b2(bxi->qs, txi % QI8_0);
+        }
+#pragma unroll
+        for (int l = 0; l < nd; ++l) {
+            if (nd*rows_d > I && row_d(l) >= I) {
+                break;
+            }
+            const int i = fallback ? min(row_d(l), i_max) : row_d(l);
+            const block_q8_0 * bxi = (const block_q8_0 *) x + kbx0 + i*stride + h*blocks_per_half + kbxd;
+            d[l] = bxi->d;
+        }
+    }
+
+    __device__ __forceinline__ void store(int * __restrict__ x_tile, const int h) const {
+        constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q8_0, I);
+        int   * x_qs = x_tile;
+        float * x_df = (float *) (x_qs + txs.qs);
+        const int txi  = threadIdx.x % MMQ_TILE_NE_K;
+        const int kbxd = threadIdx.x % blocks_per_half;
+#pragma unroll
+        for (int l = 0; l < nqs; ++l) {
+            const int i = row_qs(l);
+            if (nqs*rows_qs > I && i >= I) {
+                break;
+            }
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + h*MMQ_TILE_NE_K + txi] = qs[l];
+        }
+#pragma unroll
+        for (int l = 0; l < nd; ++l) {
+            const int i = row_d(l);
+            if (nd*rows_d > I && i >= I) {
+                break;
+            }
+            x_df[i*(2*MMQ_TILE_NE_K/QI8_0) + i/(QI8_0/2) + h*blocks_per_half + kbxd] = __half2float(d[l]);
+        }
+    }
+};
 
 // ---------------------------------------------------------------------------------------------
 
