@@ -1054,12 +1054,13 @@ static __device__ __forceinline__ int ggml_cuda_mmq_dp4a_nsteps_live(const int j
 // ---------------------------------------------------------------------------------------------
 
 // Q8_0 tiles with one block per CU: no other block hides the global loads of a K step.
-static constexpr __host__ __device__ bool ggml_cuda_mmq_pipeline_available(const ggml_type type, const int J, const bool fallback, const bool has_fusion) {
+// Below 32 columns the prefetch registers fit only next to the unrolled dot (the fully unrolled one spills hundreds of VGPRs).
+static constexpr __host__ __device__ bool ggml_cuda_mmq_pipeline_available(const ggml_type type, const int J, const bool fallback, const bool has_fusion, const bool unroll_k) {
 #if defined(GGML_USE_HIP)
     const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config_gcn(type, J, fallback);
-    return type == GGML_TYPE_Q8_0 && !has_fusion && J >= 32 && config.type == type && config.nthreads == 512 && config.I == 128;
+    return type == GGML_TYPE_Q8_0 && !has_fusion && (unroll_k || J >= 32) && config.type == type && config.nthreads == 512 && config.I == 128;
 #else
-    GGML_UNUSED_VARS(type, J, fallback, has_fusion);
+    GGML_UNUSED_VARS(type, J, fallback, has_fusion, unroll_k);
     return false;
 #endif // defined(GGML_USE_HIP)
 }
@@ -1713,7 +1714,7 @@ static void launch_mul_mat_q_impl(ggml_backend_cuda_context & ctx, const mmq_arg
     const int id = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[id].cc;
 
-    if constexpr (!pipeline && !planes && !partial_j && !y_smem && ggml_cuda_mmq_pipeline_available(type, J, fallback, has_fusion)) {
+    if constexpr (!pipeline && !planes && !partial_j && !y_smem && ggml_cuda_mmq_pipeline_available(type, J, fallback, has_fusion, unroll_k)) {
         if (GGML_CUDA_CC_IS_GCN(cc) && ggml_cuda_mmq_pipeline_enabled()) {
             launch_mul_mat_q_impl<type, J, fallback, prec_src1, has_fusion, planes, partial_j, y_smem, unroll_k, true>(ctx, args, stream);
             return;
