@@ -13905,6 +13905,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // Qwen3.8 27B output head of the target and the MTP drafts: Q6_K, Q8_0, Q5_K or Q4_K by file
+    for (ggml_type type : {GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_Q5_K, GGML_TYPE_Q4_K}) {
+        for (int64_t n = 1; n <= 8; ++n) {
+            test_cases.emplace_back(new test_mul_mat_head(type, 248320, n, 5120));
+        }
+    }
+
     // LoRA at prefill: B is [rank, n_out], so K = rank
     for (int64_t k : {16, 32, 48, 64}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 2048, 512, k, {1, 1}, {1, 1}));

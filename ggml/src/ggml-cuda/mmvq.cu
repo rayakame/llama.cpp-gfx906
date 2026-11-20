@@ -2956,6 +2956,72 @@ static void q6_k_planes_rw(const q6_k_planes_range & r, char * ptr, void * host,
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaFree(tmp));
 }
+
+struct mmvq_gcn_head_shape {
+    int rows; // per lane group, 0 = generic kernel
+    int ngroups;
+    int nwarps;
+};
+
+// Measured on the 248320 x 5120 head, where the 2048-wave rule above gives 1 warp and 2 rows per lane group and a
+// wave ends after a few K steps; more rows per lane keep more loads in flight.
+static constexpr mmvq_gcn_head_shape mmvq_gcn_head_shape_for(const ggml_type type, const int ncols_dst) {
+    if (type == GGML_TYPE_Q8_0) {
+        return ncols_dst == 1 ? mmvq_gcn_head_shape{0, 4, 1} :
+            ncols_dst <= 4 ? mmvq_gcn_head_shape{4, 2, 4} : mmvq_gcn_head_shape{4, 4, 2};
+    }
+    if (ncols_dst <= 2) {
+        return {8, 2, 1};
+    }
+    if ((type == GGML_TYPE_Q5_K && ncols_dst > 4) || (type == GGML_TYPE_Q6_K && ncols_dst == 7)) {
+        return {2, 4, 1};
+    }
+    return {4, 4, 1};
+}
+
+template <ggml_type type, int c_ncols_dst>
+static bool mul_mat_vec_q_gcn_head_launch(const mmvq_gcn_mc_args & p, cudaStream_t stream) {
+    constexpr mmvq_gcn_head_shape s = mmvq_gcn_head_shape_for(type, c_ncols_dst);
+    if constexpr (s.rows == 0) {
+        GGML_UNUSED_VARS(p, stream);
+        return false;
+    } else {
+        constexpr int wpe = s.rows == 2 ? mmvq_gcn_mc_wpe(type, c_ncols_dst) :
+            s.rows == 8 ? (c_ncols_dst == 1 ? 2 : 1) : (c_ncols_dst <= 4 ? 2 : 1);
+        if constexpr (mmvq_gcn_mc_whole(type)) {
+            static_assert(s.rows == mmvq_gcn_mc_rows(type, c_ncols_dst), "the register-cached rows are fixed");
+            mul_mat_vec_q_gcn_mc_launch<type, c_ncols_dst, s.ngroups, s.nwarps, wpe, false, false>(p, stream);
+        } else {
+            mul_mat_vec_q_gcn_grp_launch<type, c_ncols_dst, s.ngroups, s.nwarps, wpe, s.rows>(p, stream);
+        }
+        return true;
+    }
+}
+
+// The output head of the target and of the MTP drafts (Q4_K, Q5_K, Q6_K or Q8_0 by file).
+// GGML_MMVQ_GCN_HEAD=0 gives it the paths of the other matrices; GGML_MMVQ_GCN_HEAD_ROWS sets the size (65536 rows).
+template <ggml_type type>
+static bool mul_mat_vec_q_gcn_head_try(const int ncols_dst, const mmvq_gcn_mc_args & p, cudaStream_t stream) {
+    static const bool enabled  = mmvq_gcn_mc_env("GGML_MMVQ_GCN_HEAD", 1) != 0 && mmvq_gcn_mc_env("GGML_MMVQ_GCN_MC", 1) != 0 &&
+        (type == GGML_TYPE_Q8_0 || mmvq_gcn_mc_env("GGML_MMVQ_GCN_MC_K", 1) != 0);
+    static const int  min_rows = std::max(mmvq_gcn_mc_env("GGML_MMVQ_GCN_HEAD_ROWS", 65536), 8);
+
+    const ggml_cuda_mm_fusion_args_device & f = p.fusion;
+    if (!enabled || p.planes || p.nrows_x < min_rows || f.gate || f.x_bias || f.gate_bias || f.x_scale || f.gate_scale || f.shared_up) {
+        return false;
+    }
+    switch (ncols_dst) {
+        case 1: return mul_mat_vec_q_gcn_head_launch<type, 1>(p, stream);
+        case 2: return mul_mat_vec_q_gcn_head_launch<type, 2>(p, stream);
+        case 3: return mul_mat_vec_q_gcn_head_launch<type, 3>(p, stream);
+        case 4: return mul_mat_vec_q_gcn_head_launch<type, 4>(p, stream);
+        case 5: return mul_mat_vec_q_gcn_head_launch<type, 5>(p, stream);
+        case 6: return mul_mat_vec_q_gcn_head_launch<type, 6>(p, stream);
+        case 7: return mul_mat_vec_q_gcn_head_launch<type, 7>(p, stream);
+        case 8: return mul_mat_vec_q_gcn_head_launch<type, 8>(p, stream);
+        default: return false;
+    }
+}
 #endif // defined(GGML_USE_HIP)
 
 bool ggml_cuda_q6_k_planes_get(const ggml_tensor * tensor, void * data, const size_t offset, const size_t size, cudaStream_t stream) {
@@ -3396,8 +3462,15 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, nchannels_dst, nsamples_dst, planes, iq_signs,
             };
-            if (mul_mat_vec_q_gcn_mc_try<type>(ncols_dst, p, stream)) {
-                return;
+            if constexpr (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q8_0) {
+                if (mul_mat_vec_q_gcn_head_try<type>(ncols_dst, p, stream)) {
+                    return;
+                }
+            }
+            {
+                if (mul_mat_vec_q_gcn_mc_try<type>(ncols_dst, p, stream)) {
+                    return;
+                }
             }
         }
     }
