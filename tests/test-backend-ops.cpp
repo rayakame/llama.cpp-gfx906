@@ -13444,9 +13444,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
-    // Qwen3.8 27B: ffn_up/gate, ffn_down, attn_qkv, ssm_out at the verify widths
-    for (ggml_type type_a : {GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S,
-                             GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS}) {
+    // Qwen3.8 27B: ffn_up/gate, ffn_down, attn_qkv, ssm_out at the verify widths around the mat-vec/MMQ switch
+    for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
+                             GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS}) {
         for (int bs = 2; bs <= 8; ++bs) {
             for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{17408, 5120}, {5120, 17408}, {10240, 5120}, {5120, 6144}}) {
                 test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, bs, k, {1, 1}, {1, 1}));
