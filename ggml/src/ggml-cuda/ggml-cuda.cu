@@ -174,6 +174,11 @@ static bool ggml_cuda_fusion_disabled() {
     return disabled;
 }
 
+static bool ggml_cuda_add_rms_norm_fusion_enabled() {
+    static const bool enabled = ggml_cuda_env_int("GGML_CUDA_ADD_RMS_NORM", 1) != 0;
+    return enabled;
+}
+
 static bool ggml_cuda_p2p_enabled() {
     static const bool enabled = ggml_cuda_env_set("GGML_CUDA_P2P");
     return enabled;
@@ -4171,6 +4176,63 @@ static bool ggml_cuda_match_moe_weighted_reduction(
 }
 
 
+// Only batch-size independent checks, as graph_optimize uses it too.
+static bool ggml_cuda_add_rms_norm_mul_matches(const ggml_cgraph * cgraph, int node_idx) {
+    static const ggml_op ops[] = { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL };
+    const int outputs[] = { node_idx, node_idx + 2 };
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, 3, ops, outputs, 2)) {
+        return false;
+    }
+
+    const ggml_tensor * add      = cgraph->nodes[node_idx];
+    const ggml_tensor * rms_norm = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * mul      = cgraph->nodes[node_idx + 2];
+    const ggml_tensor * a        = add->src[0];
+    const ggml_tensor * b        = add->src[1];
+
+    if (rms_norm->src[0] != add || (mul->src[0] != rms_norm && mul->src[1] != rms_norm)) {
+        return false;
+    }
+    const ggml_tensor * w = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+
+    if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32 ||
+            rms_norm->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_are_same_shape(a, b) || !ggml_are_same_shape(a, add) || !ggml_are_same_shape(add, mul) ||
+            !ggml_is_contiguous(a) || !ggml_is_contiguous(b) || !ggml_is_contiguous(add) || !ggml_is_contiguous(mul) ||
+            !ggml_is_contiguous_rows(w) || w->ne[0] != add->ne[0] || !ggml_can_repeat(w, mul)) {
+        return false;
+    }
+    return true;
+}
+
+static bool ggml_cuda_should_fuse_add_rms_norm_mul(const ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_cuda_add_rms_norm_mul_matches(cgraph, node_idx)) {
+        return false;
+    }
+
+    const ggml_tensor * add = cgraph->nodes[node_idx];
+    const ggml_tensor * mul = cgraph->nodes[node_idx + 2];
+    const ggml_tensor * a   = add->src[0];
+    const ggml_tensor * b   = add->src[1];
+    const ggml_tensor * w   = mul->src[0] == cgraph->nodes[node_idx + 1] ? mul->src[1] : mul->src[0];
+
+    // Each element of the sum is read and written by one thread, and a block reads its whole row before it
+    // writes the norm, so an output may alias an input at the same address but must not overlap it otherwise.
+    const auto overlap = [](const ggml_tensor * x, const ggml_tensor * y) {
+        const char * x0 = (const char *) x->data;
+        const char * y0 = (const char *) y->data;
+        return x0 < y0 + ggml_nbytes(y) && y0 < x0 + ggml_nbytes(x);
+    };
+    for (const ggml_tensor * src : { a, b }) {
+        if ((overlap(add, src) && add->data != src->data) || (overlap(mul, src) && mul->data != src->data)) {
+            return false;
+        }
+    }
+    return !overlap(add, mul) && !overlap(w, add) && !overlap(w, mul);
+}
+
 static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
                                int                                       node_idx,
                                std::initializer_list<enum ggml_op>       ops,
@@ -5240,6 +5302,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    if (node->op == GGML_OP_ADD && ggml_cuda_add_rms_norm_fusion_enabled() && ggml_cuda_should_fuse_add_rms_norm_mul(cgraph, i)) {
+        char * q8 = ggml_cuda_q8_1_cache_begin(*cuda_ctx, cgraph, i + 2);
+        if (!ggml_cuda_op_add_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], q8) && q8 != nullptr) {
+            cuda_ctx->q8_1_cache.reset();
+        }
+        return 2;
+    }
+
     // multi-(add or mul)
     if (node->op == GGML_OP_ADD || node->op == GGML_OP_MUL) {
         int     n_fuse = 0;
@@ -6251,6 +6321,13 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             }
         }
         for (int i = 0; i < cgraph->n_nodes; ++i) {
+            // The addends stay alive until the MUL, so the norm output cannot take their memory at another offset.
+            if (cgraph->nodes[i]->op == GGML_OP_ADD && ggml_cuda_add_rms_norm_fusion_enabled() && ggml_cuda_add_rms_norm_mul_matches(cgraph, i)) {
+                params->add_alloc_dep(params->user_data, cgraph->nodes[i]->src[0], cgraph->nodes[i + 2]);
+                params->add_alloc_dep(params->user_data, cgraph->nodes[i]->src[1], cgraph->nodes[i + 2]);
+                i += 2;
+                continue;
+            }
             // Keep the inputs of the fused gate/up/GLU MMQ kernel alive until the GLU so that they cannot alias its output (under op offload the weights are buffer copies).
             if (i + 2 < cgraph->n_nodes && cgraph->nodes[i + 2]->op == GGML_OP_GLU) {
                 ggml_tensor * glu  = cgraph->nodes[i + 2];
