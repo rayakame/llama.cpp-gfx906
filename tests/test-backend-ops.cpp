@@ -4946,6 +4946,94 @@ struct test_ssm_conv_bias_silu : public test_case {
     }
 };
 
+// The Gated DeltaNet conv step as delta-net-base.cpp build_conv_state builds it: GET_ROWS of the conv state, CONCAT
+// with the transposed x, the state store (CPY for K = 1, SET_ROWS of the rollback windows for K > 1), SSM_CONV + SILU
+struct test_ssm_conv_step : public test_case {
+    const int64_t nr;
+    const int64_t n_t;
+    const int64_t K;
+    const int64_t mem_size;
+    const int64_t head;
+    const int32_t src_row;
+
+    ggml_tensor * store_node = nullptr;
+    ggml_tensor * y_node     = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SSM_CONV_STEP";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR6(nr, n_t, K, mem_size, head, src_row);
+    }
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { y_node, store_node }; }
+
+    test_ssm_conv_step(int64_t nr = 10240, int64_t n_t = 4, int64_t K = 1, int64_t mem_size = 3, int64_t head = 1, int32_t src_row = 1)
+        : nr(nr), n_t(n_t), K(K), mem_size(mem_size), head(head), src_row(src_row) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t d_conv = 4;
+        const int64_t n_old  = d_conv - 1;
+
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_old*nr, mem_size*K);
+        ggml_tensor * ids   = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        ggml_tensor * x     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, nr, n_t, 1);
+        ggml_tensor * w     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, nr);
+        ggml_set_name(cache, "cache");
+        ggml_set_name(ids,   "ids");
+        ggml_set_name(x,     "x");
+        ggml_set_name(w,     "w");
+
+        ggml_tensor * states = ggml_reshape_2d(ctx, cache, n_old*nr, cache->ne[1]);
+        ggml_tensor * state  = ggml_get_rows(ctx, states, ids);
+        state = ggml_view_2d(ctx, state, n_old*nr, 1, state->nb[1], 0);
+        state = ggml_reshape_3d(ctx, state, n_old, nr, 1);
+
+        ggml_tensor * conv_x = ggml_concat(ctx, state, ggml_transpose(ctx, x), 0);
+
+        const size_t row_size  = cache->nb[1];
+        const size_t cell_offs = head*row_size;
+        if (K == 1) {
+            ggml_tensor * last = ggml_view_3d(ctx, conv_x, n_old, nr, 1, conv_x->nb[1], conv_x->nb[2], ggml_row_size(GGML_TYPE_F32, n_t));
+            ggml_tensor * cell = ggml_view_2d(ctx, cache, n_old*nr, 1, row_size, cell_offs);
+            store_node = ggml_cpy(ctx, last, cell);
+        } else {
+            const int64_t Kw = std::min(n_t, K);
+            ggml_tensor * slot_rev = ggml_arange(ctx, 0.0f, (float) K, 1.0f);
+            slot_rev = ggml_scale_bias(ctx, slot_rev, -1.0f, (float) (K - 1));
+            slot_rev = ggml_cast(ctx, slot_rev, GGML_TYPE_I32);
+            ggml_tensor * slot_order = ggml_view_1d(ctx, slot_rev, Kw, ggml_row_size(GGML_TYPE_I32, K - Kw));
+            ggml_tensor * windows = ggml_view_4d(ctx, conv_x, n_old, Kw, nr, 1,
+                    ggml_element_size(conv_x), conv_x->nb[1], conv_x->nb[2], ggml_row_size(GGML_TYPE_F32, n_t - (Kw - 1)));
+            ggml_tensor * slots = ggml_view_4d(ctx, cache, n_old, K, nr, 1,
+                    mem_size*row_size, ggml_row_size(GGML_TYPE_F32, n_old), row_size, cell_offs);
+            store_node = ggml_set_rows(ctx, slots, windows, slot_order);
+        }
+        ggml_set_name(store_node, "store");
+
+        y_node = ggml_silu(ctx, ggml_ssm_conv(ctx, conv_x, w));
+        ggml_set_name(y_node, "y");
+
+        // the store comes before the ssm_conv in the graph, as in the model
+        ggml_tensor * out = ggml_add(ctx, ggml_sum(ctx, ggml_cont(ctx, store_node)), ggml_sum(ctx, y_node));
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op) || t->view_src != nullptr) { continue; }
+            if (strcmp(t->name, "ids") == 0) {
+                ggml_backend_tensor_set(t, &src_row, 0, sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_SSM_SCAN
 struct test_ssm_scan : public test_case {
     const ggml_type type;
@@ -11848,6 +11936,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    // the state row read is the row the store writes (1), another row, or a rollback slot the store overwrites (7)
+    for (int64_t n_t : {1, 2, 4, 5, 8, 16, 17}) {
+        for (int32_t src_row : {1, 2}) {
+            test_cases.emplace_back(new test_ssm_conv_step(10240, n_t, 1, 3, 1, src_row));
+        }
+        for (int32_t src_row : {1, 7}) {
+            test_cases.emplace_back(new test_ssm_conv_step(10240, n_t, 4, 3, 1, src_row));
+        }
+    }
+    test_cases.emplace_back(new test_ssm_conv_step(128, 4, 1, 3, 1, 1));
+    test_cases.emplace_back(new test_ssm_conv_step(128, 4, 4, 3, 1, 7));
 
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 16, 1, 1024, 1, 32, 4)); // Mamba-1
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 64, 64, 112, 2, 32, 4)); // Zamba2 (real hparams: d_inner=7168, dt_rank=112, n_group=2 -> head_dim=7168/112=64)
