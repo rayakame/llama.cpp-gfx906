@@ -1400,6 +1400,170 @@ static __global__ void mul_mat_vec_q_gcn_mc(
 #endif // defined(GCN)
 }
 
+// The compiler already shares the weight decode across columns, but cannot hoist the scales out of the float math.
+// All loads come first: written per row and column, the scheduler kept them next to their use and waited for each.
+template <ggml_type type, int ncols_dst, int rows>
+static __device__ __forceinline__ void mmvq_gcn_kf_step(
+        const void * __restrict__ vx, const block_q8_1 * __restrict__ y, const uint32_t stride_col_y,
+        const int kbx, const uint32_t stride_row_x, const int iqs, float * a) {
+    if constexpr (type == GGML_TYPE_Q5_K) {
+        const int bq8_offset = QR5_K*((iqs/2)/(QI8_1/2));
+        const int l4         = (iqs/2) % 4;
+        const int js         = bq8_offset/2;
+        const int jm         = js & 1;
+        const uint32_t hi    = (uint32_t) -(int32_t) (js >= 2);
+
+        int      ql[rows][2];
+        int      qh[rows][2];
+        uint32_t s[rows][3];
+        half2    dmh[rows];
+#pragma unroll
+        for (int r = 0; r < rows; ++r) {
+            const block_q5_K * bq = (const block_q5_K *) vx + (kbx + r*stride_row_x);
+            const int * pl = (const int *) (bq->qs + 16*bq8_offset + 4*l4);
+            const int * ph = (const int *) (bq->qh + 4*l4);
+            const uint16_t * scales = (const uint16_t *) bq->scales;
+            ql[r][0] = pl[0];
+            ql[r][1] = pl[4];
+            qh[r][0] = ph[0];
+            qh[r][1] = ph[4];
+            s[r][0]  = scales[jm + 0];
+            s[r][1]  = scales[jm + 2];
+            s[r][2]  = scales[jm + 4];
+            dmh[r]   = bq->dm;
+        }
+        int   u[ncols_dst][2*QR5_K];
+        half2 ds[ncols_dst][QR5_K];
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+            for (int i = 0; i < QR5_K; ++i) {
+                const block_q8_1 * by = y + j*stride_col_y + bq8_offset + i;
+                const int * q8 = (const int *) by->qs + l4;
+                u[j][2*i+0] = q8[0];
+                u[j][2*i+1] = q8[4];
+                ds[j][i]    = by->ds;
+            }
+        }
+
+        int   v[rows][2*QR5_K];
+        float sd[rows][QR5_K];
+        float sm[rows][QR5_K];
+#pragma unroll
+        for (int r = 0; r < rows; ++r) {
+            const int vh0 = qh[r][0] >> bq8_offset;
+            const int vh1 = qh[r][1] >> bq8_offset;
+            const uint32_t sc = ((s[r][0] & 0x3f3f) & ~hi) | ((((s[r][2] >> 0) & 0x0f0f) | ((s[r][0] & 0xc0c0) >> 2)) & hi);
+            const uint32_t m  = ((s[r][1] & 0x3f3f) & ~hi) | ((((s[r][2] >> 4) & 0x0f0f) | ((s[r][1] & 0xc0c0) >> 2)) & hi);
+            const float2 dm = __half22float2(dmh[r]);
+#pragma unroll
+            for (int i = 0; i < QR5_K; ++i) {
+                v[r][2*i+0] = ((ql[r][0] >> (4*i)) & 0x0F0F0F0F) | (((vh0 >> i) << 4) & 0x10101010);
+                v[r][2*i+1] = ((ql[r][1] >> (4*i)) & 0x0F0F0F0F) | (((vh1 >> i) << 4) & 0x10101010);
+                sd[r][i] =  dm.x*float((sc >> (8*i)) & 0xFF);
+                sm[r][i] = -dm.y*float((m  >> (8*i)) & 0xFF);
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+            for (int i = 0; i < QR5_K; ++i) {
+                const float d8 = __low2float(ds[j][i]);
+                const float su = d8*float(ggml_cuda_dp4a(0x01010101, u[j][2*i+0], ggml_cuda_dp4a(0x01010101, u[j][2*i+1], 0)));
+#pragma unroll
+                for (int r = 0; r < rows; ++r) {
+                    const int dot = ggml_cuda_dp4a(v[r][2*i+0], u[j][2*i+0], ggml_cuda_dp4a(v[r][2*i+1], u[j][2*i+1], 0));
+                    float acc = a[j*rows + r];
+                    acc = fmaf(d8*sd[r][i], float(dot), acc);
+                    acc = fmaf(sm[r][i], su, acc);
+                    a[j*rows + r] = acc;
+                }
+            }
+        }
+    } else {
+        static_assert(type == GGML_TYPE_Q6_K, "Q5_K/Q6_K only");
+        constexpr int vdr = VDR_Q6_K_Q8_1_MMVQ;
+        const int bq8_offset   = 2*QR6_K*(iqs/(QI6_K/2)) + (iqs%(QI6_K/2))/(QI6_K/4);
+        const int scale_offset = (QI6_K/4)*(iqs/(QI6_K/2)) + (iqs%(QI6_K/2))/(QI6_K/8);
+        const int vh_shift     = 2*((iqs%(QI6_K/2))/(QI6_K/4));
+        const int qh_offset    = (QI6_K/4)*(iqs/(QI6_K/2)) + iqs%(QI6_K/4);
+
+        int    ql[rows][vdr];
+        int    qh[rows][vdr];
+        int    sc[rows][QR6_K];
+        half   dh[rows];
+#pragma unroll
+        for (int r = 0; r < rows; ++r) {
+            const block_q6_K * bq = (const block_q6_K *) vx + (kbx + r*stride_row_x);
+#pragma unroll
+            for (int l = 0; l < vdr; ++l) {
+                ql[r][l] = get_int_b2(bq->ql, iqs + l);
+                qh[r][l] = get_int_b2(bq->qh, qh_offset + l);
+            }
+#pragma unroll
+            for (int i = 0; i < QR6_K; ++i) {
+                sc[r][i] = bq->scales[scale_offset + 4*i];
+            }
+            dh[r] = bq->d;
+        }
+        int   u[ncols_dst][QR6_K][vdr];
+        half2 ds[ncols_dst][QR6_K];
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+            for (int i = 0; i < QR6_K; ++i) {
+                const block_q8_1 * by = y + j*stride_col_y + bq8_offset + 2*i;
+#pragma unroll
+                for (int l = 0; l < vdr; ++l) {
+                    u[j][i][l] = get_int_b4(by->qs, iqs % QI8_1 + l);
+                }
+                ds[j][i] = by->ds;
+            }
+        }
+
+        int   v[rows][QR6_K][vdr];
+        float sd[rows][QR6_K];
+#pragma unroll
+        for (int r = 0; r < rows; ++r) {
+#pragma unroll
+            for (int l = 0; l < vdr; ++l) {
+                const int vh = qh[r][l] >> vh_shift;
+#pragma unroll
+                for (int i = 0; i < QR6_K; ++i) {
+                    v[r][i][l] = ((ql[r][l] >> (4*i)) & 0x0F0F0F0F) | (((vh >> (4*i)) << 4) & 0x30303030);
+                }
+            }
+            const float d = __half2float(dh[r]);
+#pragma unroll
+            for (int i = 0; i < QR6_K; ++i) {
+                sd[r][i] = d*sc[r][i];
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+            for (int i = 0; i < QR6_K; ++i) {
+                const float d8 = __low2float(ds[j][i]);
+                // the -32 of every quant, shared by the rows
+                int off = 0;
+#pragma unroll
+                for (int l = 0; l < vdr; ++l) {
+                    off = ggml_cuda_dp4a(0xE0E0E0E0, u[j][i][l], off);
+                }
+#pragma unroll
+                for (int r = 0; r < rows; ++r) {
+                    int dot = off;
+#pragma unroll
+                    for (int l = 0; l < vdr; ++l) {
+                        dot = ggml_cuda_dp4a(v[r][i][l], u[j][i][l], dot);
+                    }
+                    a[j*rows + r] = fmaf(d8*sd[r][i], float(dot), a[j*rows + r]);
+                }
+            }
+        }
+    }
+}
+
 using mmvq_gcn_i32x4 = __attribute__((ext_vector_type(4))) int;
 
 // buf[l]: the 16-byte chunk src[l] of the q8_1 tile that starts at superblock kb; a superblock past the end of the row
@@ -1415,7 +1579,7 @@ static __device__ __forceinline__ void mmvq_gcn_grp_tile_load(mmvq_gcn_i32x4 * b
     }
 }
 
-template <ggml_type type, int ncols_dst, int ngroups, int nwarps, int waves_per_eu, bool lds, bool iq_signs = false>
+template <ggml_type type, int ncols_dst, int ngroups, int nwarps, int waves_per_eu, bool lds, bool iq_signs = false, bool kf = false>
 __launch_bounds__(nwarps*64, waves_per_eu)
 static __global__ void mul_mat_vec_q_gcn_grp(
         const void * __restrict__ vx, const void * __restrict__ vy, const ggml_cuda_mm_fusion_args_device fusion,
@@ -1485,6 +1649,10 @@ static __global__ void mul_mat_vec_q_gcn_grp(
             // no barrier: a wave runs its LDS accesses in order, and one would keep the weight loads behind the copy
             const int kbx = kb0 + lg/lpb;
             if (nsb == 1 || kbx < blocks_per_row) {
+                if constexpr (kf) {
+                    mmvq_gcn_kf_step<type, ncols_dst, rows>(vx, ty, nby, kbx_offset + kbx, stride_row_x, kqs, a);
+                    continue;
+                }
 #pragma unroll
                 for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
@@ -1497,6 +1665,10 @@ static __global__ void mul_mat_vec_q_gcn_grp(
     } else {
         for (int kbx = lk/lpb; kbx < blocks_per_row; kbx += nwarps*nlanes/lpb) {
             const int kby = kbx*(qk/QK8_1);
+            if constexpr (kf) {
+                mmvq_gcn_kf_step<type, ncols_dst, rows>(vx, y + kby, stride_col_y, kbx_offset + kbx, stride_row_x, kqs, a);
+                continue;
+            }
 #pragma unroll
             for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
@@ -1917,11 +2089,20 @@ static void mul_mat_vec_q_gcn_mc_launch(const mmvq_gcn_mc_args & p, cudaStream_t
     } else {
         static_assert(!gate, "gate fusion is Q4 only");
         static const bool lds = mmvq_gcn_mc_env("GGML_MMVQ_GCN_MC_LDS", 1) != 0;
+        static const bool kf  = mmvq_gcn_mc_env("GGML_MMVQ_GCN_MC_KF", 1) != 0;
+        // Q5_K at 1 column (only with _1COL=1) spills at 6 waves per SIMD with the scales held per row
+        constexpr bool kf_ok = (type == GGML_TYPE_Q5_K && c_ncols_dst > 1) || type == GGML_TYPE_Q6_K;
         auto kernel = mul_mat_vec_q_gcn_grp<type, c_ncols_dst, ngroups, nwarps, waves_per_eu, false>;
+        if constexpr (kf_ok) {
+            if (kf) {
+                kernel = mul_mat_vec_q_gcn_grp<type, c_ncols_dst, ngroups, nwarps, waves_per_eu, false, false, true>;
+            }
+        }
         // measured for Q5_K/Q6_K only
         if constexpr (c_ncols_dst > 1 && (type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K)) {
             if (lds) {
-                kernel = mul_mat_vec_q_gcn_grp<type, c_ncols_dst, ngroups, nwarps, waves_per_eu, true>;
+                kernel = kf ? mul_mat_vec_q_gcn_grp<type, c_ncols_dst, ngroups, nwarps, waves_per_eu, true, false, true> :
+                    mul_mat_vec_q_gcn_grp<type, c_ncols_dst, ngroups, nwarps, waves_per_eu, true>;
             }
         }
         if constexpr (type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S) {
@@ -1996,8 +2177,9 @@ static bool mul_mat_vec_q_gcn_mc_switch_ncols(const int ncols_dst, const int wav
 }
 
 // A/B switches, 0 = old path: GGML_MMVQ_GCN_MC, _K (Q4_K/Q5_K/Q6_K), _Q4K (Q4_K), _Q8 (Q8_0), _Q2K, _Q3K, _IQ2S,
-// _IQ3XXS, _IQ3S, _IQ4NL, _IQ4XS, _LDS (Q5_K/Q6_K activations through LDS), _Q6K1 (1-column Q6_K), _FUSED; _1COL=1
-// adds the other 1-column calls of Q4_0/Q4_1/Q5_K; _GROUPS (2|4), _WARPS (1|2|4), _WPE (2|3) override the shapes chosen below.
+// _IQ3XXS, _IQ3S, _IQ4NL, _IQ4XS, _LDS (Q5_K/Q6_K activations through LDS), _KF (Q5_K/Q6_K scales once per row), _Q6K1
+// (1-column Q6_K), _FUSED; _1COL=1 adds the other 1-column calls of Q4_0/Q4_1/Q5_K; _GROUPS (2|4), _WARPS (1|2|4), _WPE
+// (2|3) override the shapes chosen below.
 template <ggml_type type>
 static bool mul_mat_vec_q_gcn_mc_try(const int ncols_dst, const mmvq_gcn_mc_args & p, cudaStream_t stream) {
     constexpr const char * type_env = mmvq_gcn_mc_type_env(type);
