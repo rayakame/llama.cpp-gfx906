@@ -5,7 +5,11 @@
 #include "unary.cuh"
 
 #include <climits>
+#include <cinttypes>
 #include <cstdint>
+#include <mutex>
+#include <set>
+#include <tuple>
 
 #define MMQ_DP4A_MAX_BATCH_SIZE 64 // Max. batch size to use for dp4a MMQ kernels when FP16 tensor cores are available.
 #define MMQ_ITER_K             256
@@ -1873,6 +1877,49 @@ static int mmq_stream_k_resident_blocks(const int id, const int nthreads, const 
     return resident[id];
 }
 
+struct mmq_gcn_fit {
+    int    resident; // blocks per CU
+    size_t scratch;  // bytes per thread, > 0 when the kernel spills
+};
+
+template <auto kernel>
+static mmq_gcn_fit mmq_gcn_get_fit(const int id, const int nthreads, const int nbytes_shared) {
+    static mmq_gcn_fit fit[GGML_CUDA_MAX_DEVICES] = {};
+    if (fit[id].resident == 0) {
+        int n = 0;
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, kernel, nthreads, nbytes_shared));
+        cudaFuncAttributes attr = {};
+        CUDA_CHECK(cudaFuncGetAttributes(&attr, (const void *) kernel));
+        fit[id] = { std::max(n, 1), attr.localSizeBytes };
+    }
+    return fit[id];
+}
+
+// GGML_MMQ_GCN_SK_EFF: on GCN, tile when the tiles fill at least this percentage of the resident block slots, else stream-k; 0 = upstream's rule.
+static int mmq_gcn_sk_eff() {
+    static const int eff = [] { const char * e = getenv("GGML_MMQ_GCN_SK_EFF"); return e ? atoi(e) : 93; }();
+    return eff;
+}
+
+static bool mmq_gcn_log_enabled() {
+    static const bool enabled = [] { const char * e = getenv("GGML_MMQ_GCN_LOG"); return e && atoi(e) != 0; }();
+    return enabled;
+}
+
+static void mmq_gcn_log(const ggml_type type, const ggml_cuda_mmq_config & config, const mmq_args & args, const int ntiles,
+        const mmq_gcn_fit & fit_t, const mmq_gcn_fit & fit_sk, const int rounds, const int fill, const bool tiling, const int nblocks) {
+    static std::mutex mutex;
+    static std::set<std::tuple<int, int, int64_t, int64_t, int64_t>> seen;
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!seen.insert({ int(type), config.J, args.nrows_x, args.ncols_x, args.ncols_dst }).second) {
+        return;
+    }
+    GGML_LOG_INFO("mmq gcn: %s J=%d I=%d threads=%d rows=%" PRId64 " K=%" PRId64 " cols=%" PRId64
+        ": tiles %d, blocks/CU tiled %d stream-k %d, scratch %zu/%zu B, rounds %d, fill %d %% -> %s, %d blocks\n",
+        ggml_type_name(type), config.J, config.I, config.nthreads, args.nrows_x, args.ncols_x, args.ncols_dst,
+        ntiles, fit_t.resident, fit_sk.resident, fit_t.scratch, fit_sk.scratch, rounds, fill, tiling ? "tiling" : "stream-k", nblocks);
+}
+
 // GGML_MMQ_Y_SMEM: widest column tile that reads y through the scalar cache, 0 turns it off. Wider tiles miss the
 // scalar cache (blocks running at the same time work on different columns) and wait on L2/HBM for every few dp4a.
 static int ggml_cuda_mmq_y_smem_max_j(const int cc) {
@@ -2007,11 +2054,35 @@ static void launch_mul_mat_q_impl(ggml_backend_cuda_context & ctx, const mmq_arg
     // Use tiling when Stream-K is unlikely to improve performance:
     // With at least 2 full waves of tiles, tiling already saturates the device and Stream-K only adds overhead.
     // With few K chunks per tile, the extra parallelism of Stream-K is not needed.
-    const bool force_tiling = GGML_CUDA_CC_IS_GCN(cc) &&
+    bool force_tiling = GGML_CUDA_CC_IS_GCN(cc) &&
         (tiles_efficiency_percent >= 90 || ntiles_dst >= 2*stream_k_blocks ||
          k_chunks <= config.occupancy * tiles_nwaves);
 
+    const int  sk_eff  = GGML_CUDA_CC_IS_GCN(cc) && !args.ids_dst ? mmq_gcn_sk_eff() : 0;
+    const bool gcn_log = GGML_CUDA_CC_IS_GCN(cc) && !args.ids_dst && mmq_gcn_log_enabled();
+    mmq_gcn_fit fit_t  = {};
+    mmq_gcn_fit fit_sk = {};
+    int rounds = 0;
+    int fill   = 0;
+    if (sk_eff > 0 || gcn_log) {
+        CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, fallback, prec_src1, has_fusion, true, planes, partial_j, y_smem, unroll_k, dp4a_grid, grid_lds, pipeline, y_b128, dp4a_pf, gcn_loader>), nbytes_shared);
+        fit_t  = mmq_gcn_get_fit<mul_mat_q<type, J, fallback, prec_src1, has_fusion, true, planes, partial_j, y_smem, unroll_k, dp4a_grid, grid_lds, pipeline, y_b128, dp4a_pf, gcn_loader>>(id, config.nthreads, nbytes_shared);
+        fit_sk = mmq_gcn_get_fit<mul_mat_q<type, J, fallback, prec_src1, has_fusion, false, planes, partial_j, y_smem, unroll_k, dp4a_grid, grid_lds, pipeline, y_b128, dp4a_pf, gcn_loader>>(id, config.nthreads, nbytes_shared);
+        const int slots = nsm * fit_t.resident;
+        rounds = (ntiles_dst + slots - 1) / slots;
+        fill   = 100 * ntiles_dst / (slots * rounds);
+    }
+    if (sk_eff > 0 && fit_t.resident == 1) {
+        // Upstream allows nsm*occupancy blocks; a CU that holds one block leaves most CUs idle in a short last round of tiles.
+        // With more blocks per CU the last round runs faster per block, and stream-k measured slower there (Q5_K, Q6_K).
+        const bool sk_worse = fit_sk.resident < fit_t.resident || fit_sk.scratch > fit_t.scratch;
+        force_tiling = fill >= sk_eff || k_chunks <= rounds || (force_tiling && sk_worse);
+    }
+
     if (force_tiling) {
+        if (gcn_log) {
+            mmq_gcn_log(type, config, args, ntiles_dst, fit_t, fit_sk, rounds, fill, true, ntiles_dst);
+        }
         GGML_ASSERT(nti <= 65535);
         CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, fallback, prec_src1, has_fusion, true, planes, partial_j, y_smem, unroll_k, dp4a_grid, grid_lds, pipeline, y_b128, dp4a_pf, gcn_loader>), nbytes_shared);
         mul_mat_q<type, J, fallback, prec_src1, has_fusion, true, planes, partial_j, y_smem, unroll_k, dp4a_grid, grid_lds, pipeline, y_b128, dp4a_pf, gcn_loader><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
@@ -2040,6 +2111,9 @@ static void launch_mul_mat_q_impl(ggml_backend_cuda_context & ctx, const mmq_arg
         }
     }
     const dim3 block_nums_stream_k(nblocks_stream_k, 1, 1);
+    if (gcn_log) {
+        mmq_gcn_log(type, config, args, ntiles_dst, fit_t, fit_sk, rounds, fill, false, nblocks_stream_k);
+    }
 
     const bool fixup_needed = ntiles_dst % block_nums_stream_k.x != 0;
 
