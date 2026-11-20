@@ -1857,6 +1857,22 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const i
     return nbs_ids + nbs_x + GGML_PAD(nbs_y, config.nthreads*sizeof(int));
 }
 
+// Blocks of the stream-k kernel that one CU holds at once (VGPRs, LDS); GGML_MMQ_GCN_SK_RESIDENT=0 returns 0 (no limit).
+template <auto kernel>
+static int mmq_stream_k_resident_blocks(const int id, const int nthreads, const int nbytes_shared) {
+    static const bool enabled = [] { const char * e = getenv("GGML_MMQ_GCN_SK_RESIDENT"); return !e || atoi(e) != 0; }();
+    if (!enabled) {
+        return 0;
+    }
+    static int resident[GGML_CUDA_MAX_DEVICES] = { 0 };
+    if (resident[id] == 0) {
+        int n = 0;
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, kernel, nthreads, nbytes_shared));
+        resident[id] = std::max(n, 1);
+    }
+    return resident[id];
+}
+
 // GGML_MMQ_Y_SMEM: widest column tile that reads y through the scalar cache, 0 turns it off. Wider tiles miss the
 // scalar cache (blocks running at the same time work on different columns) and wait on L2/HBM for every few dp4a.
 static int ggml_cuda_mmq_y_smem_max_j(const int cc) {
@@ -2015,6 +2031,13 @@ static void launch_mul_mat_q_impl(ggml_backend_cuda_context & ctx, const mmq_arg
     if (GGML_CUDA_CC_IS_GCN(cc) && ntiles_dst < nsm) {
         // Use a 512-thread budget per CU when the tiles do not fill the device.
         nblocks_stream_k = std::min(nwork, nsm * std::max(1, 512 / config.nthreads));
+    }
+    if (GGML_CUDA_CC_IS_GCN(cc)) {
+        // config.occupancy counts 2 blocks per CU also where VGPRs or LDS hold only 1, and a second round only adds partial tiles.
+        const int resident = mmq_stream_k_resident_blocks<mul_mat_q<type, J, fallback, prec_src1, has_fusion, false, planes, partial_j, y_smem, unroll_k, dp4a_grid, grid_lds, pipeline, y_b128, dp4a_pf, gcn_loader>>(id, config.nthreads, nbytes_shared);
+        if (resident > 0) {
+            nblocks_stream_k = std::min(nblocks_stream_k, nsm * resident);
+        }
     }
     const dim3 block_nums_stream_k(nblocks_stream_k, 1, 1);
 
