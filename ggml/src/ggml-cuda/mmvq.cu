@@ -42,7 +42,7 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type, 
     switch (type) {
         case GGML_TYPE_Q1_0:    return vec_dot_q1_0_q8_1;
         case GGML_TYPE_Q2_0:    return vec_dot_q2_0_q8_1;
-        case GGML_TYPE_Q4_0:    return vec_dot_q4_0_q8_1;
+        case GGML_TYPE_Q4_0:    return aligned_b2 ? vec_dot_q4_0_q8_1_aligned : vec_dot_q4_0_q8_1;
         case GGML_TYPE_Q4_1:    return vec_dot_q4_1_q8_1;
         case GGML_TYPE_Q5_0:    return vec_dot_q5_0_q8_1;
         case GGML_TYPE_Q5_1:    return vec_dot_q5_1_q8_1;
@@ -1199,7 +1199,7 @@ static __device__ __forceinline__ void mmvq_gcn_mc_store(
     }
 }
 
-template <ggml_type type, int ncols_dst, int ngroups, int nwarps, int waves_per_eu, bool gate>
+template <ggml_type type, int ncols_dst, int ngroups, int nwarps, int waves_per_eu, bool gate, bool aligned_b2>
 __launch_bounds__(nwarps*64, waves_per_eu)
 static __global__ void mul_mat_vec_q_gcn_mc(
         const void * __restrict__ vx, const void * __restrict__ vy, const ggml_cuda_mm_fusion_args_device fusion,
@@ -1252,7 +1252,11 @@ static __global__ void mul_mat_vec_q_gcn_mc(
         for (int r = 0; r < rows*nper; ++r) {
             const int i = r/nper;
             const char * bxc = (r % nper ? g0 : x0) + (offx0 + uint32_t(kb)*bs + i*row_bytes);
-            if constexpr (is_q4_0 || is_q8_0) {
+            if constexpr (is_q4_0 && aligned_b2) {
+                half d;
+                get_block_b2_aligned18(bxc, v[r], d);
+                dm[r] = make_half2(d, d);
+            } else if constexpr (is_q4_0 || is_q8_0) {
                 using block_t = std::conditional_t<is_q4_0, block_q4_0, block_q8_0>;
                 const block_t * bx = (const block_t *) bxc;
 #pragma unroll
@@ -1748,14 +1752,14 @@ struct mmvq_gcn_mc_args {
     int nchannels_dst, nsamples_dst;
 };
 
-template <ggml_type type, int c_ncols_dst, int ngroups, int nwarps, int waves_per_eu, bool gate>
+template <ggml_type type, int c_ncols_dst, int ngroups, int nwarps, int waves_per_eu, bool gate, bool aligned_b2>
 static void mul_mat_vec_q_gcn_mc_launch(const mmvq_gcn_mc_args & p, cudaStream_t stream) {
     constexpr int rows = mmvq_gcn_mc_rows(type, gate);
     const int64_t nblocks = (p.nrows_x + rows*ngroups - 1) / (rows*ngroups);
     const dim3 block_nums(nblocks, p.nchannels_dst, p.nsamples_dst);
     const dim3 block_dims(64, nwarps, 1);
     if constexpr (mmvq_gcn_mc_whole(type)) {
-        mul_mat_vec_q_gcn_mc<type, c_ncols_dst, ngroups, nwarps, waves_per_eu, gate><<<block_nums, block_dims, 0, stream>>>(
+        mul_mat_vec_q_gcn_mc<type, c_ncols_dst, ngroups, nwarps, waves_per_eu, gate, aligned_b2><<<block_nums, block_dims, 0, stream>>>(
             p.vx, p.vy, p.fusion, p.dst, p.ncols_x, p.nrows_x, p.stride_row_x, p.stride_col_y, p.stride_col_dst,
             p.channel_ratio, p.stride_channel_x, p.stride_channel_y, p.stride_channel_dst, p.sample_ratio,
             p.stride_sample_x, p.stride_sample_y, p.stride_sample_dst);
@@ -1768,55 +1772,55 @@ static void mul_mat_vec_q_gcn_mc_launch(const mmvq_gcn_mc_args & p, cudaStream_t
     }
 }
 
-template <ggml_type type, int c_ncols_dst, int waves_per_eu, bool gate>
+template <ggml_type type, int c_ncols_dst, int waves_per_eu, bool gate, bool aligned_b2>
 static void mul_mat_vec_q_gcn_mc_switch_shape(const int ngroups, const int nwarps, const mmvq_gcn_mc_args & p, cudaStream_t stream) {
     if (ngroups == 2 && !gate) {
         switch (nwarps) {
-            case 1:  mul_mat_vec_q_gcn_mc_launch<type, c_ncols_dst, 2, 1, waves_per_eu, false>(p, stream); break;
-            case 2:  mul_mat_vec_q_gcn_mc_launch<type, c_ncols_dst, 2, 2, waves_per_eu, false>(p, stream); break;
-            default: mul_mat_vec_q_gcn_mc_launch<type, c_ncols_dst, 2, 4, waves_per_eu, false>(p, stream); break;
+            case 1:  mul_mat_vec_q_gcn_mc_launch<type, c_ncols_dst, 2, 1, waves_per_eu, false, aligned_b2>(p, stream); break;
+            case 2:  mul_mat_vec_q_gcn_mc_launch<type, c_ncols_dst, 2, 2, waves_per_eu, false, aligned_b2>(p, stream); break;
+            default: mul_mat_vec_q_gcn_mc_launch<type, c_ncols_dst, 2, 4, waves_per_eu, false, aligned_b2>(p, stream); break;
         }
     } else {
         switch (nwarps) {
-            case 1:  mul_mat_vec_q_gcn_mc_launch<type, c_ncols_dst, 4, 1, waves_per_eu, gate>(p, stream); break;
-            case 2:  mul_mat_vec_q_gcn_mc_launch<type, c_ncols_dst, 4, 2, waves_per_eu, gate>(p, stream); break;
-            default: mul_mat_vec_q_gcn_mc_launch<type, c_ncols_dst, 4, 4, waves_per_eu, gate>(p, stream); break;
+            case 1:  mul_mat_vec_q_gcn_mc_launch<type, c_ncols_dst, 4, 1, waves_per_eu, gate, aligned_b2>(p, stream); break;
+            case 2:  mul_mat_vec_q_gcn_mc_launch<type, c_ncols_dst, 4, 2, waves_per_eu, gate, aligned_b2>(p, stream); break;
+            default: mul_mat_vec_q_gcn_mc_launch<type, c_ncols_dst, 4, 4, waves_per_eu, gate, aligned_b2>(p, stream); break;
         }
     }
 }
 
-template <ggml_type type, int c_ncols_dst, bool gate>
+template <ggml_type type, int c_ncols_dst, bool gate, bool aligned_b2>
 static void mul_mat_vec_q_gcn_mc_switch_wpe(const int waves_per_eu, const int ngroups, const int nwarps,
         const mmvq_gcn_mc_args & p, cudaStream_t stream) {
     if constexpr (mmvq_gcn_mc_wpe_alt(type, c_ncols_dst) != 0 && !gate) {
         if (waves_per_eu == mmvq_gcn_mc_wpe_alt(type, c_ncols_dst)) {
-            mul_mat_vec_q_gcn_mc_switch_shape<type, c_ncols_dst, mmvq_gcn_mc_wpe_alt(type, c_ncols_dst), false>(
+            mul_mat_vec_q_gcn_mc_switch_shape<type, c_ncols_dst, mmvq_gcn_mc_wpe_alt(type, c_ncols_dst), false, aligned_b2>(
                 ngroups, nwarps, p, stream);
             return;
         }
     }
-    mul_mat_vec_q_gcn_mc_switch_shape<type, c_ncols_dst, mmvq_gcn_mc_wpe(type, c_ncols_dst), gate>(ngroups, nwarps, p, stream);
+    mul_mat_vec_q_gcn_mc_switch_shape<type, c_ncols_dst, mmvq_gcn_mc_wpe(type, c_ncols_dst), gate, aligned_b2>(ngroups, nwarps, p, stream);
     GGML_UNUSED(waves_per_eu);
 }
 
-template <ggml_type type, bool gate>
+template <ggml_type type, bool gate, bool aligned_b2>
 static bool mul_mat_vec_q_gcn_mc_switch_ncols(const int ncols_dst, const int waves_per_eu, const int ngroups,
         const int nwarps, const mmvq_gcn_mc_args & p, cudaStream_t stream) {
     switch (ncols_dst) {
         case 1:
             // the Q6_K output head of the MTP drafts (248k rows), and the others on request
             if constexpr ((!gate || mmvq_gcn_mc_q4(type)) && mmvq_gcn_mc_type_env(type) == nullptr) {
-                mul_mat_vec_q_gcn_mc_switch_wpe<type, 1, gate>(waves_per_eu, ngroups, nwarps, p, stream);
+                mul_mat_vec_q_gcn_mc_switch_wpe<type, 1, gate, aligned_b2>(waves_per_eu, ngroups, nwarps, p, stream);
                 return true;
             }
             return false;
-        case 2: mul_mat_vec_q_gcn_mc_switch_wpe<type, 2, gate>(waves_per_eu, ngroups, nwarps, p, stream); return true;
-        case 3: mul_mat_vec_q_gcn_mc_switch_wpe<type, 3, gate>(waves_per_eu, ngroups, nwarps, p, stream); return true;
-        case 4: mul_mat_vec_q_gcn_mc_switch_wpe<type, 4, gate>(waves_per_eu, ngroups, nwarps, p, stream); return true;
-        case 5: mul_mat_vec_q_gcn_mc_switch_wpe<type, 5, gate>(waves_per_eu, ngroups, nwarps, p, stream); return true;
-        case 6: mul_mat_vec_q_gcn_mc_switch_wpe<type, 6, gate>(waves_per_eu, ngroups, nwarps, p, stream); return true;
-        case 7: mul_mat_vec_q_gcn_mc_switch_wpe<type, 7, gate>(waves_per_eu, ngroups, nwarps, p, stream); return true;
-        case 8: mul_mat_vec_q_gcn_mc_switch_wpe<type, 8, gate>(waves_per_eu, ngroups, nwarps, p, stream); return true;
+        case 2: mul_mat_vec_q_gcn_mc_switch_wpe<type, 2, gate, aligned_b2>(waves_per_eu, ngroups, nwarps, p, stream); return true;
+        case 3: mul_mat_vec_q_gcn_mc_switch_wpe<type, 3, gate, aligned_b2>(waves_per_eu, ngroups, nwarps, p, stream); return true;
+        case 4: mul_mat_vec_q_gcn_mc_switch_wpe<type, 4, gate, aligned_b2>(waves_per_eu, ngroups, nwarps, p, stream); return true;
+        case 5: mul_mat_vec_q_gcn_mc_switch_wpe<type, 5, gate, aligned_b2>(waves_per_eu, ngroups, nwarps, p, stream); return true;
+        case 6: mul_mat_vec_q_gcn_mc_switch_wpe<type, 6, gate, aligned_b2>(waves_per_eu, ngroups, nwarps, p, stream); return true;
+        case 7: mul_mat_vec_q_gcn_mc_switch_wpe<type, 7, gate, aligned_b2>(waves_per_eu, ngroups, nwarps, p, stream); return true;
+        case 8: mul_mat_vec_q_gcn_mc_switch_wpe<type, 8, gate, aligned_b2>(waves_per_eu, ngroups, nwarps, p, stream); return true;
         default: return false;
     }
 }
@@ -1867,12 +1871,19 @@ static bool mul_mat_vec_q_gcn_mc_try(const int ncols_dst, const mmvq_gcn_mc_args
         }
     }
 
-    if constexpr (mmvq_gcn_mc_q4(type)) {
-        if (gate) {
-            return mul_mat_vec_q_gcn_mc_switch_ncols<type, true>(ncols_dst, waves_per_eu, ngroups, nwarps, p, stream);
+    if constexpr (type == GGML_TYPE_Q4_0) {
+        static const bool aligned_b2 = mmvq_gcn_mc_env("GGML_MMVQ_ALIGNED_B2", 1) != 0;
+        if (aligned_b2) {
+            return gate ? mul_mat_vec_q_gcn_mc_switch_ncols<type, true, true>(ncols_dst, waves_per_eu, ngroups, nwarps, p, stream) :
+                mul_mat_vec_q_gcn_mc_switch_ncols<type, false, true>(ncols_dst, waves_per_eu, ngroups, nwarps, p, stream);
         }
     }
-    return mul_mat_vec_q_gcn_mc_switch_ncols<type, false>(ncols_dst, waves_per_eu, ngroups, nwarps, p, stream);
+    if constexpr (mmvq_gcn_mc_q4(type)) {
+        if (gate) {
+            return mul_mat_vec_q_gcn_mc_switch_ncols<type, true, false>(ncols_dst, waves_per_eu, ngroups, nwarps, p, stream);
+        }
+    }
+    return mul_mat_vec_q_gcn_mc_switch_ncols<type, false, false>(ncols_dst, waves_per_eu, ngroups, nwarps, p, stream);
 }
 
 struct mmvq_gcn_wide_args {
@@ -2067,8 +2078,8 @@ static void mul_mat_vec_q_switch_ncols_dst(
     const mmvq_parameter_table_id table_id  = get_device_table_id(cc);
 
 #if defined(GGML_USE_HIP)
-    // 3..8 columns read more bytes through L1 that way and get slower.
-    if constexpr (type == GGML_TYPE_Q8_0 && !aligned_b2) {
+    // Q8_0 at 3..8 columns reads more bytes through L1 that way and gets slower; Q4_0 has the row-group kernel there.
+    if constexpr ((type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_0) && !aligned_b2) {
         static const bool use_aligned_b2 = mmvq_gcn_mc_env("GGML_MMVQ_ALIGNED_B2", 1) != 0;
         if (use_aligned_b2 && GGML_CUDA_CC_IS_GCN(cc) && ncols_dst <= 2) {
             mul_mat_vec_q_switch_ncols_dst<type, true>(vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst,

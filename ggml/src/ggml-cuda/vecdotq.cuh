@@ -54,6 +54,34 @@ static __device__ __forceinline__ void get_ints_b2_aligned(const void * x, const
 #endif // defined(GGML_USE_HIP)
 }
 
+// The quants and the scale of an 18 byte block (half d, then 16 quant bytes) from one aligned dwordx4 and one ushort.
+static __device__ __forceinline__ void get_block_b2_aligned18(const void * x, int * v, half & d) {
+#if defined(GGML_USE_HIP)
+    const char * b     = (const char *) x;
+    const int    shift = ((uintptr_t) b + 2) & 3;
+    const int  * w     = (const int *) __builtin_assume_aligned(b + 2 - shift, 4);
+
+    int wv[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        wv[i] = w[i];
+    }
+    // the last two quant bytes if the block starts on a dword, else the scale
+    const int e = *(const uint16_t *) (b + 8*shift);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        v[i] = __builtin_amdgcn_alignbyte(i < 3 ? wv[i + 1] : e, wv[i], shift);
+    }
+    d = __ushort_as_half((unsigned short) (shift ? wv[0] : e));
+#else
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        v[i] = get_int_b2((const char *) x + 2, i);
+    }
+    d = *(const half *) x;
+#endif // defined(GGML_USE_HIP)
+}
+
 // q4 contains 8 indices with 4 bit each.
 // This function selects those bytes from table that are at those indices and returns them as int2.
 // The first int contains the bytes with even indices in q4, the second int contains the bytes with odd indices in q4.
@@ -863,6 +891,27 @@ static __device__ __forceinline__ float vec_dot_q4_0_q8_1(
     }
 
     return vec_dot_q4_0_q8_1_impl<VDR_Q4_0_Q8_1_MMVQ>(v, u, bq4_0->d, bq8_1->ds);
+}
+
+static __device__ __forceinline__ float vec_dot_q4_0_q8_1_aligned(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    if constexpr (VDR_Q4_0_Q8_1_MMVQ != QI4_0) {
+        return vec_dot_q4_0_q8_1(vbq, bq8_1, kbx, iqs);
+    }
+
+    int  v[QI4_0];
+    int  u[2*QI4_0];
+    half d;
+
+    get_block_b2_aligned18((const block_q4_0 *) vbq + kbx, v, d);
+#pragma unroll
+    for (int i = 0; i < QI4_0; ++i) {
+        u[2*i+0] = get_int_b4(bq8_1->qs, i);
+        u[2*i+1] = get_int_b4(bq8_1->qs, i + QI4_0);
+    }
+
+    return vec_dot_q4_0_q8_1_impl<QI4_0>(v, u, d, bq8_1->ds);
 }
 
 
