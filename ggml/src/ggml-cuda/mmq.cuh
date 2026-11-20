@@ -2072,11 +2072,12 @@ static void launch_mul_mat_q_impl(ggml_backend_cuda_context & ctx, const mmq_arg
         rounds = (ntiles_dst + slots - 1) / slots;
         fill   = 100 * ntiles_dst / (slots * rounds);
     }
-    if (sk_eff > 0 && fit_t.resident == 1) {
-        // Upstream allows nsm*occupancy blocks; a CU that holds one block leaves most CUs idle in a short last round of tiles.
-        // With more blocks per CU the last round runs faster per block, and stream-k measured slower there (Q5_K, Q6_K).
+    // Upstream allows nsm*occupancy blocks; where a CU holds one block, a short last round of tiles leaves most CUs idle.
+    // With more blocks per CU, CUs idle only when the last round has fewer tiles than CUs; stream-k paid there only for few rounds.
+    const bool sk_rule = sk_eff > 0 && (fit_t.resident == 1 || (rounds <= 3 && ntiles_dst - (rounds - 1)*nsm*fit_t.resident < nsm));
+    if (sk_rule) {
         const bool sk_worse = fit_sk.resident < fit_t.resident || fit_sk.scratch > fit_t.scratch;
-        force_tiling = fill >= sk_eff || k_chunks <= rounds || (force_tiling && sk_worse);
+        force_tiling = fill >= sk_eff || k_chunks <= fit_t.resident * rounds || (force_tiling && sk_worse);
     }
 
     if (force_tiling) {
