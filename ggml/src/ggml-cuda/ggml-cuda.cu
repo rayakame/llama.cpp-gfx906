@@ -4453,6 +4453,306 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+// The Gated DeltaNet conv path of one sequence (delta-net-base.cpp build_conv_state): GET_ROWS of the old conv state,
+// CONCAT with the transposed x, the store of the new state (CPY, or SET_ROWS of the rollback windows with the ARANGE
+// slot order) and SSM_CONV + SILU. One kernel at the CONCAT does all of it, the other nodes are skipped.
+struct ggml_cuda_conv_step_match {
+    int gather_idx;
+    int store_idx;
+    int arange_idx;
+    int conv_idx;
+    ggml_cuda_conv_step_args args;
+};
+
+static bool ggml_cuda_conv_step_enabled() {
+    static const bool enabled = ggml_cuda_env_int("GGML_CONV_STEP", 1) != 0;
+    return enabled;
+}
+
+static bool ggml_cuda_overlaps(const ggml_tensor * t, const char * lo, const char * hi) {
+    if (t == nullptr || t->data == nullptr || ggml_is_empty(t)) {
+        return false;
+    }
+    const char * t_lo = (const char *) t->data;
+    return t_lo < hi && lo < t_lo + ggml_nbytes(t);
+}
+
+static bool ggml_cuda_node_touches(const ggml_tensor * n, const char * lo, const char * hi) {
+    bool touches = ggml_cuda_overlaps(n, lo, hi);
+    for (int s = 0; s < GGML_MAX_SRC; ++s) {
+        touches = touches || ggml_cuda_overlaps(n->src[s], lo, hi);
+    }
+    return touches;
+}
+
+static int ggml_cuda_find_node_before(const ggml_cgraph * cgraph, int i, const ggml_tensor * t) {
+    for (int j = i - 1; j >= 0 && j >= i - 256; --j) {
+        if (cgraph->nodes[j] == t) {
+            return j;
+        }
+    }
+    return -1;
+}
+
+static bool ggml_cuda_match_conv_step(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int ci,
+                                      ggml_cuda_conv_step_match & m) {
+    const ggml_tensor * concat = cgraph->nodes[ci];
+    if (!cuda_ctx->stream_context().concurrent_events.empty() || concat->op != GGML_OP_CONCAT ||
+            ggml_get_op_params_i32(concat, 0) != 0 || concat->type != GGML_TYPE_F32 ||
+            (concat->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, ci) != 2) {
+        return false;
+    }
+
+    const ggml_tensor * s0 = concat->src[0];
+    const ggml_tensor * x  = concat->src[1];
+    const int64_t n_old = s0->ne[0];
+    const int64_t nr    = s0->ne[1];
+    const int64_t n_t   = x->ne[0];
+    if (n_old != 3 || n_t < 1 || n_t > GGML_CUDA_CONV_STEP_MAX_T || ggml_nrows(concat) != nr || !ggml_is_contiguous(s0) ||
+            x->type != GGML_TYPE_F32 || x->data == nullptr || x->nb[0] % sizeof(float) != 0 || x->nb[1] % sizeof(float) != 0) {
+        return false;
+    }
+
+    const ggml_tensor * chain[4];
+    int n_chain = 0;
+    const ggml_tensor * gather = s0;
+    while (gather != nullptr && (gather->op == GGML_OP_RESHAPE || gather->op == GGML_OP_VIEW) && n_chain < 4) {
+        if (gather->op == GGML_OP_VIEW && gather->view_offs != 0) {
+            return false;
+        }
+        chain[n_chain++] = gather;
+        gather = gather->src[0];
+    }
+    if (gather == nullptr || gather->op != GGML_OP_GET_ROWS || (gather->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    const ggml_tensor * states = gather->src[0];
+    const ggml_tensor * ids    = gather->src[1];
+    if (gather->type != GGML_TYPE_F32 || states->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 ||
+            gather->ne[0] != n_old*nr || ggml_nrows(gather) != 1 || states->ne[0] != n_old*nr ||
+            states->nb[0] != sizeof(float) || states->nb[1] % sizeof(float) != 0 || states->data == nullptr || ids->data == nullptr) {
+        return false;
+    }
+    const int gi = ggml_cuda_find_node_before(cgraph, ci, gather);
+    if (gi < 0) {
+        return false;
+    }
+
+    int conv_idx = -1;
+    for (int j = ci + 1; j < cgraph->n_nodes && j <= ci + 64; ++j) {
+        if (cgraph->nodes[j]->op == GGML_OP_SSM_CONV && cgraph->nodes[j]->src[0] == concat) {
+            conv_idx = j;
+            break;
+        }
+    }
+    if (conv_idx < 0 || !ggml_cuda_can_fuse(cgraph, conv_idx, { GGML_OP_SSM_CONV, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
+        return false;
+    }
+    const ggml_tensor * conv = cgraph->nodes[conv_idx];
+    const ggml_tensor * w    = conv->src[1];
+    const ggml_tensor * y    = cgraph->nodes[conv_idx + 1];
+    if (w->type != GGML_TYPE_F32 || w->ne[0] != n_old + 1 || w->ne[1] != nr || w->nb[0] != sizeof(float) || w->data == nullptr ||
+            y->ne[0] != nr || y->ne[1] != n_t || ggml_nrows(y) != n_t || y->nb[0] != sizeof(float) || y->data == nullptr) {
+        return false;
+    }
+
+    // the store is the other user of the concat, through a view
+    int store_idx = -1;
+    for (int j = ci + 1; j < conv_idx; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if ((n->op == GGML_OP_CPY || n->op == GGML_OP_SET_ROWS) && n->src[0]->op == GGML_OP_VIEW && n->src[0]->view_src == concat) {
+            store_idx = j;
+            break;
+        }
+    }
+    if (store_idx < 0) {
+        return false;
+    }
+    const ggml_tensor * store = cgraph->nodes[store_idx];
+    const ggml_tensor * win   = store->src[0];
+    const int win_idx = ggml_cuda_find_node_before(cgraph, store_idx, win);
+    if (win_idx <= ci || win->src[0] != concat || ggml_node_get_use_count(cgraph, win_idx) != 1 ||
+            ((win->flags | store->flags) & GGML_TENSOR_FLAG_OUTPUT) || win->nb[0] != sizeof(float)) {
+        return false;
+    }
+
+    const char * s_lo = (const char *) states->data;
+    const char * s_hi = s_lo + ggml_nbytes(states);
+    const size_t row_size = states->nb[1];
+    const size_t win_size = n_old*nr*sizeof(float);
+    // each window is a whole state row, so a thread reads and writes only the elements of its own channel
+    auto row_ok = [&](const char * p) {
+        return p >= s_lo && p + win_size <= s_hi && (size_t) (p - s_lo) % row_size == 0;
+    };
+
+    int arange_idx = -1;
+    if (store->op == GGML_OP_CPY) {
+        const ggml_tensor * cell = store->src[1];
+        if (win->ne[0] != n_old || win->ne[1] != nr || ggml_nrows(win) != nr || win->nb[1] != concat->nb[1] ||
+                win->view_offs != n_t*sizeof(float) || cell->type != GGML_TYPE_F32 || !ggml_is_contiguous(cell) ||
+                ggml_nelements(cell) != n_old*nr || !row_ok((const char *) cell->data)) {
+            return false;
+        }
+        m.args.win[0] = (float *) cell->data;
+        m.args.n_win  = 1;
+    } else {
+        const int64_t kw = win->ne[1];
+        if (win->ne[0] != n_old || kw < 1 || kw > GGML_CUDA_CONV_STEP_MAX_WIN || kw > n_t || win->ne[2] != nr || win->ne[3] != 1 ||
+                win->nb[1] != sizeof(float) || win->nb[2] != concat->nb[1] || win->view_offs != (n_t - kw + 1)*sizeof(float) ||
+                store->type != GGML_TYPE_F32 || store->ne[0] != n_old || store->ne[2] != nr || store->ne[3] != 1 ||
+                store->nb[0] != sizeof(float) || store->nb[2] != n_old*sizeof(float)) {
+            return false;
+        }
+        set_rows_arange_idx ar;
+        for (int j = store_idx - 3; j > ci && j >= store_idx - 8; --j) {
+            if (cgraph->nodes[j]->op == GGML_OP_ARANGE && ggml_cuda_match_set_rows_arange(cgraph, j, ar) == store_idx) {
+                arange_idx = j;
+                break;
+            }
+        }
+        if (arange_idx < 0) {
+            return false;
+        }
+        for (int64_t i1 = 0; i1 < kw; ++i1) {
+            const int   e   = (int) (i1 + ar.offset);
+            const float v   = ar.start + ar.step * e;
+            const int   row = (int) (ar.scale * v + ar.bias);
+            if (row < 0 || row >= store->ne[1]) {
+                return false;
+            }
+            const char * p = (const char *) store->data + row*store->nb[1];
+            if (!row_ok(p)) {
+                return false;
+            }
+            m.args.win[kw - 1 - i1] = (float *) p;
+        }
+        m.args.n_win = (int) kw;
+    }
+
+    // the gather and its chain are used only on the chain, other uses are empty views
+    int gather_uses = 0;
+    for (int j = gi + 1; j <= ci; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        bool on_chain = n == concat;
+        for (int c = 0; c < n_chain; ++c) {
+            on_chain = on_chain || n == chain[c];
+        }
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * src = n->src[s];
+            if (src == nullptr) {
+                continue;
+            }
+            bool src_on_chain = src == gather;
+            for (int c = 0; c < n_chain; ++c) {
+                src_on_chain = src_on_chain || src == chain[c];
+            }
+            gather_uses += src == gather;
+            if (src_on_chain && !on_chain && !ggml_is_empty(n)) {
+                return false;
+            }
+        }
+        // the old state is read at the concat, not at the gather
+        if (j < ci && !ggml_cuda_is_view_or_noop(n) && ggml_cuda_overlaps(n, s_lo, s_hi)) {
+            return false;
+        }
+    }
+    if (gather_uses != ggml_node_get_use_count(cgraph, gi)) {
+        return false;
+    }
+    for (int c = 0; c < n_chain; ++c) {
+        const int k = ggml_cuda_find_node_before(cgraph, ci, chain[c]);
+        if ((chain[c]->flags & GGML_TENSOR_FLAG_OUTPUT) || (k > gi && ggml_node_get_use_count(cgraph, k) != 1)) {
+            return false;
+        }
+    }
+
+    // the store and the silu output are written at the concat, before the nodes in between
+    const char * y_lo = (const char *) y->data;
+    const char * y_hi = y_lo + ggml_nbytes(y);
+    const bool y_is_x = y->data == x->data && y->nb[1] == x->nb[0] && x->nb[1] == sizeof(float);
+    if (ggml_cuda_overlaps(states, y_lo, y_hi) || ggml_cuda_overlaps(w, y_lo, y_hi) || ggml_cuda_overlaps(ids, y_lo, y_hi) ||
+            ggml_cuda_overlaps(x, s_lo, s_hi) || (!y_is_x && ggml_cuda_overlaps(x, y_lo, y_hi))) {
+        return false;
+    }
+    for (int j = ci + 1; j < conv_idx; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(n) || j == store_idx || (arange_idx >= 0 && j >= arange_idx && j <= arange_idx + 2)) {
+            continue;
+        }
+        if (ggml_cuda_node_touches(n, y_lo, y_hi) || (j < store_idx && ggml_cuda_node_touches(n, s_lo, s_hi))) {
+            return false;
+        }
+    }
+
+    m.gather_idx = gi;
+    m.store_idx  = store_idx;
+    m.arange_idx = arange_idx;
+    m.conv_idx   = conv_idx;
+
+    m.args.states     = (const float *) states->data;
+    m.args.rows       = (const int32_t *) ids->data;
+    m.args.row_stride = row_size / sizeof(float);
+    m.args.x          = (const float *) x->data;
+    m.args.x_st       = x->nb[0] / sizeof(float);
+    m.args.x_sc       = x->nb[1] / sizeof(float);
+    m.args.w          = (const float *) w->data;
+    m.args.w_sc       = w->nb[1] / sizeof(float);
+    m.args.dst        = (float *) y->data;
+    m.args.dst_st     = y->nb[1] / sizeof(float);
+    m.args.n_t        = (int) n_t;
+    m.args.nr         = (int) nr;
+    return true;
+}
+
+// node i is the GET_ROWS, the CONCAT, the CPY store, the ARANGE of a SET_ROWS store or the SSM_CONV of a conv step
+static bool ggml_cuda_find_conv_step(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int i,
+                                     ggml_cuda_conv_step_match & m) {
+    if (!ggml_cuda_conv_step_enabled()) {
+        return false;
+    }
+    const ggml_tensor * node   = cgraph->nodes[i];
+    const ggml_tensor * concat = nullptr;
+    switch (node->op) {
+        case GGML_OP_CONCAT:
+            return ggml_cuda_match_conv_step(cuda_ctx, cgraph, i, m);
+        case GGML_OP_GET_ROWS:
+            for (int j = i + 1; j < cgraph->n_nodes && j <= i + 256; ++j) {
+                if (cgraph->nodes[j]->op != GGML_OP_CONCAT) {
+                    continue;
+                }
+                const ggml_tensor * t = cgraph->nodes[j]->src[0];
+                for (int k = 0; k < 4 && t != nullptr && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW); ++k) {
+                    t = t->src[0];
+                }
+                if (t == node) {
+                    return ggml_cuda_match_conv_step(cuda_ctx, cgraph, j, m) && m.gather_idx == i;
+                }
+            }
+            return false;
+        case GGML_OP_CPY:
+            concat = node->src[0]->op == GGML_OP_VIEW ? node->src[0]->view_src : nullptr;
+            break;
+        case GGML_OP_ARANGE: {
+            set_rows_arange_idx ar;
+            const int k = ggml_cuda_match_set_rows_arange(cgraph, i, ar);
+            if (k > 0 && cgraph->nodes[k]->src[0]->op == GGML_OP_VIEW) {
+                concat = cgraph->nodes[k]->src[0]->view_src;
+            }
+        } break;
+        case GGML_OP_SSM_CONV:
+            concat = node->src[0];
+            break;
+        default:
+            return false;
+    }
+    if (concat == nullptr || concat->op != GGML_OP_CONCAT) {
+        return false;
+    }
+    const int ci = ggml_cuda_find_node_before(cgraph, i, concat);
+    return ci >= 0 && ggml_cuda_match_conv_step(cuda_ctx, cgraph, ci, m) &&
+           (m.store_idx == i || m.arange_idx == i || m.conv_idx == i);
+}
+
 // Qwen3.5/3.8 GDN gate (qwen35.cpp build_layer_attn_linear): alpha = MUL_MAT, RESHAPE, ADD(ssm_dt), SOFTPLUS,
 // MUL(ssm_a), RESHAPE; beta = MUL_MAT, RESHAPE, SIGMOID; both from the same input. Six launches become one.
 static bool ggml_cuda_try_fuse_gdn_gate(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
@@ -4566,6 +4866,20 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     *cuda_ctx, match.experts, match.expert_scale, match.weights, match.dst);
                 return match.node_count - 1;
             }
+        }
+    }
+
+    if (node->op == GGML_OP_GET_ROWS || node->op == GGML_OP_CONCAT || node->op == GGML_OP_CPY ||
+            node->op == GGML_OP_ARANGE || node->op == GGML_OP_SSM_CONV) {
+        ggml_cuda_conv_step_match m;
+        if (ggml_cuda_find_conv_step(cuda_ctx, cgraph, i, m)) {
+            if (node->op == GGML_OP_CONCAT) {
+                ggml_cuda_op_ssm_conv_step(*cuda_ctx, m.args);
+            }
+            if (i == m.arange_idx) {
+                return m.store_idx - i;
+            }
+            return i == m.conv_idx ? 1 : -1;
         }
     }
 
@@ -5733,6 +6047,20 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 params->add_alloc_dep(params->user_data, up->src[2], cgraph->nodes[i + 5]);
                 i += 5;
                 break;
+            }
+        }
+        // the conv step writes the silu output at the concat, while it reads x: keep x until the silu
+        for (int i = 0; i < cgraph->n_nodes && ggml_cuda_conv_step_enabled(); ++i) {
+            ggml_tensor * concat = cgraph->nodes[i];
+            if (concat->op != GGML_OP_CONCAT || concat->src[1]->ne[0] > GGML_CUDA_CONV_STEP_MAX_T) {
+                continue;
+            }
+            for (int j = i + 1; j + 1 < cgraph->n_nodes && j <= i + 64; ++j) {
+                if (cgraph->nodes[j]->op == GGML_OP_SSM_CONV && cgraph->nodes[j]->src[0] == concat &&
+                        cgraph->nodes[j + 1]->op == GGML_OP_UNARY) {
+                    params->add_alloc_dep(params->user_data, concat->src[1], cgraph->nodes[j + 1]);
+                    break;
+                }
             }
         }
         for (int i = 0; i < cgraph->n_nodes; ++i) {

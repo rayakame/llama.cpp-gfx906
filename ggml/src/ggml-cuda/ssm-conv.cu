@@ -205,3 +205,86 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
                           out->nb[2], nc, nr, n_t, n_s, stream);
     }
 }
+
+template <int n_max>
+static __global__ void ssm_conv_step_f32(const ggml_cuda_conv_step_args p) {
+    constexpr int d_conv = 4;
+    constexpr int n_old  = d_conv - 1;
+    constexpr int n_hist = n_old + GGML_CUDA_CONV_STEP_MAX_WIN - 1;
+
+    const int c = blockIdx.x*blockDim.x + threadIdx.x;
+    if (c >= p.nr) {
+        return;
+    }
+
+    // all reads come before the first write: a window may be the old state row, dst may be x
+    const float * s = p.states + p.rows[0]*p.row_stride + c*n_old;
+    float h[n_hist];
+#pragma unroll
+    for (int k = 0; k < n_hist; ++k) {
+        h[k] = k < n_hist - n_old ? 0.0f : s[k - (n_hist - n_old)];
+    }
+
+    float xt[n_max];
+#pragma unroll
+    for (int t = 0; t < n_max; ++t) {
+        xt[t] = t < p.n_t ? p.x[t*p.x_st + c*p.x_sc] : 0.0f;
+    }
+
+    float w[d_conv];
+#pragma unroll
+    for (int j = 0; j < d_conv; ++j) {
+        w[j] = p.w[c*p.w_sc + j];
+    }
+
+#pragma unroll
+    for (int t = 0; t < n_max; ++t) {
+        if (t >= p.n_t) {
+            break;
+        }
+#pragma unroll
+        for (int k = 0; k < n_hist - 1; ++k) {
+            h[k] = h[k + 1];
+        }
+        h[n_hist - 1] = xt[t];
+
+        float sumf = 0.0f;
+#pragma unroll
+        for (int j = 0; j < d_conv; ++j) {
+            sumf += h[n_hist - d_conv + j] * w[j];
+        }
+        // ssm_conv_f32 adds its zero bias, which turns -0 into +0
+        sumf += 0.0f;
+        p.dst[t*p.dst_st + c] = ggml_cuda_op_silu_single(sumf);
+    }
+
+#pragma unroll
+    for (int r = 0; r < GGML_CUDA_CONV_STEP_MAX_WIN; ++r) {
+        if (r < p.n_win) {
+            float * d = p.win[r] + c*n_old;
+#pragma unroll
+            for (int j = 0; j < n_old; ++j) {
+                d[j] = h[n_hist - n_old - r + j];
+            }
+        }
+    }
+}
+
+void ggml_cuda_op_ssm_conv_step(ggml_backend_cuda_context & ctx, const ggml_cuda_conv_step_args & args) {
+    GGML_ASSERT(args.n_t >= 1 && args.n_t <= GGML_CUDA_CONV_STEP_MAX_T);
+    GGML_ASSERT(args.n_win >= 1 && args.n_win <= GGML_CUDA_CONV_STEP_MAX_WIN);
+
+    const int    threads = 64;
+    const dim3   blocks((args.nr + threads - 1) / threads);
+    cudaStream_t stream  = ctx.stream();
+
+    if (args.n_t == 1) {
+        ssm_conv_step_f32<1><<<blocks, threads, 0, stream>>>(args);
+    } else if (args.n_t <= 4) {
+        ssm_conv_step_f32<4><<<blocks, threads, 0, stream>>>(args);
+    } else if (args.n_t <= 8) {
+        ssm_conv_step_f32<8><<<blocks, threads, 0, stream>>>(args);
+    } else {
+        ssm_conv_step_f32<GGML_CUDA_CONV_STEP_MAX_T><<<blocks, threads, 0, stream>>>(args);
+    }
+}
