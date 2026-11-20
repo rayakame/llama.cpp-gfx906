@@ -2,12 +2,12 @@
 #include "ssm-conv.cuh"
 #include "unary.cuh"
 
-template <bool apply_silu, size_t split_d_inner, size_t d_conv>
+template <bool apply_silu, size_t split_d_inner, size_t d_conv, bool l2 = false>
 static __global__ void ssm_conv_f32(const float * src0_ptr, const float * src1_ptr,
                                     const float * bias_ptr,
                                     const int src0_nb0, const int src0_nb1, const int src0_nb2, const int src1_nb1,
                                     float * dst_ptr, const int dst_nb0, const int dst_nb1, const int dst_nb2,
-                                    const int64_t n_t) {
+                                    const int64_t n_t, const ggml_cuda_ssm_conv_l2_args l2a) {
     ggml_cuda_pdl_lc();
     const float * GGML_CUDA_RESTRICT src0 = src0_ptr;
     const float * GGML_CUDA_RESTRICT src1 = src1_ptr;
@@ -37,6 +37,20 @@ static __global__ void ssm_conv_f32(const float * src0_ptr, const float * src1_p
 
     float b = bias != nullptr ? bias[bidy * split_d_inner + tid] : 0.0f;
 
+    [[maybe_unused]] extern __shared__ float s_l2[];
+    [[maybe_unused]] int l2r  = -1;
+    [[maybe_unused]] int head = 0;
+    if constexpr (l2) {
+        const int c0 = bidy * split_d_inner;
+#pragma unroll
+        for (int r = 0; r < 2; r++) {
+            if (r < l2a.n && c0 >= l2a.ch0[r] && c0 < l2a.ch0[r] + l2a.nheads[r] * (int) split_d_inner) {
+                l2r  = r;
+                head = (c0 - l2a.ch0[r]) / (int) split_d_inner;
+            }
+        }
+    }
+
     for (int64_t i = 0; i < n_t; i++) {
         float sumf = 0.0f;
 
@@ -53,7 +67,45 @@ static __global__ void ssm_conv_f32(const float * src0_ptr, const float * src1_p
             sumf += x[(i + j) % d_conv] * w[j];
         }
         sumf += b;
-        y_block[i * stride_y + tid] = apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
+        const float y = apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
+        y_block[i * stride_y + tid] = y;
+        if constexpr (l2) {
+            if (l2r >= 0) {
+                s_l2[i * split_d_inner + tid] = y;
+            }
+        }
+    }
+
+    if constexpr (l2) {
+        static_assert(split_d_inner == GGML_CUDA_SSM_CONV_L2_NCOLS, "a block must hold one head");
+        if (l2r < 0) {
+            return;
+        }
+        constexpr int lanes = split_d_inner / 4;
+        float * s_scale = s_l2 + n_t * split_d_inner;
+        const float eps       = l2r == 0 ? l2a.eps[0]    : l2a.eps[1];
+        const float scale_out = l2r == 0 ? l2a.scale[0]  : l2a.scale[1];
+        const int   nheads    = l2r == 0 ? l2a.nheads[0] : l2a.nheads[1];
+        float *     dst_r     = l2r == 0 ? l2a.dst[0]    : l2a.dst[1];
+        __syncthreads();
+
+        // the sum of squares in the order of rms_norm_f32<32, 1, true>, so the result is bit-identical
+        const int lane = tid % lanes;
+        for (int t = tid / lanes; t < n_t; t += split_d_inner / lanes) {
+            const float4 xs = ((const float4 *) (s_l2 + t * split_d_inner))[lane];
+            float tmp = 0.0f;
+            tmp += xs.x*xs.x + xs.y*xs.y + xs.z*xs.z + xs.w*xs.w;
+            tmp = warp_reduce_sum<lanes>(tmp);
+            if (lane == 0) {
+                s_scale[t] = rsqrtf(tmp / l2a.ncols + eps);
+            }
+        }
+        __syncthreads();
+
+        float * l2_dst = dst_r + ((int64_t) bidx * n_t * nheads + head) * split_d_inner + tid;
+        for (int64_t t = 0; t < n_t; t++) {
+            l2_dst[t * nheads * split_d_inner] = (s_scale[t] * s_l2[t * split_d_inner + tid]) * scale_out;
+        }
     }
 }
 
@@ -127,17 +179,29 @@ template <bool apply_silu>
 static void ssm_conv_f32_cuda(const float * src0, const float * src1, const float * bias, const int src0_nb0, const int src0_nb1,
                               const int src0_nb2, const int src1_nb1, float * dst, const int dst_nb0, const int dst_nb1,
                               const int dst_nb2, const int64_t nc, const int64_t nr, const int64_t n_t,
-                              const int64_t n_s, cudaStream_t stream) {
+                              const int64_t n_s, cudaStream_t stream, const ggml_cuda_ssm_conv_l2_args * l2 = nullptr) {
     const int threads = 128;
     GGML_ASSERT(nr % threads == 0);
 
     auto launch_kernel = [&](auto NC) {
         constexpr int kNC = decltype(NC)::value;
+        if constexpr (apply_silu) {
+            if (l2 != nullptr) {
+                GGML_ASSERT(n_t <= GGML_CUDA_SSM_CONV_L2_MAX_T && l2->ncols == threads);
+                const dim3   blocks(n_s, nr / threads, 1);
+                const size_t smem = (n_t * threads + n_t) * sizeof(float);
+                const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks, threads, smem, stream);
+                ggml_cuda_kernel_launch(ssm_conv_f32<true, threads, kNC, true>, launch_params, src0, src1, bias, src0_nb0, src0_nb1,
+                                        src0_nb2, src1_nb1, dst, dst_nb0, dst_nb1, dst_nb2, n_t, *l2);
+                return;
+            }
+        }
         if (n_t <= 32) {
             const dim3 blocks(n_s, (nr + threads - 1) / threads, 1);
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks, threads, 0, stream);
             ggml_cuda_kernel_launch(ssm_conv_f32<apply_silu, threads, kNC>, launch_params, src0, src1, bias, src0_nb0, src0_nb1,
-                                                                        src0_nb2, src1_nb1, dst, dst_nb0, dst_nb1, dst_nb2, n_t);
+                                                                        src0_nb2, src1_nb1, dst, dst_nb0, dst_nb1, dst_nb2, n_t,
+                                                                        ggml_cuda_ssm_conv_l2_args{});
         } else {
             const int64_t split_n_t = 32;
             dim3          blocks(n_s, (nr + threads - 1) / threads, (n_t + split_n_t - 1) / split_n_t);
@@ -158,7 +222,8 @@ static void ssm_conv_f32_cuda(const float * src0, const float * src1, const floa
     }
 }
 
-void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * bias_add_node, ggml_tensor * silu_dst) {
+void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * bias_add_node, ggml_tensor * silu_dst,
+                           const ggml_cuda_ssm_conv_l2_args * l2) {
     const struct ggml_tensor * src0 = dst->src[0];  // conv_x
     const struct ggml_tensor * src1 = dst->src[1];  // conv1d.weight
     const bool fuse_bias = bias_add_node != nullptr;
@@ -197,9 +262,10 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
         GGML_ASSERT(ggml_nelements(bias) == nr);
     }
 
+    GGML_ASSERT(l2 == nullptr || fuse_silu);
     if (fuse_silu) {
         ssm_conv_f32_cuda<true>(src0_d, src1_d, bias_d, src0->nb[0], src0->nb[1], src0->nb[2], src1->nb[1], dst_d, out->nb[0], out->nb[1],
-                          out->nb[2], nc, nr, n_t, n_s, stream);
+                          out->nb[2], nc, nr, n_t, n_s, stream, l2);
     } else {
         ssm_conv_f32_cuda<false>(src0_d, src1_d, bias_d, src0->nb[0], src0->nb[1], src0->nb[2], src1->nb[1], dst_d, out->nb[0], out->nb[1],
                           out->nb[2], nc, nr, n_t, n_s, stream);

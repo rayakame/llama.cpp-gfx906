@@ -4477,6 +4477,27 @@ static bool ggml_cuda_overlaps(const ggml_tensor * t, const char * lo, const cha
     return t_lo < hi && lo < t_lo + ggml_nbytes(t);
 }
 
+// The q and k l2 norms of the Gated DeltaNet (models.h build_gdn_l2_norm: RMS_NORM + SCALE of a head-wide view of the
+// silu output) are done by the SSM_CONV + SILU kernel, whose 128-channel blocks each hold one head.
+struct ggml_cuda_ssm_conv_l2_match {
+    int conv_idx;
+    int norm_idx[2];
+    ggml_cuda_ssm_conv_l2_args args;
+};
+
+static bool ggml_cuda_ssm_conv_l2_enabled() {
+    static const bool enabled = ggml_cuda_env_int("GGML_SSM_CONV_L2", 1) != 0;
+    return enabled;
+}
+
+static bool ggml_cuda_l2_overlaps(const ggml_tensor * t, const char * lo, const char * hi) {
+    if (t == nullptr || t->data == nullptr || ggml_is_empty(t)) {
+        return false;
+    }
+    const char * t_lo = (const char *) t->data;
+    return t_lo < hi && lo < t_lo + ggml_nbytes(t);
+}
+
 static bool ggml_cuda_node_touches(const ggml_tensor * n, const char * lo, const char * hi) {
     bool touches = ggml_cuda_overlaps(n, lo, hi);
     for (int s = 0; s < GGML_MAX_SRC; ++s) {
@@ -4753,6 +4774,135 @@ static bool ggml_cuda_find_conv_step(ggml_backend_cuda_context * cuda_ctx, const
            (m.store_idx == i || m.arange_idx == i || m.conv_idx == i);
 }
 
+static bool ggml_cuda_match_ssm_conv_l2(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int ci,
+                                        ggml_cuda_ssm_conv_l2_match & m) {
+    if (!ggml_cuda_ssm_conv_l2_enabled() || !cuda_ctx->stream_context().concurrent_events.empty() ||
+            !ggml_cuda_can_fuse(cgraph, ci, { GGML_OP_SSM_CONV, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
+        return false;
+    }
+    const ggml_tensor * conv = cgraph->nodes[ci];
+    const ggml_tensor * y    = cgraph->nodes[ci + 1];
+    const ggml_tensor * x    = conv->src[0];
+    const ggml_tensor * w    = conv->src[1];
+
+    constexpr int64_t ncols = GGML_CUDA_SSM_CONV_L2_NCOLS;
+    const int64_t nr  = y->ne[0];
+    const int64_t n_t = y->ne[1];
+    const int64_t n_s = y->ne[2];
+    if (nr % ncols != 0 || n_t < 1 || n_t > GGML_CUDA_SSM_CONV_L2_MAX_T || y->ne[3] != 1 || !ggml_is_contiguous(y) ||
+            y->data == nullptr || x->data == nullptr || w->data == nullptr) {
+        return false;
+    }
+
+    m.args       = {};
+    m.args.ncols = (int) ncols;
+    int n    = 0;
+    int last = ci + 1;
+    for (int j = ci + 2; j + 1 < cgraph->n_nodes && j <= ci + 16 && n < 2; ++j) {
+        const ggml_tensor * rms = cgraph->nodes[j];
+        if (rms->op != GGML_OP_RMS_NORM || rms->src[0]->op != GGML_OP_VIEW || rms->src[0]->src[0] != y ||
+                !ggml_cuda_can_fuse(cgraph, j, { GGML_OP_RMS_NORM, GGML_OP_SCALE }, {})) {
+            continue;
+        }
+        const ggml_tensor * v  = rms->src[0];
+        const ggml_tensor * sc = cgraph->nodes[j + 1];
+        // the shape and alignment for which rms_norm_f32_cuda takes rms_norm_f32<32, 1, true>
+        if (v->type != GGML_TYPE_F32 || v->ne[0] != ncols || v->nb[0] != sizeof(float) || v->nb[1] != ncols*sizeof(float) ||
+                v->ne[2] != n_t || v->ne[3] != n_s || v->nb[2] != y->nb[1] || v->nb[3] != y->nb[2] ||
+                v->view_offs % (ncols*sizeof(float)) != 0 || !ggml_cuda_is_aligned(v, 16) ||
+                (int64_t) (v->view_offs/sizeof(float)) + v->ne[1]*ncols > nr ||
+                sc->type != GGML_TYPE_F32 || !ggml_is_contiguous(sc) || !ggml_are_same_shape(sc, v) || sc->data == nullptr ||
+                (uintptr_t) sc->data % 16 != 0) {
+            continue;
+        }
+        m.args.ch0[n]    = (int) (v->view_offs/sizeof(float));
+        m.args.nheads[n] = (int) v->ne[1];
+        memcpy(&m.args.eps[n], rms->op_params, sizeof(float));
+        m.args.scale[n]  = ggml_get_op_params_f32(sc, 0);
+        m.args.dst[n]    = (float *) sc->data;
+        m.norm_idx[n]    = j;
+        last = j + 1;
+        ++n;
+        ++j;
+    }
+    if (n == 0 || (n == 2 && m.args.ch0[0] < m.args.ch0[1] + m.args.nheads[1]*ncols &&
+                             m.args.ch0[1] < m.args.ch0[0] + m.args.nheads[0]*ncols)) {
+        return false;
+    }
+    m.args.n = n;
+
+    auto fused = [&](int j) {
+        for (int r = 0; r < n; ++r) {
+            if (j == m.norm_idx[r] || j == m.norm_idx[r] + 1) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    // the l2 outputs are written at the SSM_CONV, before the nodes in between, which must not touch them or write y
+    const char * y_lo = (const char *) y->data;
+    const char * y_hi = y_lo + ggml_nbytes(y);
+    for (int r = 0; r < n; ++r) {
+        const ggml_tensor * sc = cgraph->nodes[m.norm_idx[r] + 1];
+        const char * lo = (const char *) sc->data;
+        const char * hi = lo + ggml_nbytes(sc);
+        if (ggml_cuda_l2_overlaps(x, lo, hi) || ggml_cuda_l2_overlaps(w, lo, hi) || ggml_cuda_l2_overlaps(y, lo, hi) ||
+                (r == 1 && ggml_cuda_l2_overlaps(cgraph->nodes[m.norm_idx[0] + 1], lo, hi))) {
+            return false;
+        }
+        for (int j = ci + 2; j < last; ++j) {
+            const ggml_tensor * nd = cgraph->nodes[j];
+            if (fused(j) || ggml_cuda_is_view_or_noop(nd)) {
+                continue;
+            }
+            bool touches = ggml_cuda_l2_overlaps(nd, lo, hi) || ggml_cuda_l2_overlaps(nd, y_lo, y_hi);
+            for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                touches = touches || ggml_cuda_l2_overlaps(nd->src[k], lo, hi);
+            }
+            if (touches) {
+                return false;
+            }
+        }
+    }
+
+    m.conv_idx = ci;
+    return true;
+}
+
+// node i is the SSM_CONV or one of the fused RMS_NORMs
+static bool ggml_cuda_conv_step_owns(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int conv_idx) {
+    ggml_cuda_conv_step_match ms;
+    return ggml_cuda_find_conv_step(cuda_ctx, cgraph, conv_idx, ms) && ms.conv_idx == conv_idx;
+}
+
+static bool ggml_cuda_find_ssm_conv_l2(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int i,
+                                       ggml_cuda_ssm_conv_l2_match & m) {
+    if (!ggml_cuda_ssm_conv_l2_enabled()) {
+        return false;
+    }
+    const ggml_tensor * node = cgraph->nodes[i];
+    if (node->op == GGML_OP_SSM_CONV) {
+        // the conv step of one sequence does not do the norms
+        return !ggml_cuda_conv_step_owns(cuda_ctx, cgraph, i) && ggml_cuda_match_ssm_conv_l2(cuda_ctx, cgraph, i, m);
+    }
+    if (node->op != GGML_OP_RMS_NORM || node->src[0]->op != GGML_OP_VIEW || node->src[0]->src[0] == nullptr ||
+            node->src[0]->src[0]->op != GGML_OP_UNARY) {
+        return false;
+    }
+    const ggml_tensor * conv = node->src[0]->src[0]->src[0];
+    if (conv == nullptr || conv->op != GGML_OP_SSM_CONV) {
+        return false;
+    }
+    for (int j = i - 2; j >= 0 && j >= i - 16; --j) {
+        if (cgraph->nodes[j] == conv) {
+            return !ggml_cuda_conv_step_owns(cuda_ctx, cgraph, j) && ggml_cuda_match_ssm_conv_l2(cuda_ctx, cgraph, j, m) &&
+                   (m.norm_idx[0] == i || (m.args.n == 2 && m.norm_idx[1] == i));
+        }
+    }
+    return false;
+}
+
 // Qwen3.5/3.8 GDN gate (qwen35.cpp build_layer_attn_linear): alpha = MUL_MAT, RESHAPE, ADD(ssm_dt), SOFTPLUS,
 // MUL(ssm_a), RESHAPE; beta = MUL_MAT, RESHAPE, SIGMOID; both from the same input. Six launches become one.
 static bool ggml_cuda_try_fuse_gdn_gate(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
@@ -4880,6 +5030,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 return m.store_idx - i;
             }
             return i == m.conv_idx ? 1 : -1;
+        }
+    }
+
+    if (node->op == GGML_OP_SSM_CONV || node->op == GGML_OP_RMS_NORM) {
+        ggml_cuda_ssm_conv_l2_match m;
+        if (ggml_cuda_find_ssm_conv_l2(cuda_ctx, cgraph, i, m)) {
+            if (node->op == GGML_OP_SSM_CONV) {
+                ggml_cuda_op_ssm_conv(*cuda_ctx, node, /*bias_add_node=*/ nullptr, cgraph->nodes[i + 1], &m.args);
+            }
+            return 1;
         }
     }
 
@@ -6060,6 +6220,22 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                         cgraph->nodes[j + 1]->op == GGML_OP_UNARY) {
                     params->add_alloc_dep(params->user_data, concat->src[1], cgraph->nodes[j + 1]);
                     break;
+                }
+            }
+        }
+        // the l2 norms are written at the SSM_CONV, while it reads its input: keep the input until the last SCALE
+        for (int i = 0; i + 1 < cgraph->n_nodes && ggml_cuda_ssm_conv_l2_enabled(); ++i) {
+            ggml_tensor * conv = cgraph->nodes[i];
+            ggml_tensor * y    = cgraph->nodes[i + 1];
+            if (conv->op != GGML_OP_SSM_CONV || y->op != GGML_OP_UNARY || y->src[0] != conv ||
+                    y->ne[1] > GGML_CUDA_SSM_CONV_L2_MAX_T) {
+                continue;
+            }
+            for (int j = i + 2; j + 1 < cgraph->n_nodes && j <= i + 16; ++j) {
+                const ggml_tensor * rms = cgraph->nodes[j];
+                if (rms->op == GGML_OP_RMS_NORM && rms->src[0]->op == GGML_OP_VIEW && rms->src[0]->src[0] == y &&
+                        cgraph->nodes[j + 1]->op == GGML_OP_SCALE) {
+                    params->add_alloc_dep(params->user_data, conv->src[0], cgraph->nodes[j + 1]);
                 }
             }
         }
