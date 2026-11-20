@@ -1313,6 +1313,308 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
 // ---------------------------------------------------------------------------------------------
 
+#if defined(GGML_USE_HIP)
+// GCN dp4a loaders for whole K-quant tiles: rows as an SGPR base plus a 32-bit lane offset, so the loads need no 64-bit math per row.
+
+typedef const __attribute__((address_space(1))) char * ggml_cuda_mmq_gcn_ptr;
+
+static __device__ __forceinline__ ggml_cuda_mmq_gcn_ptr ggml_cuda_mmq_gcn_sbase(const char * x) {
+    ggml_cuda_mmq_gcn_ptr p = (ggml_cuda_mmq_gcn_ptr) x;
+#if defined(__HIP_DEVICE_COMPILE__)
+    // Without this the compiler moves the lane offset into a 64-bit VGPR base and redoes the row math for every row.
+    asm("" : "+s"(p));
+#endif // defined(__HIP_DEVICE_COMPILE__)
+    return p;
+}
+
+// Keeps the zero extension of the lane offset inside the K loop, where the SGPR base form needs to see it.
+static __device__ __forceinline__ uint32_t ggml_cuda_mmq_gcn_loff(uint32_t off, const int kbx0) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    asm("" : "+v"(off) : "s"(kbx0));
+#else
+    GGML_UNUSED(kbx0);
+#endif // defined(__HIP_DEVICE_COMPILE__)
+    return off;
+}
+
+template <typename T>
+static __device__ __forceinline__ T ggml_cuda_mmq_gcn_load(ggml_cuda_mmq_gcn_ptr p, const uint32_t off) {
+    return *(const __attribute__((address_space(1))) T *) (p + off);
+}
+
+static __device__ __forceinline__ int ggml_cuda_mmq_gcn_load_b2(ggml_cuda_mmq_gcn_ptr p, const uint32_t off) {
+    const __attribute__((address_space(1))) uint16_t * p16 = (const __attribute__((address_space(1))) uint16_t *) (p + off);
+    return p16[0] | (p16[1] << 16);
+}
+
+static constexpr __device__ int ggml_cuda_mmq_gcn_meta_lanes(const int nthreads, const int I) {
+    return nthreads >= 4*I ? 4 : (nthreads >= 2*I ? 2 : 1);
+}
+
+template <typename block_t, int nthreads, int I>
+static __device__ __forceinline__ void ggml_cuda_mmq_gcn_load_dm_sc_q45_K(
+        const char * __restrict__ x, half2 * __restrict__ x_dm, int * __restrict__ x_sc, const int kbx0, const int stride, const int tid) {
+    constexpr int nl   = ggml_cuda_mmq_gcn_meta_lanes(nthreads, I);
+    constexpr int nrow = nthreads / nl;
+    constexpr int nsc  = (MMQ_TILE_NE_K/8) / nl;
+
+    const int il = tid / nl;
+    const int kl = tid % nl;
+    const uint32_t off  = ggml_cuda_mmq_gcn_loff(uint32_t(il*stride)*sizeof(block_t), kbx0);
+    const int64_t  step = int64_t(nrow*stride)*sizeof(block_t);
+    const char *   xr   = x + int64_t(kbx0)*sizeof(block_t);
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nrow) {
+        const int i = i0 + il;
+        if (nrow <= I || i < I) {
+            // dm and the 12 scale bytes are the first 16 bytes of the block
+            const int4 v = ggml_cuda_mmq_gcn_load<int4>(ggml_cuda_mmq_gcn_sbase(xr), off);
+            const int scales[3] = {v.y, v.z, v.w};
+
+            if (kl == 0) {
+                ((int *) x_dm)[i] = v.x;
+            }
+#pragma unroll
+            for (int l = 0; l < nsc; ++l) {
+                const int ksc = kl*nsc + l;
+                x_sc[i*(MMQ_TILE_NE_K/8) + i/8 + ksc] = unpack_scales_q45_K(scales, ksc);
+            }
+        }
+        xr += step;
+    }
+}
+
+template <ggml_type type, int J> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_q3_K_gcn(
+        const char * __restrict__ x, const char * __restrict__ x_gate, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    GGML_UNUSED_VARS(x_gate, i_max);
+
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nthreads  = ggml_cuda_mmq_get_nthreads(type, J, false, GGML_PREC_Q8);
+    constexpr int I         = ggml_cuda_mmq_get_I(type, J, false, GGML_PREC_Q8);
+
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q3_K, I);
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + txs.qs);
+    int   * x_sc = (int   *) (x_df + txs.dm);
+
+    const int tid = threadIdx.y*warp_size + threadIdx.x;
+
+    constexpr int nl   = MMQ_ITER_K / (4 * QR3_K);
+    constexpr int nrow = nthreads / nl;
+    const int il = tid / nl;
+    const int kq = tid % nl;
+    const uint32_t off_row = uint32_t(il*stride)*sizeof(block_q3_K);
+    const uint32_t off_ql  = ggml_cuda_mmq_gcn_loff(off_row + offsetof(block_q3_K, qs)    + sizeof(int)*kq, kbx0);
+    const uint32_t off_qh  = ggml_cuda_mmq_gcn_loff(off_row + offsetof(block_q3_K, hmask) + sizeof(int)*(kq % (QI3_K/2)), kbx0);
+    const int      sh_qh   = 4 * (kq / (QI3_K/2));
+    const int64_t  step    = int64_t(nrow*stride)*sizeof(block_q3_K);
+    const char *   xr      = x + int64_t(kbx0)*sizeof(block_q3_K);
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nrow) {
+        const ggml_cuda_mmq_gcn_ptr xs = ggml_cuda_mmq_gcn_sbase(xr);
+        const int ql = ggml_cuda_mmq_gcn_load_b2(xs, off_ql);
+        const int qh = ggml_cuda_mmq_gcn_load_b2(xs, off_qh) >> sh_qh;
+
+#pragma unroll
+        for (int l = 0; l < QR3_K; ++l) {
+            const int k = (kq/8)*32 + l*8 + kq % 8;
+
+            const int x_ql_k =  (ql >> (2*l))       & 0x03030303;
+            const int x_qh_k = ((qh >>    l)  << 2) & 0x04040404;
+
+            x_qs[(i0 + il)*(2*MMQ_TILE_NE_K + 1) + k] = __vsub4(x_ql_k | x_qh_k, 0x04040404);
+        }
+        xr += step;
+    }
+
+    constexpr int ml   = ggml_cuda_mmq_gcn_meta_lanes(nthreads, I);
+    constexpr int mrow = nthreads / ml;
+    constexpr int msc  = (MMQ_TILE_NE_K/8) / ml;
+    const int jl = tid / ml;
+    const int kl = tid % ml;
+    const uint32_t off_m  = ggml_cuda_mmq_gcn_loff(uint32_t(jl*stride)*sizeof(block_q3_K) + offsetof(block_q3_K, scales), kbx0);
+    const int64_t  step_m = int64_t(mrow*stride)*sizeof(block_q3_K);
+    const char *   xm     = x + int64_t(kbx0)*sizeof(block_q3_K);
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += mrow) {
+        const int i = i0 + jl;
+        if (mrow <= I || i < I) {
+            const ggml_cuda_mmq_gcn_ptr xs = ggml_cuda_mmq_gcn_sbase(xm);
+            const int s0 = ggml_cuda_mmq_gcn_load_b2(xs, off_m + 0);
+            const int s1 = ggml_cuda_mmq_gcn_load_b2(xs, off_m + 4);
+            const int s2 = ggml_cuda_mmq_gcn_load_b2(xs, off_m + 8);
+
+#pragma unroll
+            for (int l = 0; l < msc; ++l) {
+                const int ksc = kl*msc + l;
+                const int sc_low  = ((ksc % 2 ? s1 : s0) >> (4 * (ksc / 2))) & 0x0F0F0F0F;
+                const int sc_high = ((s2 >> (2 * ksc)) << 4) & 0x30303030;
+                x_sc[i*(MMQ_TILE_NE_K/8) + i/8 + ksc] = __vsub4(sc_low | sc_high, 0x20202020);
+            }
+            if (kl == 0) {
+                x_df[i] = ggml_cuda_mmq_gcn_load<half>(xs, off_m + offsetof(block_q3_K, d) - offsetof(block_q3_K, scales));
+            }
+        }
+        xm += step_m;
+    }
+}
+
+template <ggml_type type, int J> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_q4_K_gcn(
+        const char * __restrict__ x, const char * __restrict__ x_gate, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    GGML_UNUSED_VARS(x_gate, i_max);
+
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nthreads  = ggml_cuda_mmq_get_nthreads(type, J, false, GGML_PREC_Q8);
+    constexpr int I         = ggml_cuda_mmq_get_I(type, J, false, GGML_PREC_Q8);
+
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q4_K, I);
+    int   * x_qs = (int   *)  x_tile;
+    half2 * x_dm = (half2 *) (x_qs + txs.qs);
+    int   * x_sc = (int   *) (x_dm + txs.dm);
+
+    const int tid = threadIdx.y*warp_size + threadIdx.x;
+
+    constexpr int nl   = MMQ_ITER_K / (4 * QR4_K);
+    constexpr int nrow = nthreads / nl;
+    const int il = tid / nl;
+    const int kq = tid % nl;
+    const uint32_t off  = ggml_cuda_mmq_gcn_loff(uint32_t(il*stride)*sizeof(block_q4_K) + offsetof(block_q4_K, qs) + sizeof(int)*kq, kbx0);
+    const int64_t  step = int64_t(nrow*stride)*sizeof(block_q4_K);
+    const char *   xr   = x + int64_t(kbx0)*sizeof(block_q4_K);
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nrow) {
+        x_qs[(i0 + il)*(MMQ_TILE_NE_K + 1) + kq] = ggml_cuda_mmq_gcn_load<int>(ggml_cuda_mmq_gcn_sbase(xr), off);
+        xr += step;
+    }
+
+    ggml_cuda_mmq_gcn_load_dm_sc_q45_K<block_q4_K, nthreads, I>(x, x_dm, x_sc, kbx0, stride, tid);
+}
+
+template <ggml_type type, int J> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_q5_K_gcn(
+        const char * __restrict__ x, const char * __restrict__ x_gate, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    GGML_UNUSED_VARS(x_gate, i_max);
+
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nthreads  = ggml_cuda_mmq_get_nthreads(type, J, false, GGML_PREC_Q8);
+    constexpr int I         = ggml_cuda_mmq_get_I(type, J, false, GGML_PREC_Q8);
+
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q5_K, I);
+    int   * x_qs = (int   *)  x_tile;
+    half2 * x_dm = (half2 *) (x_qs + txs.qs);
+    int   * x_sc = (int   *) (x_dm + txs.dm);
+
+    const int tid = threadIdx.y*warp_size + threadIdx.x;
+
+    constexpr int nl   = MMQ_ITER_K / (4 * QR5_K);
+    constexpr int nrow = nthreads / nl;
+    const int il = tid / nl;
+    const int kq = tid % nl;
+    const uint32_t off_row = uint32_t(il*stride)*sizeof(block_q5_K);
+    const uint32_t off_ql  = ggml_cuda_mmq_gcn_loff(off_row + offsetof(block_q5_K, qs) + sizeof(int)*kq, kbx0);
+    const uint32_t off_qh  = ggml_cuda_mmq_gcn_loff(off_row + offsetof(block_q5_K, qh) + sizeof(int)*(kq % (QI5_K/4)), kbx0);
+    const int      sh_qh   = 2 * (kq / (QI5_K/4));
+    const int      ky      = QR5_K*kq;
+    const int      kq0     = ky - ky % (QI5_K/2) + kq % (QI5_K/4) + 0;
+    const int      kq1     = ky - ky % (QI5_K/2) + kq % (QI5_K/4) + QI5_K/4;
+    const int64_t  step    = int64_t(nrow*stride)*sizeof(block_q5_K);
+    const char *   xr      = x + int64_t(kbx0)*sizeof(block_q5_K);
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nrow) {
+        const ggml_cuda_mmq_gcn_ptr xs = ggml_cuda_mmq_gcn_sbase(xr);
+        const int ql = ggml_cuda_mmq_gcn_load<int>(xs, off_ql);
+        const int qh = ggml_cuda_mmq_gcn_load<int>(xs, off_qh);
+
+        const int ql0 = (ql >> 0) & 0x0F0F0F0F;
+        const int ql1 = (ql >> 4) & 0x0F0F0F0F;
+        const int qh0 = ((qh >> (sh_qh + 0)) << 4) & 0x10101010;
+        const int qh1 = ((qh >> (sh_qh + 1)) << 4) & 0x10101010;
+
+        x_qs[(i0 + il)*(2*MMQ_TILE_NE_K + 1) + kq0] = ql0 | qh0;
+        x_qs[(i0 + il)*(2*MMQ_TILE_NE_K + 1) + kq1] = ql1 | qh1;
+        xr += step;
+    }
+
+    ggml_cuda_mmq_gcn_load_dm_sc_q45_K<block_q5_K, nthreads, I>(x, x_dm, x_sc, kbx0, stride, tid);
+}
+
+template <ggml_type type, int J> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_q6_K_gcn(
+        const char * __restrict__ x, const char * __restrict__ x_gate, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    GGML_UNUSED_VARS(x_gate, i_max);
+
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nthreads  = ggml_cuda_mmq_get_nthreads(type, J, false, GGML_PREC_Q8);
+    constexpr int I         = ggml_cuda_mmq_get_I(type, J, false, GGML_PREC_Q8);
+
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q6_K, I);
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + txs.qs);
+    int   * x_sc = (int   *) (x_df + txs.dm);
+
+    const int tid = threadIdx.y*warp_size + threadIdx.x;
+
+    constexpr int nl   = MMQ_ITER_K / (4 * QR6_K);
+    constexpr int nrow = nthreads / nl;
+    const int il = tid / nl;
+    const int kq = tid % nl;
+    const uint32_t off_row = uint32_t(il*stride)*sizeof(block_q6_K);
+    const uint32_t off_ql  = ggml_cuda_mmq_gcn_loff(off_row + offsetof(block_q6_K, ql) + sizeof(int)*kq, kbx0);
+    const uint32_t off_qh  = ggml_cuda_mmq_gcn_loff(off_row + offsetof(block_q6_K, qh) + sizeof(int)*((QI6_K/4) * (kq / (QI6_K/2)) + kq % (QI6_K/4)), kbx0);
+    const int      sh_qh   = (kq & 0x08) >> 2;
+    const int      kq0     = 2*kq - kq % (QI6_K/2) + 0;
+    const int      kq1     = 2*kq - kq % (QI6_K/2) + QI6_K/2;
+    const int64_t  step    = int64_t(nrow*stride)*sizeof(block_q6_K);
+    const char *   xr      = x + int64_t(kbx0)*sizeof(block_q6_K);
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nrow) {
+        const ggml_cuda_mmq_gcn_ptr xs = ggml_cuda_mmq_gcn_sbase(xr);
+        const int ql = ggml_cuda_mmq_gcn_load_b2(xs, off_ql);
+        const int qh = ggml_cuda_mmq_gcn_load_b2(xs, off_qh);
+
+        const int ql0 = (ql >> 0) & 0x0F0F0F0F;
+        const int ql1 = (ql >> 4) & 0x0F0F0F0F;
+        const int qh0 = ((qh >> sh_qh) << 4) & 0x30303030;
+        const int qh1 =  (qh >> sh_qh)       & 0x30303030;
+
+        x_qs[(i0 + il)*(2*MMQ_TILE_NE_K + 1) + kq0] = __vsub4(ql0 | qh0, 0x20202020);
+        x_qs[(i0 + il)*(2*MMQ_TILE_NE_K + 1) + kq1] = __vsub4(ql1 | qh1, 0x20202020);
+        xr += step;
+    }
+
+    constexpr int ml   = ggml_cuda_mmq_gcn_meta_lanes(nthreads, I);
+    constexpr int mrow = nthreads / ml;
+    constexpr int msc  = (MMQ_TILE_NE_K/8) / ml;
+    const int jl = tid / ml;
+    const int kl = tid % ml;
+    const uint32_t off_m  = ggml_cuda_mmq_gcn_loff(uint32_t(jl*stride)*sizeof(block_q6_K) + offsetof(block_q6_K, scales) + sizeof(int)*msc*kl, kbx0);
+    const int64_t  step_m = int64_t(mrow*stride)*sizeof(block_q6_K);
+    const char *   xm     = x + int64_t(kbx0)*sizeof(block_q6_K);
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += mrow) {
+        const int i = i0 + jl;
+        if (mrow <= I || i < I) {
+            const ggml_cuda_mmq_gcn_ptr xs = ggml_cuda_mmq_gcn_sbase(xm);
+#pragma unroll
+            for (int l = 0; l < msc; ++l) {
+                x_sc[i*(MMQ_TILE_NE_K/8) + i/8 + kl*msc + l] = ggml_cuda_mmq_gcn_load_b2(xs, off_m + sizeof(int)*l);
+            }
+            if (kl == 0) {
+                x_df[i*(MMQ_TILE_NE_K/QI6_K) + i/QI6_K] = ggml_cuda_mmq_gcn_load<half>(xs, off_m + offsetof(block_q6_K, d) - offsetof(block_q6_K, scales));
+            }
+        }
+        xm += step_m;
+    }
+}
+#endif // defined(GGML_USE_HIP)
+
+// ---------------------------------------------------------------------------------------------
+
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_iq1_s(
         const char * __restrict__ x, const char * __restrict__ x_gate, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
     GGML_UNUSED(x_gate);
