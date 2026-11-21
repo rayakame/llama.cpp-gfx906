@@ -945,12 +945,13 @@ static __global__ void flash_attn_tile(
     const int  * GGML_CUDA_RESTRICT KV_max   = KV_max_ptr;
     float      * GGML_CUDA_RESTRICT dst      = dst_ptr;
     float2     * GGML_CUDA_RESTRICT dst_meta = dst_meta_ptr;
-    GGML_UNUSED(KV_rows_ptr);
+    // this kernel has no kv_rows path, launch_fattn passes the K/V tile visibility from flash_attn_mask_to_tile_vis there
+    const int  * GGML_CUDA_RESTRICT KV_vis   = KV_rows_ptr;
 
     // Skip unused kernel variants for faster compilation:
 
     if ((use_logit_softcap && !(DV == 128 || DV == 256 || DV == 512))) {
-        GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, dst, dst_meta, scale,
+        GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, KV_vis, dst, dst_meta, scale,
             max_bias, m0, m1, n_head_log2, logit_softcap,
             ne00, ne01, ne02, ne03,
                   nb01, nb02, nb03,
@@ -1110,7 +1111,25 @@ static __global__ void flash_attn_tile(
         }
     } else {
         // Branch without out-of-bounds checks.
+        // A K/V tile that is fully masked for all queries of this block adds exactly zero, so it is skipped.
+        const int * tile_vis = KV_vis ? KV_vis + (int64_t(sequence)*gridDim.x + blockIdx.x)*(ne11/nbatch_fa) : nullptr;
+        int vis_next = tile_vis && int(blockIdx.y*nbatch_fa) < k_VKQ_max ? tile_vis[blockIdx.y] : 1;
         for (int k_VKQ_0 = blockIdx.y*nbatch_fa; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nbatch_fa) {
+            const int vis = vis_next;
+            if (tile_vis && k_VKQ_0 + int(gridDim.y*nbatch_fa) < k_VKQ_max) {
+                vis_next = tile_vis[(k_VKQ_0 + gridDim.y*nbatch_fa)/nbatch_fa];
+            }
+            if (!vis) {
+                if constexpr (kv_prefetch) {
+                    // the registers hold the K of this tile; the next tile needs its own
+                    const int k_VKQ_next = k_VKQ_0 + int(gridDim.y)*nbatch_fa;
+                    if (k_VKQ_next < k_VKQ_max) {
+                        flash_attn_tile_pf_copy<warp_size, nwarps, nbatch_fa, nbatch_K, cpy_ne, false>
+                            (K_h2 + int64_t(k_VKQ_next)*stride_K2, nullptr, KV_pf, stride_K2);
+                    }
+                }
+                continue;
+            }
             constexpr bool oob_check = false;
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, kv_prefetch>
                 (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp, KV_pf,
@@ -1296,7 +1315,7 @@ static void launch_fattn_tile_cfg(ggml_backend_cuda_context & ctx, ggml_tensor *
     const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc, gfx906);
     fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, gfx906, kv_prefetch>;
     launch_fattn<DV, cols_per_block/ncols2, ncols2>
-        (ctx, dst, fattn_kernel, nwarps, 0, nbatch_fa, true, true, false, false, warp_size);
+        (ctx, dst, fattn_kernel, nwarps, 0, nbatch_fa, true, true, false, false, warp_size, false, true);
 }
 
 template <int DKQ, int DV, int cols_per_block, int ncols2, bool use_logit_softcap>

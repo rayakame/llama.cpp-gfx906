@@ -9146,6 +9146,44 @@ struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     }
 };
 
+// Qwen3.8 27B attention over a K/V cache that n_slots sequences share in runs of chunk cells (the server's unified cache).
+// Each query sees only the cells of its own sequence: all queries are sequence 0, or with q_split all sequences in turn.
+struct test_flash_attn_ext_slots : public test_flash_attn_ext {
+    const int64_t n_slots;
+    const int64_t chunk;
+    const bool    q_split;
+
+    std::string vars() override {
+        return test_flash_attn_ext::vars() + ",n_slots=" + std::to_string(n_slots) + ",chunk=" + std::to_string(chunk) + ",q_split=" + std::to_string(q_split);
+    }
+
+    test_flash_attn_ext_slots(int64_t kv, int64_t nb, int64_t n_slots, int64_t chunk, bool q_split)
+        : test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16),
+          n_slots(n_slots), chunk(chunk), q_split(q_split) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext::initialize_tensors(ctx);
+
+        ggml_tensor * m = ggml_get_tensor(ctx, "m");
+        const int64_t ne0 = m->ne[0];
+        const int64_t ne1 = m->ne[1];
+        const int64_t rows_per_slot = q_split ? std::max<int64_t>(1, ne1/n_slots) : ne1;
+
+        std::mt19937 gen(0x5107);
+        std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
+        std::vector<float> f(ggml_nelements(m));
+        for (int64_t j = 0; j < ne1; ++j) {
+            const int64_t slot = (j/rows_per_slot) % n_slots;
+            for (int64_t i = 0; i < ne0; ++i) {
+                f[j*ne0 + i] = (i/chunk) % n_slots == slot ? dis(gen) : -INFINITY;
+            }
+        }
+        std::vector<ggml_fp16_t> h(f.size());
+        ggml_fp32_to_fp16_row(f.data(), h.data(), f.size());
+        ggml_backend_tensor_set(m, h.data(), 0, h.size()*sizeof(ggml_fp16_t));
+    }
+};
+
 // GGML_OP_FLASH_ATTN_EXT with kv_rows: each q slice attends to its own list of K/V cache rows
 struct test_flash_attn_ext_kv_rows : public test_case {
     const int64_t hs;
@@ -13021,6 +13059,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // the same with four sequences in one K/V cache, in runs of cells that do and do not line up with the K/V tiles
+    for (int nb : { 16, 40, 512 }) {
+        for (int chunk : { 100, 512 }) {
+            for (bool q_split : { false, true }) {
+                test_cases.emplace_back(new test_flash_attn_ext_slots(4096, nb, 4, chunk, q_split));
+            }
+        }
+    }
+
     // sparse mask with large batch size
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
@@ -13781,6 +13828,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int64_t kv : {256, 512, 1024, 1536, 2048, 3072, 4096, 8192, 32768}) {
         for (int64_t nb : {1, 2, 4, 8, 16}) {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
+    }
+
+    // Qwen3.8 27B prompt next to three other server slots in one K/V cache; n_slots=1 is the same work with every cell visible
+    for (int64_t kv : {8192, 32768}) {
+        for (int64_t nb : {32, 512, 2048}) {
+            for (int64_t n_slots : {1, 4}) {
+                test_cases.emplace_back(new test_flash_attn_ext_slots(kv, nb, n_slots, 512, false));
+            }
         }
     }
 

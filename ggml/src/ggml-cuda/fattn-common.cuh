@@ -729,6 +729,45 @@ static __global__ void flash_attn_mask_to_KV_max(
     KV_max[sequence*ne31 + jt] = KV_max_sj;
 }
 
+// 1 per tile of ncols1 queries x nbatch_fa K/V cells if any of the queries sees any of the cells.
+template <int ncols1>
+__launch_bounds__(FATTN_KQ_STRIDE/2, 1)
+static __global__ void flash_attn_mask_to_tile_vis(
+        const half2 * mask_ptr, int * vis_ptr, const int ne01, const int ne33, const int nbatch_fa, const int64_t s31, const int64_t s33) {
+    const int tid      = threadIdx.x;
+    const int jt       = blockIdx.y;
+    const int sequence = blockIdx.z;
+
+    const half2 * mask = mask_ptr + (sequence % ne33)*s33 + blockIdx.x*(FATTN_KQ_STRIDE/2) + tid;
+
+    __shared__ int vis_shared[FATTN_KQ_STRIDE/32];
+    if (tid < FATTN_KQ_STRIDE/32) {
+        vis_shared[tid] = 0;
+    }
+    ggml_cuda_pdl_sync();
+
+    int vis = 0;
+#pragma unroll
+    for (int j0 = 0; j0 < ncols1; ++j0) {
+        // the FA kernel drops the results of rows past ne01, so they do not count
+        const int j = jt*ncols1 + j0 < ne01 ? jt*ncols1 + j0 : jt*ncols1;
+        const float2 tmp = __half22float2(mask[j*s31]);
+        vis |= int(!isinf(tmp.x)) | int(!isinf(tmp.y));
+    }
+
+    __syncthreads();
+    if (vis) {
+        vis_shared[2*tid/nbatch_fa] = 1;
+    }
+    __syncthreads();
+
+    const int ntiles_chunk = FATTN_KQ_STRIDE/nbatch_fa;
+    if (tid < ntiles_chunk) {
+        const int ntiles_KV = gridDim.x*ntiles_chunk;
+        vis_ptr[(int64_t(sequence)*gridDim.y + jt)*ntiles_KV + blockIdx.x*ntiles_chunk + tid] = vis_shared[tid];
+    }
+}
+
 void ggml_cuda_flash_attn_ext_compact_mask(
         const ggml_tensor * mask, int32_t * indices, int32_t * counts, int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream);
 
@@ -987,7 +1026,7 @@ template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
-    const int warp_size = WARP_SIZE, const bool async_kv_preload = false
+    const int warp_size = WARP_SIZE, const bool async_kv_preload = false, const bool tile_vis = false
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1026,6 +1065,7 @@ void launch_fattn(
         ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, need_f16_K, need_f16_V);
 
     ggml_cuda_pool_alloc<int>    KV_max(pool);
+    ggml_cuda_pool_alloc<int>    KV_vis(pool);
     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
     ggml_cuda_pool_alloc<float2> dst_tmp_meta(pool);
 
@@ -1140,6 +1180,25 @@ void launch_fattn(
         ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_KV_max, block_dim_KV_max, 0, main_stream);
         ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<ncols1>, launch_params,
             (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    // With several server slots in one K/V cache, a query tile of one sequence skips the K/V tiles it cannot see.
+    // Small batches mix the slots in one query tile, so only batches of 32 or more queries are scanned.
+    static const bool tile_vis_env = [] { const char * e = getenv("GGML_FA_TILE_SKIP"); return !e || atoi(e) != 0; }();
+    const bool scan_tiles = tile_vis && tile_vis_env && ncols2 > 1 && !use_sparse && !kv_rows && !stream_k && mask && Q->ne[1] >= 32 &&
+        n_kv_cols % FATTN_KQ_STRIDE == 0 && nbatch_fa >= 32 && FATTN_KQ_STRIDE % nbatch_fa == 0;
+    if (scan_tiles) {
+        const int64_t s31 = mask->nb[1] / sizeof(half2);
+        const int64_t s33 = mask->nb[3] / sizeof(half2);
+
+        const dim3 blocks_num_vis(n_kv_cols / FATTN_KQ_STRIDE, ntiles_x, Q->ne[3]);
+        const dim3 block_dim_vis(FATTN_KQ_STRIDE/2, 1, 1);
+
+        KV_vis.alloc(size_t(ntiles_x)*Q->ne[3]*(n_kv_cols/nbatch_fa));
+        ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_vis, block_dim_vis, 0, main_stream);
+        ggml_cuda_kernel_launch(flash_attn_mask_to_tile_vis<ncols1>, launch_params,
+            (const half2 *) mask->data, KV_vis.ptr, int(Q->ne[1]), int(mask->ne[3]), nbatch_fa, s31, s33);
         CUDA_CHECK(cudaGetLastError());
     }
 
@@ -1272,7 +1331,7 @@ void launch_fattn(
         mask ? ((const char *) mask->data) : nullptr,
         sinks ? ((const char *) sinks->data) : nullptr,
         KV_max.ptr,
-        kv_rows ? (const int *) kv_rows->data : nullptr,
+        kv_rows ? (const int *) kv_rows->data : KV_vis.ptr,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
