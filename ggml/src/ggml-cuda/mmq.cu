@@ -2,6 +2,7 @@
 #include "mmq.cuh"
 #include "quantize.cuh"
 #include "mmid.cuh"
+#include "mmvq.cuh"
 
 #include <cstdint>
 
@@ -26,6 +27,10 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
             mul_mat_q_case<GGML_TYPE_Q5_1, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_Q8_0:
+            if (args.planes) {
+                mul_mat_q_case<GGML_TYPE_Q8_0, GGML_PREC_Q8, true>(ctx, args, stream);
+                break;
+            }
             mul_mat_q_case<GGML_TYPE_Q8_0, GGML_PREC_Q8>(ctx, args, stream);
             break;
 // -----------------------------------------------------------------------
@@ -300,7 +305,7 @@ void ggml_cuda_mul_mat_q(
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
-            ntj, J_best, fusion_device};
+            ntj, J_best, fusion_device, ggml_cuda_q8_0_planes(src0)};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
         return;
     }
@@ -383,6 +388,7 @@ void ggml_cuda_mul_mat_q(
         ne03, ne13, s03, s13, s3,
         ntj, J_best, fusion_device};
 
+    GGML_ASSERT(!ggml_cuda_q8_0_planes(src0));
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
 }
 

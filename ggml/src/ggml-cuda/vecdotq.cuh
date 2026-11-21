@@ -1007,6 +1007,16 @@ static __device__ __forceinline__ float vec_dot_q8_0_q8_1_aligned(
     return vec_dot_q8_0_q8_1_impl<float, VDR_Q8_0_Q8_1_MMVQ>(v, u, bq8_0->d, __low2half(bq8_1->ds));
 }
 
+// Q8_0 in planes: each group of 8 blocks (272 bytes, 16-byte aligned) holds its 256 quants and then its 8 scales.
+// ib counts blocks from a group boundary.
+static __device__ __forceinline__ const int * q8_0_planes_qs(const void * x, const int ib) {
+    return (const int *) __builtin_assume_aligned((const char *) ((const block_q8_0 *) x + ib) - 2*(ib & 7), 16);
+}
+
+static __device__ __forceinline__ half q8_0_planes_d(const void * x, const int ib) {
+    return *(const half *) ((const char *) ((const block_q8_0 *) x + ib) + 8*QK8_0 - 32*(ib & 7));
+}
+
 static __device__ __forceinline__ float vec_dot_q2_K_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 

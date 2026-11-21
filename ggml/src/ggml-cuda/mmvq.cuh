@@ -13,6 +13,16 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc);
 // follows; the caller fills it in the layout of quantize_q8_1 or resets ctx.q8_1_cache.
 char * ggml_cuda_q8_1_cache_begin(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx);
 
+// gfx906: Q8_0 weights are rearranged into planes when their last bytes are uploaded; the mat-vec and MMQ read them.
+bool ggml_cuda_q8_0_planes_eligible(const ggml_tensor * tensor, int device);
+void ggml_cuda_q8_0_planes_repack(const ggml_tensor * tensor, cudaStream_t stream);
+bool ggml_cuda_q8_0_planes_get(const ggml_tensor * tensor, void * data, size_t offset, size_t size, cudaStream_t stream);
+bool ggml_cuda_q8_0_planes_set(const ggml_tensor * tensor, const void * data, size_t offset, size_t size, cudaStream_t stream);
+void ggml_cuda_q8_0_planes_forget(const void * base, size_t size);
+bool ggml_cuda_q8_0_planes(const ggml_tensor * tensor);
+// Writes the canonical layout of the tensor's bytes, rounded up to whole groups of 8 blocks, to dst.
+void ggml_cuda_q8_0_planes_unpack(const ggml_tensor * tensor, void * dst, cudaStream_t stream);
+
 void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
 

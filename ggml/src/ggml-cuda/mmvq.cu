@@ -3,8 +3,12 @@
 #include "unary.cuh"
 #include "vecdotq.cuh"
 
+#include <atomic>
 #include <cctype>
 #include <cstdint>
+#include <cstring>
+#include <map>
+#include <mutex>
 #include <type_traits>
 
 // only enabled on DGX Spark, where it is a gain on every type below. On the higher-bandwidth parts the kernel
@@ -720,7 +724,7 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
     return 1;
 }
 
-template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, bool aligned_b2 = false>
+template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, bool aligned_b2 = false, bool planes = false>
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
@@ -737,7 +741,9 @@ static __global__ void mul_mat_vec_q(
     constexpr int qk  = ggml_cuda_type_traits<type>::qk;
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
-    constexpr int vdr = mmvq_gcn_q4_multicol(type, ncols_dst, table_id) && ncols_dst > 4 ? GCN_MMVQ_Q4_VDR8 : get_vdr_mmvq(type);
+    // planes at 1..2 columns: half a block per lane, one 16-byte load
+    constexpr int vdr = planes && ncols_dst <= 2 ? 4 :
+        mmvq_gcn_q4_multicol(type, ncols_dst, table_id) && ncols_dst > 4 ? GCN_MMVQ_Q4_VDR8 : get_vdr_mmvq(type);
     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
     constexpr int rows_per_cuda_block = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
@@ -841,6 +847,10 @@ static __global__ void mul_mat_vec_q(
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
+
+    // planes: rows start on a group and kbx steps by whole groups, so a lane keeps its block in the group
+    static_assert(!planes || blocks_per_iter % 8 == 0, "planes need whole groups per K step");
+    [[maybe_unused]] const int planes_j = (tid / (qi/vdr)) & 7;
 
     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
@@ -947,6 +957,41 @@ static __global__ void mul_mat_vec_q(
             continue;
         }
 #endif // defined(GGML_USE_HIP) && defined(GCN)
+
+        if constexpr (planes) {
+#pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                const char * xb = (const char *) ((const block_q8_0 *) vx + kbx_offset + i*stride_row_x + kbx);
+                int v[vdr];
+                ggml_cuda_memcpy_1<sizeof(v)>(v, (const int *) __builtin_assume_aligned(xb - 2*planes_j, 16) + kqs);
+                const half d = *(const half *) (xb + 8*QK8_0 - 32*planes_j);
+                [[maybe_unused]] int   vg[vdr];
+                [[maybe_unused]] half  dg = d;
+                if constexpr (has_fusion) {
+                    if (use_gate) {
+                        const char * gb = (const char *) ((const block_q8_0 *) vgate + kbx_offset + i*stride_row_x + kbx);
+                        ggml_cuda_memcpy_1<sizeof(vg)>(vg, (const int *) __builtin_assume_aligned(gb - 2*planes_j, 16) + kqs);
+                        dg = *(const half *) (gb + 8*QK8_0 - 32*planes_j);
+                    }
+                }
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    const block_q8_1 * by = &y[j*stride_col_y + kby];
+                    int u[vdr];
+#pragma unroll
+                    for (int l = 0; l < vdr; ++l) {
+                        u[l] = get_int_b4(by->qs, kqs + l);
+                    }
+                    tmp[j][i] += vec_dot_q8_0_q8_1_impl<float, vdr>(v, u, d, __low2half(by->ds));
+                    if constexpr (has_fusion) {
+                        if (use_gate) {
+                            tmp_gate[j][i] += vec_dot_q8_0_q8_1_impl<float, vdr>(vg, u, dg, __low2half(by->ds));
+                        }
+                    }
+                }
+            }
+            continue;
+        }
 
 #pragma unroll
         for (int j = 0; j < ncols_dst; ++j) {
@@ -1199,7 +1244,7 @@ static __device__ __forceinline__ void mmvq_gcn_mc_store(
     }
 }
 
-template <ggml_type type, int ncols_dst, int ngroups, int nwarps, int waves_per_eu, bool gate, bool aligned_b2>
+template <ggml_type type, int ncols_dst, int ngroups, int nwarps, int waves_per_eu, bool gate, bool aligned_b2, bool planes = false>
 __launch_bounds__(nwarps*64, waves_per_eu)
 static __global__ void mul_mat_vec_q_gcn_mc(
         const void * __restrict__ vx, const void * __restrict__ vy, const ggml_cuda_mm_fusion_args_device fusion,
@@ -1213,6 +1258,7 @@ static __global__ void mul_mat_vec_q_gcn_mc(
     constexpr bool is_q4_0  = type == GGML_TYPE_Q4_0;
     constexpr bool is_q8_0  = type == GGML_TYPE_Q8_0;
     static_assert(!(is_q8_0 && gate), "gate fusion is Q4 only");
+    static_assert(!planes || is_q8_0, "planes are Q8_0 only");
     constexpr int  nper     = gate ? 2 : 1;
     constexpr int  rows     = mmvq_gcn_mc_rows(type, gate);
     constexpr int  qi       = is_q8_0 ? QI8_0 : 4;
@@ -1252,7 +1298,13 @@ static __global__ void mul_mat_vec_q_gcn_mc(
         for (int r = 0; r < rows*nper; ++r) {
             const int i = r/nper;
             const char * bxc = (r % nper ? g0 : x0) + (offx0 + uint32_t(kb)*bs + i*row_bytes);
-            if constexpr (is_q4_0 && aligned_b2) {
+            if constexpr (planes) {
+                const char * qs = (const char *) __builtin_assume_aligned(bxc - 2*(kb & 7), 16);
+                ggml_cuda_memcpy_1<16>(v[r] + 0, qs +  0);
+                ggml_cuda_memcpy_1<16>(v[r] + 4, qs + 16);
+                const half d = *(const half *) (bxc + 8*QK8_0 - 32*(kb & 7));
+                dm[r] = make_half2(d, d);
+            } else if constexpr (is_q4_0 && aligned_b2) {
                 half d;
                 get_block_b2_aligned18(bxc, v[r], d);
                 dm[r] = make_half2(d, d);
@@ -1750,16 +1802,17 @@ struct mmvq_gcn_mc_args {
     uint3 sample_ratio;
     int stride_sample_x, stride_sample_y, stride_sample_dst;
     int nchannels_dst, nsamples_dst;
+    bool planes;
 };
 
-template <ggml_type type, int c_ncols_dst, int ngroups, int nwarps, int waves_per_eu, bool gate, bool aligned_b2>
+template <ggml_type type, int c_ncols_dst, int ngroups, int nwarps, int waves_per_eu, bool gate, bool aligned_b2, bool planes = false>
 static void mul_mat_vec_q_gcn_mc_launch(const mmvq_gcn_mc_args & p, cudaStream_t stream) {
     constexpr int rows = mmvq_gcn_mc_rows(type, gate);
     const int64_t nblocks = (p.nrows_x + rows*ngroups - 1) / (rows*ngroups);
     const dim3 block_nums(nblocks, p.nchannels_dst, p.nsamples_dst);
     const dim3 block_dims(64, nwarps, 1);
     if constexpr (mmvq_gcn_mc_whole(type)) {
-        mul_mat_vec_q_gcn_mc<type, c_ncols_dst, ngroups, nwarps, waves_per_eu, gate, aligned_b2><<<block_nums, block_dims, 0, stream>>>(
+        mul_mat_vec_q_gcn_mc<type, c_ncols_dst, ngroups, nwarps, waves_per_eu, gate, aligned_b2, planes><<<block_nums, block_dims, 0, stream>>>(
             p.vx, p.vy, p.fusion, p.dst, p.ncols_x, p.nrows_x, p.stride_row_x, p.stride_col_y, p.stride_col_dst,
             p.channel_ratio, p.stride_channel_x, p.stride_channel_y, p.stride_channel_dst, p.sample_ratio,
             p.stride_sample_x, p.stride_sample_y, p.stride_sample_dst);
@@ -1772,56 +1825,61 @@ static void mul_mat_vec_q_gcn_mc_launch(const mmvq_gcn_mc_args & p, cudaStream_t
     }
 }
 
-template <ggml_type type, int c_ncols_dst, int waves_per_eu, bool gate, bool aligned_b2>
+template <ggml_type type, int c_ncols_dst, int waves_per_eu, bool gate, bool aligned_b2, bool planes = false>
 static void mul_mat_vec_q_gcn_mc_switch_shape(const int ngroups, const int nwarps, const mmvq_gcn_mc_args & p, cudaStream_t stream) {
     if (ngroups == 2 && !gate) {
         switch (nwarps) {
-            case 1:  mul_mat_vec_q_gcn_mc_launch<type, c_ncols_dst, 2, 1, waves_per_eu, false, aligned_b2>(p, stream); break;
-            case 2:  mul_mat_vec_q_gcn_mc_launch<type, c_ncols_dst, 2, 2, waves_per_eu, false, aligned_b2>(p, stream); break;
-            default: mul_mat_vec_q_gcn_mc_launch<type, c_ncols_dst, 2, 4, waves_per_eu, false, aligned_b2>(p, stream); break;
+            case 1:  mul_mat_vec_q_gcn_mc_launch<type, c_ncols_dst, 2, 1, waves_per_eu, false, aligned_b2, planes>(p, stream); break;
+            case 2:  mul_mat_vec_q_gcn_mc_launch<type, c_ncols_dst, 2, 2, waves_per_eu, false, aligned_b2, planes>(p, stream); break;
+            default: mul_mat_vec_q_gcn_mc_launch<type, c_ncols_dst, 2, 4, waves_per_eu, false, aligned_b2, planes>(p, stream); break;
         }
     } else {
         switch (nwarps) {
-            case 1:  mul_mat_vec_q_gcn_mc_launch<type, c_ncols_dst, 4, 1, waves_per_eu, gate, aligned_b2>(p, stream); break;
-            case 2:  mul_mat_vec_q_gcn_mc_launch<type, c_ncols_dst, 4, 2, waves_per_eu, gate, aligned_b2>(p, stream); break;
-            default: mul_mat_vec_q_gcn_mc_launch<type, c_ncols_dst, 4, 4, waves_per_eu, gate, aligned_b2>(p, stream); break;
+            case 1:  mul_mat_vec_q_gcn_mc_launch<type, c_ncols_dst, 4, 1, waves_per_eu, gate, aligned_b2, planes>(p, stream); break;
+            case 2:  mul_mat_vec_q_gcn_mc_launch<type, c_ncols_dst, 4, 2, waves_per_eu, gate, aligned_b2, planes>(p, stream); break;
+            default: mul_mat_vec_q_gcn_mc_launch<type, c_ncols_dst, 4, 4, waves_per_eu, gate, aligned_b2, planes>(p, stream); break;
         }
     }
 }
 
-template <ggml_type type, int c_ncols_dst, bool gate, bool aligned_b2>
+template <ggml_type type, int c_ncols_dst, bool gate, bool aligned_b2, bool planes = false>
 static void mul_mat_vec_q_gcn_mc_switch_wpe(const int waves_per_eu, const int ngroups, const int nwarps,
         const mmvq_gcn_mc_args & p, cudaStream_t stream) {
     if constexpr (mmvq_gcn_mc_wpe_alt(type, c_ncols_dst) != 0 && !gate) {
         if (waves_per_eu == mmvq_gcn_mc_wpe_alt(type, c_ncols_dst)) {
-            mul_mat_vec_q_gcn_mc_switch_shape<type, c_ncols_dst, mmvq_gcn_mc_wpe_alt(type, c_ncols_dst), false, aligned_b2>(
+            mul_mat_vec_q_gcn_mc_switch_shape<type, c_ncols_dst, mmvq_gcn_mc_wpe_alt(type, c_ncols_dst), false, aligned_b2, planes>(
                 ngroups, nwarps, p, stream);
             return;
         }
     }
-    mul_mat_vec_q_gcn_mc_switch_shape<type, c_ncols_dst, mmvq_gcn_mc_wpe(type, c_ncols_dst), gate, aligned_b2>(ngroups, nwarps, p, stream);
+    mul_mat_vec_q_gcn_mc_switch_shape<type, c_ncols_dst, mmvq_gcn_mc_wpe(type, c_ncols_dst), gate, aligned_b2, planes>(ngroups, nwarps, p, stream);
     GGML_UNUSED(waves_per_eu);
 }
 
-template <ggml_type type, bool gate, bool aligned_b2>
+template <ggml_type type, bool gate, bool aligned_b2, bool planes = false>
 static bool mul_mat_vec_q_gcn_mc_switch_ncols(const int ncols_dst, const int waves_per_eu, const int ngroups,
         const int nwarps, const mmvq_gcn_mc_args & p, cudaStream_t stream) {
     switch (ncols_dst) {
         case 1:
             // the Q6_K output head of the MTP drafts (248k rows), and the others on request
-            if constexpr ((!gate || mmvq_gcn_mc_q4(type)) && mmvq_gcn_mc_type_env(type) == nullptr) {
-                mul_mat_vec_q_gcn_mc_switch_wpe<type, 1, gate, aligned_b2>(waves_per_eu, ngroups, nwarps, p, stream);
+            if constexpr ((!gate || mmvq_gcn_mc_q4(type)) && mmvq_gcn_mc_type_env(type) == nullptr && !planes) {
+                mul_mat_vec_q_gcn_mc_switch_wpe<type, 1, gate, aligned_b2, planes>(waves_per_eu, ngroups, nwarps, p, stream);
                 return true;
             }
             return false;
-        case 2: mul_mat_vec_q_gcn_mc_switch_wpe<type, 2, gate, aligned_b2>(waves_per_eu, ngroups, nwarps, p, stream); return true;
-        case 3: mul_mat_vec_q_gcn_mc_switch_wpe<type, 3, gate, aligned_b2>(waves_per_eu, ngroups, nwarps, p, stream); return true;
-        case 4: mul_mat_vec_q_gcn_mc_switch_wpe<type, 4, gate, aligned_b2>(waves_per_eu, ngroups, nwarps, p, stream); return true;
+        case 2:
+            if constexpr (planes) {
+                return false;
+            }
+            mul_mat_vec_q_gcn_mc_switch_wpe<type, 2, gate, aligned_b2, planes>(waves_per_eu, ngroups, nwarps, p, stream);
+            return true;
+        case 3: mul_mat_vec_q_gcn_mc_switch_wpe<type, 3, gate, aligned_b2, planes>(waves_per_eu, ngroups, nwarps, p, stream); return true;
+        case 4: mul_mat_vec_q_gcn_mc_switch_wpe<type, 4, gate, aligned_b2, planes>(waves_per_eu, ngroups, nwarps, p, stream); return true;
         // the aligned Q4_0 loads lose at 5..8 columns (pp8 -9 %)
-        case 5: mul_mat_vec_q_gcn_mc_switch_wpe<type, 5, gate, false>(waves_per_eu, ngroups, nwarps, p, stream); return true;
-        case 6: mul_mat_vec_q_gcn_mc_switch_wpe<type, 6, gate, false>(waves_per_eu, ngroups, nwarps, p, stream); return true;
-        case 7: mul_mat_vec_q_gcn_mc_switch_wpe<type, 7, gate, false>(waves_per_eu, ngroups, nwarps, p, stream); return true;
-        case 8: mul_mat_vec_q_gcn_mc_switch_wpe<type, 8, gate, false>(waves_per_eu, ngroups, nwarps, p, stream); return true;
+        case 5: mul_mat_vec_q_gcn_mc_switch_wpe<type, 5, gate, false, planes>(waves_per_eu, ngroups, nwarps, p, stream); return true;
+        case 6: mul_mat_vec_q_gcn_mc_switch_wpe<type, 6, gate, false, planes>(waves_per_eu, ngroups, nwarps, p, stream); return true;
+        case 7: mul_mat_vec_q_gcn_mc_switch_wpe<type, 7, gate, false, planes>(waves_per_eu, ngroups, nwarps, p, stream); return true;
+        case 8: mul_mat_vec_q_gcn_mc_switch_wpe<type, 8, gate, false, planes>(waves_per_eu, ngroups, nwarps, p, stream); return true;
         default: return false;
     }
 }
@@ -1882,6 +1940,11 @@ static bool mul_mat_vec_q_gcn_mc_try(const int ncols_dst, const mmvq_gcn_mc_args
     if constexpr (mmvq_gcn_mc_q4(type)) {
         if (gate) {
             return mul_mat_vec_q_gcn_mc_switch_ncols<type, true, false>(ncols_dst, waves_per_eu, ngroups, nwarps, p, stream);
+        }
+    }
+    if constexpr (type == GGML_TYPE_Q8_0) {
+        if (p.planes) {
+            return mul_mat_vec_q_gcn_mc_switch_ncols<type, false, false, true>(ncols_dst, waves_per_eu, ngroups, nwarps, p, stream);
         }
     }
     return mul_mat_vec_q_gcn_mc_switch_ncols<type, false, false>(ncols_dst, waves_per_eu, ngroups, nwarps, p, stream);
@@ -1989,9 +2052,205 @@ static void mul_mat_vec_q_gcn_wide_cuda(
         default: GGML_ABORT("fatal error");
     }
 }
+
+// Q8_0 planes, see q8_0_planes_qs: ushort u of a group in planes is ushort q8_0_planes_src(u) of the canonical group.
+static __device__ __forceinline__ int q8_0_planes_src(const int u, const bool to_planes) {
+    if (to_planes) {
+        return u < 128 ? 17*(u >> 4) + 1 + (u & 15) : 17*(u - 128);
+    }
+    const int j = u / 17;
+    const int r = u - 17*j;
+    return r == 0 ? 128 + j : 16*j + r - 1;
+}
+
+// src may be dst: each block reads its groups completely before it writes them.
+template <bool to_planes>
+static __global__ void q8_0_planes_convert(const char * src, char * dst, const int64_t ngroups) {
+    constexpr int ngb = 32;
+    constexpr int nw  = sizeof(block_q8_0)*8/4;
+    __shared__ uint16_t buf[ngb*nw*2];
+
+    const int64_t g0 = int64_t(blockIdx.x)*ngb;
+    const int     ng = int(min(int64_t(ngb), ngroups - g0));
+    const uint32_t * s = (const uint32_t *) (src + g0*nw*4);
+    uint32_t       * d = (uint32_t       *) (dst + g0*nw*4);
+
+    for (int i = threadIdx.x; i < ng*nw; i += blockDim.x) {
+        ((uint32_t *) buf)[i] = s[i];
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < ng*nw; i += blockDim.x) {
+        const uint16_t * bg = buf + (i/nw)*nw*2;
+        const int        u  = 2*(i % nw);
+        d[i] = uint32_t(bg[q8_0_planes_src(u, to_planes)]) | uint32_t(bg[q8_0_planes_src(u + 1, to_planes)]) << 16;
+    }
+}
+
+static void q8_0_planes_convert_cuda(const char * src, char * dst, const int64_t ngroups, const bool to_planes, cudaStream_t stream) {
+    if (ngroups <= 0) {
+        return;
+    }
+    const int64_t nblocks = (ngroups + 31) / 32;
+    if (to_planes) {
+        q8_0_planes_convert<true><<<nblocks, 256, 0, stream>>>(src, dst, ngroups);
+    } else {
+        q8_0_planes_convert<false><<<nblocks, 256, 0, stream>>>(src, dst, ngroups);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// GGML_CUDA_Q8_0_PLANES: 0 off, 1 2D Q8_0 weights, 2 every Q8_0 tensor it can take (for test-backend-ops)
+static int q8_0_planes_mode() {
+    static const int mode = mmvq_gcn_mc_env("GGML_CUDA_Q8_0_PLANES", 1);
+    return mode;
+}
+
+static std::mutex                           q8_0_planes_mutex;
+static std::map<const char *, const char *> q8_0_planes_ranges;
+static std::atomic<int>                     q8_0_planes_count{0};
+
+static bool q8_0_planes_find(const void * ptr, const char ** lo) {
+    if (q8_0_planes_count.load(std::memory_order_relaxed) == 0) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(q8_0_planes_mutex);
+    auto it = q8_0_planes_ranges.upper_bound((const char *) ptr);
+    if (it == q8_0_planes_ranges.begin()) {
+        return false;
+    }
+    --it;
+    if ((const char *) ptr >= it->second) {
+        return false;
+    }
+    *lo = it->first;
+    return true;
+}
+
+// Reads or writes [ptr, ptr + size) of a tensor in planes in the canonical layout, through whole groups.
+static void q8_0_planes_rw(const char * lo, char * ptr, void * host, const size_t size, const bool write, cudaStream_t stream) {
+    if (size == 0) {
+        return;
+    }
+    constexpr size_t gs = 8*sizeof(block_q8_0);
+    const size_t off = ptr - lo;
+    const size_t g0  = off / gs;
+    const size_t g1  = (off + size + gs - 1) / gs;
+    char * groups = (char *) lo + g0*gs;
+    char * tmp    = nullptr;
+    CUDA_CHECK(cudaMalloc((void **) &tmp, (g1 - g0)*gs));
+    q8_0_planes_convert_cuda(groups, tmp, g1 - g0, false, stream);
+    if (write) {
+        CUDA_CHECK(cudaMemcpyAsync(tmp + (off - g0*gs), host, size, cudaMemcpyHostToDevice, stream));
+        q8_0_planes_convert_cuda(tmp, groups, g1 - g0, true, stream);
+    } else {
+        CUDA_CHECK(cudaMemcpyAsync(host, tmp + (off - g0*gs), size, cudaMemcpyDeviceToHost, stream));
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaFree(tmp));
+}
 #endif // defined(GGML_USE_HIP)
 
-template<ggml_type type, int c_ncols_dst, bool small_k = false, bool halve_iters = false, bool aligned_b2 = false>
+bool ggml_cuda_q8_0_planes_eligible(const ggml_tensor * tensor, const int device) {
+#if defined(GGML_USE_HIP)
+    const int mode = q8_0_planes_mode();
+    if (mode == 0 || tensor->type != GGML_TYPE_Q8_0 || tensor->view_src != nullptr || !ggml_is_contiguous(tensor) ||
+            tensor->ne[0] % (8*QK8_0) != 0 || (uintptr_t) tensor->data % 16 != 0 || tensor->buffer == nullptr ||
+            !GGML_CUDA_CC_IS_GCN(ggml_cuda_info().devices[device].cc)) {
+        return false;
+    }
+    const ggml_backend_buffer_usage usage = ggml_backend_buffer_get_usage(tensor->buffer);
+    if (mode == 2) {
+        return usage != GGML_BACKEND_BUFFER_USAGE_COMPUTE;
+    }
+    // the KV cache is in a weights buffer too
+    const size_t nlen = strlen(tensor->name);
+    return usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS && tensor->ne[2] == 1 && tensor->ne[3] == 1 &&
+        nlen > 7 && strcmp(tensor->name + nlen - 7, ".weight") == 0;
+#else
+    GGML_UNUSED_VARS(tensor, device);
+    return false;
+#endif // defined(GGML_USE_HIP)
+}
+
+void ggml_cuda_q8_0_planes_repack(const ggml_tensor * tensor, cudaStream_t stream) {
+#if defined(GGML_USE_HIP)
+    const char * lo = (const char *) tensor->data;
+    const size_t nbytes = ggml_nbytes(tensor);
+    q8_0_planes_convert_cuda(lo, (char *) lo, nbytes / (8*sizeof(block_q8_0)), true, stream);
+
+    std::lock_guard<std::mutex> lock(q8_0_planes_mutex);
+    q8_0_planes_ranges[lo] = lo + nbytes;
+    q8_0_planes_count = (int) q8_0_planes_ranges.size();
+#else
+    GGML_UNUSED_VARS(tensor, stream);
+#endif // defined(GGML_USE_HIP)
+}
+
+bool ggml_cuda_q8_0_planes_get(const ggml_tensor * tensor, void * data, const size_t offset, const size_t size, cudaStream_t stream) {
+#if defined(GGML_USE_HIP)
+    const char * lo;
+    if (!q8_0_planes_find(tensor->data, &lo)) {
+        return false;
+    }
+    q8_0_planes_rw(lo, (char *) tensor->data + offset, data, size, false, stream);
+    return true;
+#else
+    GGML_UNUSED_VARS(tensor, data, offset, size, stream);
+    return false;
+#endif // defined(GGML_USE_HIP)
+}
+
+bool ggml_cuda_q8_0_planes_set(const ggml_tensor * tensor, const void * data, const size_t offset, const size_t size, cudaStream_t stream) {
+#if defined(GGML_USE_HIP)
+    const char * lo;
+    if (!q8_0_planes_find(tensor->data, &lo) || (tensor->view_src == nullptr && offset == 0 && size == ggml_nbytes(tensor))) {
+        return false;
+    }
+    q8_0_planes_rw(lo, (char *) tensor->data + offset, const_cast<void *>(data), size, true, stream);
+    return true;
+#else
+    GGML_UNUSED_VARS(tensor, data, offset, size, stream);
+    return false;
+#endif // defined(GGML_USE_HIP)
+}
+
+void ggml_cuda_q8_0_planes_forget(const void * base, const size_t size) {
+#if defined(GGML_USE_HIP)
+    if (q8_0_planes_count.load(std::memory_order_relaxed) == 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(q8_0_planes_mutex);
+    const char * lo = (const char *) base;
+    q8_0_planes_ranges.erase(q8_0_planes_ranges.lower_bound(lo), q8_0_planes_ranges.lower_bound(lo + size));
+    q8_0_planes_count = (int) q8_0_planes_ranges.size();
+#else
+    GGML_UNUSED_VARS(base, size);
+#endif // defined(GGML_USE_HIP)
+}
+
+bool ggml_cuda_q8_0_planes(const ggml_tensor * tensor) {
+#if defined(GGML_USE_HIP)
+    const char * lo;
+    return tensor->type == GGML_TYPE_Q8_0 && q8_0_planes_find(tensor->data, &lo);
+#else
+    GGML_UNUSED(tensor);
+    return false;
+#endif // defined(GGML_USE_HIP)
+}
+
+void ggml_cuda_q8_0_planes_unpack(const ggml_tensor * tensor, void * dst, cudaStream_t stream) {
+#if defined(GGML_USE_HIP)
+    const char * lo;
+    GGML_ASSERT(q8_0_planes_find(tensor->data, &lo) && ((const char *) tensor->data - lo) % (8*sizeof(block_q8_0)) == 0);
+    const int64_t ngroups = (ggml_nbytes(tensor) + 8*sizeof(block_q8_0) - 1) / (8*sizeof(block_q8_0));
+    q8_0_planes_convert_cuda((const char *) tensor->data, (char *) dst, ngroups, false, stream);
+#else
+    GGML_UNUSED_VARS(tensor, dst, stream);
+    GGML_ABORT("Q8_0 planes need HIP");
+#endif // defined(GGML_USE_HIP)
+}
+
+template<ggml_type type, int c_ncols_dst, bool small_k = false, bool halve_iters = false, bool aligned_b2 = false, bool planes = false>
 static void mul_mat_vec_q_switch_fusion(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
@@ -2006,7 +2265,7 @@ static void mul_mat_vec_q_switch_fusion(
     if constexpr (c_ncols_dst == 1) {
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters, aligned_b2>, launch_params,
+            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters, aligned_b2, planes>, launch_params,
                  vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
@@ -2017,7 +2276,7 @@ static void mul_mat_vec_q_switch_fusion(
     GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, aligned_b2>, launch_params,
+    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, aligned_b2, planes>, launch_params,
         vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
@@ -2056,7 +2315,7 @@ static void mul_mat_vec_q_moe_launch(
     }
 }
 
-template <ggml_type type, bool aligned_b2 = false>
+template <ggml_type type, bool aligned_b2 = false, bool planes = false>
 static void mul_mat_vec_q_switch_ncols_dst(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
         const int ncols_x, const int nrows_x, const int ncols_dst,
@@ -2080,7 +2339,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
 
 #if defined(GGML_USE_HIP)
     // Q8_0 at 3..8 columns reads more bytes through L1 that way and gets slower; Q4_0 has the row-group kernel there.
-    if constexpr ((type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_0) && !aligned_b2) {
+    if constexpr ((type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_0) && !aligned_b2 && !planes) {
         static const bool use_aligned_b2 = mmvq_gcn_mc_env("GGML_MMVQ_ALIGNED_B2", 1) != 0;
         if (use_aligned_b2 && GGML_CUDA_CC_IS_GCN(cc) && ncols_dst <= 2) {
             mul_mat_vec_q_switch_ncols_dst<type, true>(vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst,
@@ -2177,7 +2436,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
             const mmvq_gcn_mc_args p = {
                 vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
                 channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
-                sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, nchannels_dst, nsamples_dst,
+                sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, nchannels_dst, nsamples_dst, planes,
             };
             if (mul_mat_vec_q_gcn_mc_try<type>(ncols_dst, p, stream)) {
                 return;
@@ -2203,7 +2462,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
 
                 const std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst + (fusion.shared_up != nullptr),
                                                                               nsamples_dst, warp_size, table_id, c_small_k, c_halve_iters);
-                mul_mat_vec_q_switch_fusion<type, c_ncols_dst, c_small_k, c_halve_iters, aligned_b2>(
+                mul_mat_vec_q_switch_fusion<type, c_ncols_dst, c_small_k, c_halve_iters, aligned_b2, planes>(
                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                     channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
                     stride_sample_x, stride_sample_y, stride_sample_dst, dims.first, dims.second, 0, ids_stride,
@@ -2221,7 +2480,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         case 2: {
             constexpr int c_ncols_dst = 2;
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
-            mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, false, aligned_b2>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+            mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, false, aligned_b2, planes>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
                  dims.first, dims.second, 0, ids_stride, stream);
@@ -2229,7 +2488,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         case 3: {
             constexpr int c_ncols_dst = 3;
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
-            mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+            mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, false, false, planes>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
                  dims.first, dims.second, 0, ids_stride, stream);
@@ -2237,7 +2496,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         case 4: {
             constexpr int c_ncols_dst = 4;
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
-            mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+            mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, false, false, planes>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
                  dims.first, dims.second, 0, ids_stride, stream);
@@ -2245,7 +2504,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         case 5: {
             constexpr int c_ncols_dst = 5;
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
-            mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+            mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, false, false, planes>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
                  dims.first, dims.second, 0, ids_stride, stream);
@@ -2253,7 +2512,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         case 6: {
             constexpr int c_ncols_dst = 6;
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
-            mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+            mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, false, false, planes>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
                  dims.first, dims.second, 0, ids_stride, stream);
@@ -2261,7 +2520,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         case 7: {
             constexpr int c_ncols_dst = 7;
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
-            mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+            mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, false, false, planes>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
                  dims.first, dims.second, 0, ids_stride, stream);
@@ -2269,7 +2528,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         case 8: {
             constexpr int c_ncols_dst = 8;
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
-            mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+            mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, false, false, planes>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
                  dims.first, dims.second, 0, ids_stride, stream);
@@ -2540,6 +2799,41 @@ void ggml_cuda_mul_mat_vec_q(
 
     GGML_ASSERT(!ids || ne12 <= MMVQ_MAX_BATCH_SIZE);
 
+#if defined(GGML_USE_HIP)
+    // only the dense kernels read Q8_0 planes; the others get canonical copies
+    {
+        const ggml_tensor * w[4] = { src0, fusion ? fusion->gate : nullptr, fusion ? fusion->shared_up : nullptr, fusion ? fusion->shared_gate : nullptr };
+        bool p[4];
+        for (int k = 0; k < 4; ++k) {
+            p[k] = w[k] && ggml_cuda_q8_0_planes(w[k]);
+        }
+        const bool dense = !ids && !w[2];
+        if ((!dense && (p[0] || p[1] || p[2] || p[3])) || (w[1] && p[0] != p[1])) {
+            ggml_cuda_pool_alloc<char> buf[4];
+            ggml_tensor                canonical[4];
+            for (int k = 0; k < 4; ++k) {
+                if (p[k]) {
+                    buf[k].alloc(ctx.pool(), GGML_PAD(ggml_nbytes(w[k]), 8*sizeof(block_q8_0)));
+                    ggml_cuda_q8_0_planes_unpack(w[k], buf[k].get(), stream);
+                    canonical[k]      = *w[k];
+                    canonical[k].data = buf[k].get();
+                    w[k]              = &canonical[k];
+                }
+            }
+            if (fusion) {
+                ggml_cuda_mm_fusion_args_host f = *fusion;
+                f.gate        = w[1];
+                f.shared_up   = w[2];
+                f.shared_gate = w[3];
+                ggml_cuda_mul_mat_vec_q(ctx, w[0], src1, ids, dst, &f);
+            } else {
+                ggml_cuda_mul_mat_vec_q(ctx, w[0], src1, ids, dst);
+            }
+            return;
+        }
+    }
+#endif // defined(GGML_USE_HIP)
+
     const float   * src1_d =       (const float   *) src1->data;
     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;
     float         *  dst_d =       (float         *)  dst->data;
@@ -2661,6 +2955,16 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t stride_channel_y   = ids ? s11  : s12;
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+
+#if defined(GGML_USE_HIP)
+    if (ggml_cuda_q8_0_planes(src0)) {
+        mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q8_0, false, true>(
+            src0->data, src1_q8_1, ids_d, fusion_local, dst_d, ne00, ne01, ncols_dst, s01, stride_col_y, stride_col_dst,
+            ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
+            ne03, ne3, s03, s13, s3, ids_stride, stream);
+        return;
+    }
+#endif // defined(GGML_USE_HIP)
 
     mul_mat_vec_q_switch_type(
         src0->data, src0->type, src1_q8_1, ids_d, fusion_local, dst_d, ne00,
