@@ -11959,6 +11959,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 31, 509, 2051, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 32, 509, 2112, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 32, 509, 2112, {1, 1}, {1, 1}));
+    // IQ1_M prompt batches (UD-IQ3_XXS FFN weights): every MMQ tile width, with and without row fallback
+    for (int64_t n : {24, 40, 64, 509}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ1_M, GGML_TYPE_F32, 1024, n, 1024, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ1_M, GGML_TYPE_F32, 1000, n, 512,  {1, 1}, {1, 1}));
+    }
 
     // Q8_0 MMQ tiles from 32 columns on, with whole and partial row tiles and a row view
     for (int64_t n : {32, 64, 128, 300, 512}) {

@@ -110,6 +110,9 @@ static void ggml_cuda_mul_mat_q_switch_type(
         case GGML_TYPE_IQ1_S:
             mul_mat_q_case<GGML_TYPE_IQ1_S, GGML_PREC_Q8>(ctx, args, stream);
             break;
+        case GGML_TYPE_IQ1_M:
+            mul_mat_q_case<GGML_TYPE_IQ1_M, GGML_PREC_Q8>(ctx, args, stream);
+            break;
         case GGML_TYPE_IQ2_XXS:
             mul_mat_q_case<GGML_TYPE_IQ2_XXS, GGML_PREC_Q8>(ctx, args, stream);
             break;
@@ -473,6 +476,7 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         case GGML_TYPE_Q6_K:
 // -------------------------------------------------
         case GGML_TYPE_IQ1_S:
+        case GGML_TYPE_IQ1_M:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ2_S:
@@ -488,6 +492,14 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         default:
             mmq_supported = false;
             break;
+    }
+
+    // IQ1_M tile configs exist for GCN only; GGML_CUDA_MMQ_IQ1_M=0 keeps it on dequantize + rocBLAS.
+    if (type == GGML_TYPE_IQ1_M) {
+        static const bool iq1_m_enabled = [] { const char * e = getenv("GGML_CUDA_MMQ_IQ1_M"); return e == nullptr || atoi(e) != 0; }();
+        if (!iq1_m_enabled || !GGML_CUDA_CC_IS_GCN(cc)) {
+            return false;
+        }
     }
 
     if (!mmq_supported) {
