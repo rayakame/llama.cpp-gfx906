@@ -11797,6 +11797,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // partial MMQ column tiles with whole 128-row tiles: 9..15 columns in the 16-column tile, 17..31 in the 24/32-column tiles
+    for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K,
+                             GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS}) {
+        for (int64_t n : {10, 12, 15, 20, 30}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1024, n, 2048, {1, 1}, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 17408, 12, 1024, {1, 1}, {1, 1}));
+    }
+
 #if 0
     {
         // Test paths in OpenCL
@@ -13485,6 +13494,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{17408, 5120}, {5120, 17408}, {5120, 6144}, {10240, 5120}, {6144, 5120}, {48, 5120}}) {
         for (int bs : {1, 2, 4, 8, 16, 512}) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, bs, k, {1, 1}, {1, 1}));
+        }
+    }
+
+    // Qwen3.8 27B: ffn_up/gate, ffn_down, attn_qkv, ssm_out at the verify width of three users
+    for (ggml_type type_a : {GGML_TYPE_Q4_1, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS}) {
+        for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{17408, 5120}, {5120, 17408}, {10240, 5120}, {5120, 6144}}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, 12, k, {1, 1}, {1, 1}));
         }
     }
 
