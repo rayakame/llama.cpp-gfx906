@@ -13013,6 +13013,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Qwen3.8 27B attention (head 256, 4 KV heads, GQA 6, f16 cache): every tile width from decode to prefill
+    for (int kv : { 512, 4096 }) {
+        for (int nb : { 1, 2, 3, 4, 6, 8, 13, 16, 512 }) {
+            if (nb == 512 && kv != 512) continue;
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
+    }
+
     // sparse mask with large batch size
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
@@ -13766,6 +13774,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 }
                 test_cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F32, {IW_IH, IW_IH, IC, 1}, {K, K, IC, 1}, 1, 1, 1, 1, 1, 1, true));
             }
+        }
+    }
+
+    // Qwen3.8 27B attention at depth: decode, 2 tokens, MTP verify of one, two and four requests
+    for (int64_t kv : {256, 512, 1024, 1536, 2048, 3072, 4096, 8192, 32768}) {
+        for (int64_t nb : {1, 2, 4, 8, 16}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
         }
     }
 
