@@ -12322,6 +12322,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // MMQ Q4_1 lane grid tiles of 32..64 columns: partial row tiles, stream-k with fixup, tiling
+    for (int64_t m : {200, 1024, 17408}) {
+        for (int64_t n : {32, 40, 48, 64, 200}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_1, GGML_TYPE_F32, m, n, 1024, {1, 1}, {1, 1}));
+        }
+    }
+
     // SIMD K boundaries, including tails shorter than one vector.
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}) {
         for (int k : {1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 48}) {
@@ -13951,6 +13958,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 17408, 1,  5120, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,  5120, 1, 17408, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,  1024, 1,  5120, {1, 1}, {1, 1}));
+    }
+
+    // Qwen3.8 27B Q4_1: ffn_up/gate, ffn_down, attn_qkv, ssm_out at prefill widths
+    for (int bs : {64, 512}) {
+        for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{17408, 5120}, {5120, 17408}, {10240, 5120}, {5120, 6144}}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_1, GGML_TYPE_F32, m, bs, k, {1, 1}, {1, 1}));
+        }
     }
 
     // Q4_K multi-column mat-vec
