@@ -467,6 +467,7 @@ static constexpr __device__ int ggml_cuda_mmq_dp4a_lanes_j(ggml_type type, int J
         return 1;
     }
     switch (type) {
+        case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_IQ3_XXS:
@@ -514,10 +515,11 @@ static __device__ __forceinline__ const int * ggml_cuda_mmq_y_smem_ptr(const int
 #endif // defined(GGML_USE_HIP)
 }
 
-// Types whose lane grid GGML_MMQ_Q8_0_GRID=0 (the Q8_0-layout dot of the Qwen3.8 27B files) or GGML_MMQ_KQ_GRID=0 (Q6_K) turns off.
+// Types whose lane grid GGML_MMQ_Q8_0_GRID=0 (the Q8_0-layout dot of the Qwen3.8 27B files), GGML_MMQ_KQ_GRID=0 (Q6_K) or
+// GGML_MMQ_Q4_0_GRID=0 (Q4_0) turns off.
 static constexpr __host__ __device__ bool ggml_cuda_mmq_dp4a_grid_switchable(ggml_type type) {
     return type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_IQ4_NL ||
-        type == GGML_TYPE_Q6_K;
+        type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q4_0;
 }
 
 #include "mmq-load-tiles.cuh"
@@ -703,6 +705,13 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                     ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a<type, J, fallback, JL, y_smem, unroll_k>,
                     ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1>);
             case GGML_TYPE_Q4_0:
+                if constexpr (use_grid) {
+                    return ggml_cuda_mmq_util_funcs(
+                        VDR_Q4_0_Q8_1_MMQ,
+                        ggml_cuda_mmq_load_tiles_q4_0<type, J, fallback>,
+                        ggml_cuda_mmq_vec_dot_q4_0_q8_1_dp4a_grid<type, J, fallback>,
+                        ggml_cuda_mmq_write_back_dp4a_grid<type, J, fallback, prec_src1>);
+                }
                 return ggml_cuda_mmq_util_funcs(
                     VDR_Q4_0_Q8_1_MMQ,
                     ggml_cuda_mmq_load_tiles_q4_0<type, J, fallback>,
@@ -2007,7 +2016,8 @@ static void mul_mat_q_switch_fallback(ggml_backend_cuda_context & ctx, const mmq
 static bool ggml_cuda_mmq_dp4a_grid_enabled(const ggml_type type) {
     static const bool enabled_q8_0 = [] { const char * e = getenv("GGML_MMQ_Q8_0_GRID"); return !e || atoi(e) != 0; }();
     static const bool enabled_kq   = [] { const char * e = getenv("GGML_MMQ_KQ_GRID");   return !e || atoi(e) != 0; }();
-    return type == GGML_TYPE_Q6_K ? enabled_kq : enabled_q8_0;
+    static const bool enabled_q4_0 = [] { const char * e = getenv("GGML_MMQ_Q4_0_GRID"); return !e || atoi(e) != 0; }();
+    return type == GGML_TYPE_Q6_K ? enabled_kq : type == GGML_TYPE_Q4_0 ? enabled_q4_0 : enabled_q8_0;
 }
 
 // Types whose dp4a dot is ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a; GGML_MMQ_Q8_0_UNROLL=0 gives them the old K loop.
