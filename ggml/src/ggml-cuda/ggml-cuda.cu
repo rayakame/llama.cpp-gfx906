@@ -2262,8 +2262,10 @@ static bool ggml_cuda_mul_mat_q_fusion_matches(const ggml_tensor * up, const ggm
         return false;
     }
 
-    // NVIDIA only: the fused write-back relies on the MMA accumulator layout.
-    return turing_mma_available(ggml_cuda_info().devices[device].cc);
+    // NVIDIA MMA layout, or the gfx906 dp4a write-back (GGML_MMQ_GCN_FUSION=0 turns it off).
+    static const bool gcn_fusion = ggml_cuda_env_int("GGML_MMQ_GCN_FUSION", 1) != 0;
+    const int cc = ggml_cuda_info().devices[device].cc;
+    return turing_mma_available(cc) || (gcn_fusion && cc == GGML_CUDA_CC_VEGA20 && x_up->type != GGML_TYPE_NVFP4);
 }
 
 static bool ggml_cuda_should_fuse_mul_mat_q(const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * glu,
