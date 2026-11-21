@@ -3456,13 +3456,24 @@ static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm
         return false;
     }
 
-    // the fused kernel handles the norm/neox rope modes only
-    const int mode = ((const int32_t *) rope->op_params)[2];
-    if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX) {
+    const int mode   = ((const int32_t *) rope->op_params)[2];
+    const int n_dims = ((const int32_t *) rope->op_params)[1];
+
+    if ((mode & GGML_ROPE_TYPE_MROPE) && mode != GGML_ROPE_TYPE_VISION) {
+        // GGML_ROPE_MULTI_FUSE=0 keeps RMS_NORM+MUL and MROPE/IMROPE as two kernels.
+        static const bool multi_fuse = [] { const char * e = getenv("GGML_ROPE_MULTI_FUSE"); return !e || atoi(e) != 0; }();
+        const ggml_tensor * x       = rms_norm->src[0];
+        const ggml_tensor * mul_src = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+        const int64_t       ncols   = x->ne[0];
+        if (!multi_fuse || ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size != 64 ||
+            ncols % 4 != 0 || ncols > 256 || n_dims % 8 != 0 || n_dims > ncols || n_dims > 128 ||
+            mul_src->ne[0] != ncols || !ggml_cuda_is_aligned(x, 16) || !ggml_cuda_is_aligned(mul_src, 16)) {
+            return false;
+        }
+    } else if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX) {
         return false;
     }
 
-    const int n_dims = ((const int32_t *) rope->op_params)[1];
     if (n_dims % 2 != 0 || rope->src[0]->ne[0] % 2 != 0) {
         return false;
     }

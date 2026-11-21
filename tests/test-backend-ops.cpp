@@ -2974,6 +2974,7 @@ struct test_rms_norm_mul_rope : public test_case {
     int mode;
     const bool yarn;
     const bool truncate;
+    const int n_dims; // 0: rotate the whole row
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -2983,15 +2984,15 @@ struct test_rms_norm_mul_rope : public test_case {
     bool run_whole_graph() override { return true; }
 
     std::string vars() override {
-        return VARS_TO_STR11(ne, eps, multi_add, mul, rope, set_rows, broadcast, mode, set_rows_type, yarn, truncate);
+        return VARS_TO_STR12(ne, eps, multi_add, mul, rope, set_rows, broadcast, mode, set_rows_type, yarn, truncate, n_dims);
     }
 
     test_rms_norm_mul_rope(std::array<int64_t, 4> ne, float eps = 1e-6f, bool multi_add = false,
                            bool set_rows = false, bool broadcast = false, int mode = GGML_ROPE_TYPE_NORMAL,
                            bool mul = true, bool rope = true, ggml_type set_rows_type = GGML_TYPE_F16,
-                           bool yarn = false, bool truncate = true)
+                           bool yarn = false, bool truncate = true, int n_dims = 0)
         : ne(ne), eps(eps), multi_add(multi_add), mul(mul), rope(rope), set_rows(set_rows), broadcast(broadcast),
-          set_rows_type(set_rows_type), mode(mode), yarn(yarn), truncate(truncate) {}
+          set_rows_type(set_rows_type), mode(mode), yarn(yarn), truncate(truncate), n_dims(n_dims) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], ne[3]);
@@ -3029,9 +3030,16 @@ struct test_rms_norm_mul_rope : public test_case {
             const float ext_factor = yarn ? 1.0f : 0.0f;
 
             if (is_mrope) {
-                const int n_dims = ne[0];
-                int sections[4] = { n_dims/3, n_dims/3, n_dims/3, 0 };
-                a = ggml_rope_multi(ctx, a, pos, nullptr, n_dims, sections, mode, n_ctx_orig, freq_base, freq_scale, ext_factor, 1.0f, 32.0f, 1.0f);
+                const int nd = n_dims > 0 ? n_dims : ne[0];
+                // partial rotation: sections over the rotated pairs, as Qwen3.5 ([11, 11, 10, 0] for 64 dims)
+                const int s0 = (nd/2 + 2)/3;
+                int sections[4] = { nd/3, nd/3, nd/3, 0 };
+                if (n_dims > 0) {
+                    sections[0] = s0;
+                    sections[1] = s0;
+                    sections[2] = nd/2 - 2*s0;
+                }
+                a = ggml_rope_multi(ctx, a, pos, nullptr, nd, sections, mode, n_ctx_orig, freq_base, freq_scale, ext_factor, 1.0f, 32.0f, 1.0f);
             } else if (yarn) {
                 a = ggml_rope_ext(ctx, a, pos, nullptr, ne[0], mode, n_ctx_orig, freq_base, freq_scale, ext_factor, 1.0f, 32.0f, 1.0f);
             } else {
@@ -11945,6 +11953,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // Qwen3.5/3.8 attention: Q (24 heads) and K into the cache (4 heads), 256-wide heads, 64 of them rotated
+    for (int mode : {GGML_ROPE_TYPE_IMROPE, GGML_ROPE_TYPE_MROPE}) {
+        for (int64_t n_tokens : {1, 4, 16, 512}) {
+            test_cases.emplace_back(new test_rms_norm_mul_rope({256, 24, n_tokens, 1}, 1e-6f, false, false, true, mode, true, true, GGML_TYPE_F16, false, true, 64));
+            test_cases.emplace_back(new test_rms_norm_mul_rope({256, 4, n_tokens, 1}, 1e-6f, false, true, true, mode, true, true, GGML_TYPE_F16, false, true, 64));
+        }
+        for (int n_dims : {8, 32, 128}) {
+            for (bool set_rows : {false, true}) {
+                for (bool broadcast : {false, true}) {
+                    test_cases.emplace_back(new test_rms_norm_mul_rope({256, 3, 5, 1}, 1e-6f, false, set_rows, broadcast, mode, true, true, GGML_TYPE_F16, false, true, n_dims));
+                    test_cases.emplace_back(new test_rms_norm_mul_rope({96, 3, 5, 1}, 1e-6f, false, set_rows, broadcast, mode, true, true, GGML_TYPE_F32, false, true, n_dims < 96 ? n_dims : 96));
+                }
+            }
+        }
+        test_cases.emplace_back(new test_rms_norm_mul_rope({256, 4, 7, 2}, 1e-6f, false, false, true, mode, true, true, GGML_TYPE_F16, false, true, 64));
+        test_cases.emplace_back(new test_rms_norm_mul_rope({256, 2, 3, 1}, 1e-6f, false, true, true, mode, true, true, GGML_TYPE_F16, true, true, 64));
+    }
+
     // ne[2] > 65535 exceeds the CUDA gridDim.y limit (#27901)
     test_cases.emplace_back(new test_rms_norm_mul_rope({4, 1, 65536, 1}, 1e-6f, false, false, false, GGML_ROPE_TYPE_NORMAL));
     test_cases.emplace_back(new test_rms_norm_mul_rope({4, 1, 65536, 1}, 1e-6f, false, true,  false, GGML_ROPE_TYPE_NEOX));
