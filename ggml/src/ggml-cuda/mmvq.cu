@@ -2481,9 +2481,10 @@ static bool mul_mat_vec_q_gcn_mc_switch_ncols(const int ncols_dst, const int wav
 
 // More rows per wave keep more weight loads in flight for the K-quants, IQ types and Q8_0; below 4096 rows waves run short.
 // GGML_MMVQ_GCN_1COL_SHAPE sets one shape for all types, 0 = the table. A partial last block would read past the last row.
-static int mmvq_gcn_1col_shape(const ggml_type type, const int nrows_x) {
+// The VDR 4 kernels of Q4_K/Q5_K (kvdr4, GGML_MMVQ_GCN_KVDR4) have only shape 0, 2 warps x 1 row.
+static int mmvq_gcn_1col_shape(const ggml_type type, const int nrows_x, const bool kvdr4) {
     static const int env = mmvq_gcn_mc_env("GGML_MMVQ_GCN_1COL_SHAPE", -1);
-    if (nrows_x % 4 != 0) {
+    if (kvdr4 || nrows_x % 4 != 0) {
         return 0;
     }
     if (env >= 0) {
@@ -2497,8 +2498,7 @@ static int mmvq_gcn_1col_shape(const ggml_type type, const int nrows_x) {
             return 3;
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
-            // with VDR 4 (GGML_MMVQ_GCN_KVDR4) their 1-column lanes keep the 2 warps x 1 row shape
-            return mmvq_gcn_mc_env("GGML_MMVQ_GCN_KVDR4", 1) != 0 ? 0 : 5;
+            return 5;
         case GGML_TYPE_Q2_K:
         case GGML_TYPE_Q3_K:
         case GGML_TYPE_Q6_K:
@@ -3599,7 +3599,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
 #if defined(GGML_USE_HIP)
             if (GGML_CUDA_CC_IS_GCN(cc) && !has_ids) {
                 using no = std::false_type;
-                switch (mmvq_gcn_1col_shape(type, nrows_x)) {
+                switch (mmvq_gcn_1col_shape(type, nrows_x, kvdr4)) {
                     case 1: launch(no{}, no{}, std::integral_constant<int, 1>{}); return;
                     case 2: launch(no{}, no{}, std::integral_constant<int, 2>{}); return;
                     case 3: launch(no{}, no{}, std::integral_constant<int, 3>{}); return;

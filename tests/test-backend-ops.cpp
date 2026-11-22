@@ -12500,6 +12500,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 17408, 12, 1024, {1, 1}, {1, 1}));
     }
+    // 1-column mat-vec of Q4_K/Q5_K from 4096 rows, where GGML_MMVQ_GCN_1COL_SHAPE and the VDR 4 kernels meet
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 5120, 1, 1024, {1, 1}, {1, 1}));
+    }
 
     // MMQ dp4a lane grid of the Q8_0-layout dot: tile widths from 32 columns, whole and partial row tiles
     for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL}) {
