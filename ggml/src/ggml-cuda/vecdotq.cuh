@@ -1250,6 +1250,131 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
     return vec_dot_q5_K_q8_1_impl_vmmq(vl, vh, u, sc, m, bq5_K->dm, d8);
 }
 
+// GCN mat-vec layout of Q4_K/Q5_K: 8 lanes per superblock, each reads 16 qs bytes of a sub-block pair with one dwordx4 (iqs = 0, 4, ..., 28: pair iqs/8, half (iqs/4) % 2).
+#define VDR_Q4_K_Q5_K_Q8_1_MMVQ_GCN 4
+
+static __device__ __forceinline__ void vec_dot_q4_K_q5_K_gcn_scales(
+    const uint8_t * __restrict__ scales_k, const int j, uint8_t * __restrict__ sc, uint8_t * __restrict__ m) {
+
+    const uint16_t * scales = (const uint16_t *) scales_k;
+    const int jm = j & 1;
+
+    const uint32_t s0 = scales[jm + 0];
+    const uint32_t s2 = scales[jm + 2];
+    const uint32_t s4 = scales[jm + 4];
+
+    const uint32_t hi = (uint32_t) -(int32_t) (j >= 2);
+
+    const uint32_t a0 = ((s0 & 0x3f3f) & ~hi) | ((((s4 >> 0) & 0x0f0f) | ((s0 & 0xc0c0) >> 2)) & hi);
+    const uint32_t a1 = ((s2 & 0x3f3f) & ~hi) | ((((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2)) & hi);
+
+    sc[0] = a0 & 0xff;
+    sc[1] = (a0 >> 8) & 0xff;
+    m[0]  = a1 & 0xff;
+    m[1]  = (a1 >> 8) & 0xff;
+}
+
+static __device__ __forceinline__ void vec_dot_q4_K_q5_K_gcn_u(
+    const block_q8_1 * __restrict__ bq8_1, const int j, const int h, int * __restrict__ u, float * __restrict__ d8) {
+
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const block_q8_1 * bq8i = bq8_1 + 2*j + i;
+        d8[i] = __low2float(bq8i->ds);
+
+        const int * q8 = (const int *) bq8i->qs + 4*h;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            u[4*i + l] = q8[l];
+        }
+    }
+}
+
+static __device__ __forceinline__ float vec_dot_q4_K_q8_1_gcn(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_q4_K * bq4_K = (const block_q4_K *) vbq + kbx;
+
+    const int j = iqs/8;
+    const int h = (iqs/4) % 2;
+
+    const int4 q4 = *(const int4 *) (bq4_K->qs + 32*j + 16*h);
+    const int  v[4] = {q4.x, q4.y, q4.z, q4.w};
+
+    uint8_t sc[2];
+    uint8_t m[2];
+    vec_dot_q4_K_q5_K_gcn_scales(bq4_K->scales, j, sc, m);
+
+    int   u[8];
+    float d8[2];
+    vec_dot_q4_K_q5_K_gcn_u(bq8_1, j, h, u, d8);
+
+    float sumf_d = 0.0f;
+    float sumf_m = 0.0f;
+
+#pragma unroll
+    for (int i = 0; i < QR4_K; ++i) {
+        int dot1 = 0;
+        int dot2 = 0;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            dot1 = ggml_cuda_dp4a((v[l] >> (4*i)) & 0x0F0F0F0F, u[4*i + l], dot1);
+            dot2 = ggml_cuda_dp4a(0x01010101, u[4*i + l], dot2);
+        }
+
+        sumf_d += d8[i] * (dot1 * sc[i]);
+        sumf_m += d8[i] * (dot2 * m[i]);
+    }
+
+    const float2 dm4f = __half22float2(bq4_K->dm);
+
+    return dm4f.x*sumf_d - dm4f.y*sumf_m;
+}
+
+static __device__ __forceinline__ float vec_dot_q5_K_q8_1_gcn(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_q5_K * bq5_K = (const block_q5_K *) vbq + kbx;
+
+    const int j = iqs/8;
+    const int h = (iqs/4) % 2;
+
+    const int4 ql = *(const int4 *) (bq5_K->qs + 32*j + 16*h);
+    const int4 qh = *(const int4 *) (bq5_K->qh + 16*h);
+    const int  vl[4] = {ql.x, ql.y, ql.z, ql.w};
+    const int  vh[4] = {qh.x >> (2*j), qh.y >> (2*j), qh.z >> (2*j), qh.w >> (2*j)};
+
+    uint8_t sc[2];
+    uint8_t m[2];
+    vec_dot_q4_K_q5_K_gcn_scales(bq5_K->scales, j, sc, m);
+
+    int   u[8];
+    float d8[2];
+    vec_dot_q4_K_q5_K_gcn_u(bq8_1, j, h, u, d8);
+
+    float sumf_d = 0.0f;
+    float sumf_m = 0.0f;
+
+#pragma unroll
+    for (int i = 0; i < QR5_K; ++i) {
+        int dot1 = 0;
+        int dot2 = 0;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const int vi = ((vl[l] >> (4*i)) & 0x0F0F0F0F) | (((vh[l] >> i) << 4) & 0x10101010);
+            dot1 = ggml_cuda_dp4a(vi, u[4*i + l], dot1);
+            dot2 = ggml_cuda_dp4a(0x01010101, u[4*i + l], dot2);
+        }
+
+        sumf_d += d8[i] * (dot1 * sc[i]);
+        sumf_m += d8[i] * (dot2 * m[i]);
+    }
+
+    const float2 dm5f = __half22float2(bq5_K->dm);
+
+    return dm5f.x*sumf_d - dm5f.y*sumf_m;
+}
+
 static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
