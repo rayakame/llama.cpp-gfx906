@@ -1726,32 +1726,6 @@ struct test_case {
             return false;
         }
 
-        // determine number of runs
-        int n_runs;
-        bool is_cpu = ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
-        if (op_flops(out) > 0) {
-            // based on flops
-            const uint64_t GFLOP = 1000 * 1000 * 1000;
-            const uint64_t target_flops_cpu =   8ULL * GFLOP;
-            const uint64_t target_flops_gpu = 100ULL * GFLOP;
-            uint64_t target_flops = is_cpu ? target_flops_cpu : target_flops_gpu;
-            n_runs = (int)std::min<int64_t>(ggml_graph_size(gf) - ggml_graph_n_nodes(gf), target_flops / op_flops(out)) + 1;
-        } else {
-            // based on memory size
-            const size_t GB = 1ULL << 30;
-            const size_t target_size_cpu =  8 * GB;
-            const size_t target_size_gpu = 32 * GB;
-            size_t target_size = is_cpu ? target_size_cpu : target_size_gpu;
-            n_runs = (int)std::min<int64_t>(ggml_graph_size(gf) - ggml_graph_n_nodes(gf), target_size / op_size(out)) + 1;
-        }
-
-        // duplicate the op
-        for (int i = 1; i < n_runs; i++) {
-            ggml_graph_add_node(gf, out);
-        }
-
-        // calculate memory
-        size_t mem = n_runs * op_size(out);
         auto tensor_op_size = [](ggml_tensor * t) {
             size_t size = ggml_nbytes(t);
             // add source tensors
@@ -1762,6 +1736,50 @@ struct test_case {
             }
             return size;
         };
+
+        // a whole-graph case repeats all of its nodes in each run, not only the output op
+        const bool whole_graph = run_whole_graph();
+        const int  n_nodes     = ggml_graph_n_nodes(gf);
+        const int64_t max_runs = (ggml_graph_size(gf) - n_nodes) / (whole_graph ? n_nodes : 1);
+        size_t run_size = op_size(out);
+        for (int i = 0; whole_graph && i < n_nodes; ++i) {
+            if (!ggml_is_view_op(ggml_graph_node(gf, i)->op) && ggml_graph_node(gf, i) != out) {
+                run_size += tensor_op_size(ggml_graph_node(gf, i));
+            }
+        }
+
+        // determine number of runs
+        int n_runs;
+        bool is_cpu = ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
+        if (op_flops(out) > 0) {
+            // based on flops
+            const uint64_t GFLOP = 1000 * 1000 * 1000;
+            const uint64_t target_flops_cpu =   8ULL * GFLOP;
+            const uint64_t target_flops_gpu = 100ULL * GFLOP;
+            uint64_t target_flops = is_cpu ? target_flops_cpu : target_flops_gpu;
+            n_runs = (int)std::min<int64_t>(max_runs, target_flops / op_flops(out)) + 1;
+        } else {
+            // based on memory size
+            const size_t GB = 1ULL << 30;
+            const size_t target_size_cpu =  8 * GB;
+            const size_t target_size_gpu = 32 * GB;
+            size_t target_size = is_cpu ? target_size_cpu : target_size_gpu;
+            n_runs = (int)std::min<int64_t>(max_runs, target_size / run_size) + 1;
+        }
+
+        // duplicate the op, or the whole graph
+        for (int i = 1; i < n_runs; i++) {
+            if (whole_graph) {
+                for (int j = 0; j < n_nodes; j++) {
+                    ggml_graph_add_node(gf, ggml_graph_node(gf, j));
+                }
+            } else {
+                ggml_graph_add_node(gf, out);
+            }
+        }
+
+        // calculate memory
+        size_t mem = n_runs * op_size(out);
         for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
             if (ggml_is_view_op(ggml_graph_node(gf, i)->op) || ggml_graph_node(gf, i) == out) {
                 continue;
@@ -1795,7 +1813,7 @@ struct test_case {
         double calculated_flops = (op_flops(out) > 0) ? (op_flops(out) * total_runs) / (total_time_us / 1e6) : 0.0;
         double calculated_bandwidth =
             (op_flops(out) == 0) ? total_mem / (total_time_us / 1e6) / 1024.0 / 1024.0 / 1024.0 : 0.0;
-        size_t calculated_memory_kb = op_size(out) / 1024;
+        size_t calculated_memory_kb = run_size / 1024;
 
         test_result result(ggml_backend_name(backend), current_op_name, vars(), "perf", true, true, "", avg_time_us,
                            calculated_flops, calculated_bandwidth, calculated_memory_kb, total_runs);
