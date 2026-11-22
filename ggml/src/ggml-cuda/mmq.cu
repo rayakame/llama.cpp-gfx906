@@ -40,6 +40,10 @@ static void ggml_cuda_mul_mat_q_switch_type(
                 mul_mat_q_case_gcn_variant<GGML_TYPE_Q5_K, 1>(ctx, args, stream);
                 return;
             case GGML_TYPE_Q6_K:
+                if (args.planes) {
+                    mul_mat_q_case_gcn_variant<GGML_TYPE_Q6_K, 1, true>(ctx, args, stream);
+                    return;
+                }
                 mul_mat_q_case_gcn_variant<GGML_TYPE_Q6_K, 1>(ctx, args, stream);
                 return;
             case GGML_TYPE_IQ3_XXS:
@@ -96,6 +100,10 @@ static void ggml_cuda_mul_mat_q_switch_type(
             mul_mat_q_case<GGML_TYPE_Q5_K, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_Q6_K:
+            if (args.planes) {
+                mul_mat_q_case<GGML_TYPE_Q6_K, GGML_PREC_Q8, true>(ctx, args, stream);
+                break;
+            }
             mul_mat_q_case<GGML_TYPE_Q6_K, GGML_PREC_Q8>(ctx, args, stream);
             break;
 // -----------------------------------------------------------------------
@@ -355,7 +363,7 @@ void ggml_cuda_mul_mat_q(
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
-            ntj, J_best, fusion_device, ggml_cuda_q8_0_planes(src0)};
+            ntj, J_best, fusion_device, ggml_cuda_q8_0_planes(src0) || ggml_cuda_q6_k_planes(src0)};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1, gcn_variant);
         return;
     }
@@ -438,7 +446,7 @@ void ggml_cuda_mul_mat_q(
         ne03, ne13, s03, s13, s3,
         ntj, J_best, fusion_device};
 
-    GGML_ASSERT(!ggml_cuda_q8_0_planes(src0));
+    GGML_ASSERT(!ggml_cuda_q8_0_planes(src0) && !ggml_cuda_q6_k_planes(src0));
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1, gcn_variant);
 }
 

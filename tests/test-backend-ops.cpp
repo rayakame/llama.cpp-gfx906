@@ -5716,6 +5716,35 @@ struct test_mul_mat_big : public test_mul_mat {
     }
 };
 
+// Output head shapes: 64 random rows repeated, since quantizing a 1 GB matrix on the CPU takes longer than timing it
+struct test_mul_mat_head : public test_mul_mat {
+    test_mul_mat_head(ggml_type type_a, int64_t m, int64_t n, int64_t k)
+        : test_mul_mat(type_a, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->ne[1] < 4096 || !ggml_is_quantized(t->type)) {
+                init_tensor_uniform(t);
+                continue;
+            }
+            const int64_t nr = 64;
+            std::vector<float> f(t->ne[0]*nr);
+            std::default_random_engine gen(42);
+            std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+            for (float & x : f) {
+                x = dist(gen);
+            }
+            std::vector<uint8_t> q(ggml_row_size(t->type, t->ne[0])*nr);
+            ggml_quantize_chunk(t->type, f.data(), q.data(), 0, nr, t->ne[0], nullptr);
+            std::vector<uint8_t> all(ggml_nbytes(t));
+            for (size_t off = 0; off < all.size(); off += q.size()) {
+                memcpy(all.data() + off, q.data(), std::min(q.size(), all.size() - off));
+            }
+            ggml_backend_tensor_set(t, all.data(), 0, all.size());
+        }
+    }
+};
+
 // GGML_HINT_SRC0_IS_HADAMARD
 struct test_mul_mat_hadamard : public test_mul_mat {
     test_mul_mat_hadamard(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
@@ -11974,6 +12003,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_pos(type_a, GGML_TYPE_F32, 1000, n, 1024, {1, 1}, {1, 1}));
         }
     }
+    // MMQ above the mat-vec columns: whole and partial tiles, a row view and broadcast batches
+    for (int64_t n : {17, 32, 100, 512}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 1024, n, 1024, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 1000, n, 1024, {1, 1}, {1, 1}, {0, 1, 2, 3}, 1280));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 64, n, 5120, {3, 2}, {2, 1}));
+    }
 
     // MMQ tile configs with whole 128-row tiles: every column tile width the tables use, stream-k (few tiles) and tiling (many)
     for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
@@ -13436,6 +13471,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // delta-net conv input: conv state followed by the transposed qkv of the ubatch
     test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 8192, 1, 1}, 512, 0, 16));
+
+    // Qwen3.8 27B Q6_K output head of the target and the MTP drafts, 1..16 columns (GGML_CUDA_Q6K_PLANES=2 for any name)
+    for (int64_t n = 1; n <= 16; ++n) {
+        test_cases.emplace_back(new test_mul_mat_head(GGML_TYPE_Q6_K, 248320, n, 5120));
+    }
+    // Qwen3.8 27B Q6_K layer weights: decode, verify passes and prefill
+    for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{17408, 5120}, {5120, 17408}, {10240, 5120}, {5120, 6144}}) {
+        for (int64_t n : {1, 2, 3, 4, 5, 8, 12, 16, 512}) {
+            test_cases.emplace_back(new test_mul_mat_head(GGML_TYPE_Q6_K, m, n, k));
+        }
+    }
 
     // LoRA at prefill: B is [rank, n_out], so K = rank
     for (int64_t k : {16, 32, 48, 64}) {

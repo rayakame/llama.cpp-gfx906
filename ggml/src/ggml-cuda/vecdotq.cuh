@@ -752,6 +752,12 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_mmq(
     return dm4f.x*sumf_d - dm4f.y*sumf_m;
 }
 
+// Q6_K in planes (gfx906), row by row in place: ql | qh with the high bit of each 2-bit field flipped | scales as one
+// word per 64-value lane unit | d. The d plane goes first when that puts the other planes on 16 bytes.
+static __host__ __device__ __forceinline__ bool q6_k_rp_d_first(const uintptr_t row, const int nb) {
+    return (row & 15) != 0 && ((row + 2*nb) & 15) == 0;
+}
+
 #define VDR_Q6_K_Q8_1_MMVQ 2
 #define VDR_Q6_K_Q8_1_MMQ  8
 

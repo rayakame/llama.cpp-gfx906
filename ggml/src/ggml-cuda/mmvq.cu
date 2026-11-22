@@ -1846,6 +1846,207 @@ static __global__ void mul_mat_vec_q_gcn_wide(
     NO_DEVICE_CODE;
 #endif // defined(GCN)
 }
+
+static __global__ void q6_k_rp_repack(char * __restrict__ x, const int nb) {
+    extern __shared__ char q6_k_rp_buf[];
+    const int row_bytes = nb*int(sizeof(block_q6_K));
+    char * xr = x + int64_t(blockIdx.x)*row_bytes;
+
+    for (int i = threadIdx.x; i < row_bytes/2; i += blockDim.x) {
+        ((uint16_t *) q6_k_rp_buf)[i] = ((const uint16_t *) xr)[i];
+    }
+    __syncthreads();
+
+    const block_q6_K * bx = (const block_q6_K *) q6_k_rp_buf;
+    const bool d_first = q6_k_rp_d_first((uintptr_t) xr, nb);
+    char * ql = xr + (d_first ? 2*nb : 0);
+    char * qh = ql + 128*nb;
+    char * sc = qh +  64*nb;
+    char * dp = d_first ? xr : sc + 16*nb;
+
+    for (int i = threadIdx.x; i < 128*nb; i += blockDim.x) {
+        ql[i] = bx[i/128].ql[i%128];
+    }
+    for (int i = threadIdx.x; i < 64*nb; i += blockDim.x) {
+        qh[i] = bx[i/64].qh[i%64] ^ 0xAA;
+    }
+    // unit u = 2*n + h covers ql bytes 64n + 16h + [0, 16) and +32 of a block; byte g is the scale of q8_1 block 4n + g
+    for (int i = threadIdx.x; i < 16*nb; i += blockDim.x) {
+        const int u = (i%16)/4;
+        const int g = i%4;
+        sc[i] = bx[i/16].scales[8*(u >> 1) + (u & 1) + 2*g];
+    }
+    for (int i = threadIdx.x; i < nb; i += blockDim.x) {
+        ((half *) dp)[i] = bx[i].d;
+    }
+}
+
+static __global__ void q6_k_rp_unpack(const char * __restrict__ x, char * __restrict__ dst, const int nb) {
+    const int row_bytes = nb*int(sizeof(block_q6_K));
+    const char * xr = x + int64_t(blockIdx.x)*row_bytes;
+    block_q6_K * bd = (block_q6_K *) (dst + int64_t(blockIdx.x)*row_bytes);
+
+    const bool d_first = q6_k_rp_d_first((uintptr_t) xr, nb);
+    const char * ql = xr + (d_first ? 2*nb : 0);
+    const char * qh = ql + 128*nb;
+    const char * sc = qh +  64*nb;
+    const char * dp = d_first ? xr : sc + 16*nb;
+
+    for (int i = threadIdx.x; i < 128*nb; i += blockDim.x) {
+        bd[i/128].ql[i%128] = ql[i];
+    }
+    for (int i = threadIdx.x; i < 64*nb; i += blockDim.x) {
+        bd[i/64].qh[i%64] = qh[i] ^ 0xAA;
+    }
+    for (int i = threadIdx.x; i < 16*nb; i += blockDim.x) {
+        const int u = (i%16)/4;
+        const int g = i%4;
+        bd[i/16].scales[8*(u >> 1) + (u & 1) + 2*g] = sc[i];
+    }
+    for (int i = threadIdx.x; i < nb; i += blockDim.x) {
+        bd[i].d = ((const half *) dp)[i];
+    }
+}
+
+template <int ncols_dst, int rows, int ngroups, int waves_per_eu>
+__launch_bounds__(64, waves_per_eu)
+static __global__ void mul_mat_vec_q6_k_rp(
+        const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst, const int nb,
+        const uint32_t ncols_x, const uint32_t nrows_x, const uint32_t stride_row_x, const uint32_t stride_col_y,
+        const uint32_t stride_col_dst, const uint3 channel_ratio, const uint32_t stride_channel_x,
+        const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
+        const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst) {
+#if defined(GCN)
+    constexpr int nlanes = 64/ngroups;
+    constexpr int nvals  = mmvq_gcn_mc_ncols_p2(ncols_dst)*rows;
+
+    const int lane  = threadIdx.x;
+    const int lg    = lane % nlanes;
+    const int row_g = (blockIdx.x*ngroups + lane/nlanes)*rows;
+    const int row_r = row_g + rows <= int(nrows_x) ? row_g : int(nrows_x) - rows;
+
+    const uint32_t channel_dst = blockIdx.y;
+    const uint32_t sample_dst  = blockIdx.z;
+    const uint32_t channel_x   = fastdiv(channel_dst, channel_ratio);
+    const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
+
+    const uint32_t row_bytes = stride_row_x*uint32_t(sizeof(block_q6_K));
+    const char * x0 = (const char *) vx +
+        (size_t(sample_x*stride_sample_x + channel_x*stride_channel_x) + size_t(row_r)*stride_row_x)*sizeof(block_q6_K);
+    const block_q8_1 * y = (const block_q8_1 *) vy + sample_dst*stride_sample_y + channel_dst*stride_channel_y;
+
+    const char * ql[rows];
+    const char * dp[rows];
+#pragma unroll
+    for (int r = 0; r < rows; ++r) {
+        const char * xr = x0 + r*row_bytes;
+        const bool d_first = q6_k_rp_d_first((uintptr_t) xr, nb);
+        ql[r] = xr + (d_first ? 2*nb : 0);
+        dp[r] = d_first ? xr : ql[r] + 208*nb;
+    }
+
+    float a[nvals] = {0.0f};
+
+    for (int iu = lg; iu < int(4*ncols_x/QK_K); iu += nlanes) {
+        const int kb = iu >> 2;
+        const int n  = (iu >> 1) & 1;
+        const int h  = iu & 1;
+
+        int4  vla[rows], vlb[rows], vh[rows];
+        int   sc[rows];
+        float d[rows];
+#pragma unroll
+        for (int r = 0; r < rows; ++r) {
+            const char * pl = ql[r] + (kb*128 + 64*n + 16*h);
+            vla[r] = *(const int4 *) pl;
+            vlb[r] = *(const int4 *) (pl + 32);
+            vh[r]  = *(const int4 *) (ql[r] + (128*nb + kb*64 + 32*n + 16*h));
+            sc[r]  = *(const int  *) (ql[r] + (192*nb + kb*16 + 4*(iu & 3)));
+            d[r]   = 0.25f*__half2float(((const half *) dp[r])[kb]);
+        }
+
+        // activations of two columns at a time: hoisting all of them spills
+        int   uy[2][16];
+        float dy[2][4];
+        const auto load_y = [&](const int j, int * u, float * d8) {
+            const block_q8_1 * by = y + j*stride_col_y + kb*8 + 4*n;
+#pragma unroll
+            for (int g = 0; g < 4; ++g) {
+#pragma unroll
+                for (int t = 0; t < 4; ++t) {
+                    u[4*g + t] = get_int_b4(by[g].qs, 4*h + t);
+                }
+                d8[g] = __low2float(by[g].ds);
+            }
+        };
+        load_y(0, uy[0], dy[0]);
+
+        const auto decode = [&](const int r, const int g, const int t) {
+            const int la[4] = {vla[r].x, vla[r].y, vla[r].z, vla[r].w};
+            const int lb[4] = {vlb[r].x, vlb[r].y, vlb[r].z, vlb[r].w};
+            const int hh[4] = {vh[r].x,  vh[r].y,  vh[r].z,  vh[r].w};
+            const int l = g & 1 ? lb[t] : la[t];
+            return ((g & 2 ? l >> 2 : l << 2) & 0x3C3C3C3C) | ((hh[t] << (6 - 2*g)) & 0xC0C0C0C0);
+        };
+
+        // one column decodes where it uses the weights, more columns decode once
+        int   w[ncols_dst > 1 ? rows : 1][4][4];
+        float fs[rows][4];
+#pragma unroll
+        for (int r = 0; r < rows; ++r) {
+            if constexpr (ncols_dst > 1) {
+#pragma unroll
+                for (int g = 0; g < 4; ++g) {
+#pragma unroll
+                    for (int t = 0; t < 4; ++t) {
+                        w[r][g][t] = decode(r, g, t);
+                    }
+                }
+            }
+#pragma unroll
+            for (int g = 0; g < 4; ++g) {
+                fs[r][g] = d[r]*float(int8_t(sc[r] >> (8*g)));
+            }
+        }
+
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            if constexpr (ncols_dst > 1) {
+                if (j + 1 < ncols_dst) {
+                    load_y(j + 1, uy[(j + 1) & 1], dy[(j + 1) & 1]);
+                }
+                __builtin_amdgcn_sched_barrier(0);
+            }
+            const int   * u  = uy[j & 1];
+            const float * d8 = dy[j & 1];
+#pragma unroll
+            for (int g = 0; g < 4; ++g) {
+#pragma unroll
+                for (int r = 0; r < rows; ++r) {
+                    int sumi = 0;
+#pragma unroll
+                    for (int t = 0; t < 4; ++t) {
+                        sumi = ggml_cuda_dp4a(ncols_dst > 1 ? w[ncols_dst > 1 ? r : 0][g][t] : decode(r, g, t), u[4*g + t], sumi);
+                    }
+                    a[j*rows + r] += fs[r][g]*(d8[g]*float(sumi));
+                }
+            }
+            if constexpr (ncols_dst > 1) {
+                __builtin_amdgcn_sched_barrier(0);
+            }
+        }
+    }
+
+    const uint32_t dst_offset = sample_dst*stride_sample_dst + channel_dst*stride_channel_dst;
+    mmvq_gcn_mc_store<ncols_dst, rows, nlanes, 1, false>(a, dst + dst_offset, nullptr, nullptr, GGML_GLU_OP_SWIGLU,
+        0.0f, stride_col_dst, row_g, row_r);
+#else
+    GGML_UNUSED_VARS(vx, vy, dst, nb, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, channel_ratio,
+        stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio, stride_sample_x, stride_sample_y,
+        stride_sample_dst);
+    NO_DEVICE_CODE;
+#endif // defined(GCN)
+}
 #endif // defined(GGML_USE_HIP)
 
 // Dedicated MoE multi-token kernel.
@@ -2308,6 +2509,94 @@ static bool mul_mat_vec_q_gcn_mc_try(const int ncols_dst, const mmvq_gcn_mc_args
     return mul_mat_vec_q_gcn_mc_switch_ncols<type, false, false>(ncols_dst, waves_per_eu, ngroups, nwarps, pt, stream);
 }
 
+template <int ncols_dst, int rows, int ngroups, int waves_per_eu>
+static void mul_mat_vec_q6_k_rp_launch(const mmvq_gcn_mc_args & p, const int nb, cudaStream_t stream) {
+    const int64_t nblocks = (p.nrows_x + rows*ngroups - 1) / (rows*ngroups);
+    const dim3 block_nums(nblocks, p.nchannels_dst, p.nsamples_dst);
+    const dim3 block_dims(64, 1, 1);
+    mul_mat_vec_q6_k_rp<ncols_dst, rows, ngroups, waves_per_eu><<<block_nums, block_dims, 0, stream>>>(
+        p.vx, p.vy, p.dst, nb, p.ncols_x, p.nrows_x, p.stride_row_x, p.stride_col_y, p.stride_col_dst,
+        p.channel_ratio, p.stride_channel_x, p.stride_channel_y, p.stride_channel_dst, p.sample_ratio,
+        p.stride_sample_x, p.stride_sample_y, p.stride_sample_dst);
+}
+
+// GGML_CUDA_Q6K_PLANES_SHAPE (rows per lane group x lane groups x waves per SIMD): 1 = 4 x 4|8 x 1, 2 = 2 x 4 x 2,
+// 3 = 1 x 4 x 4, 4 = 2 x 4 x 1; 0 picks by columns and rows. 3 and 2 spill above 1 and 4 columns and give way to 2 and 4.
+template <int ncols_dst>
+static int mul_mat_vec_q6_k_rp_shape(const int nrows) {
+    if (nrows >= 65536 || ncols_dst >= 5) {
+        return 1;
+    }
+    if (ncols_dst == 1) {
+        return nrows >= 8192 ? 2 : 4;
+    }
+    return ncols_dst == 4 && nrows >= 8192 ? 1 : 4;
+}
+
+template <int ncols_dst>
+static void mul_mat_vec_q6_k_rp_switch_shape(const mmvq_gcn_mc_args & p, const int nb, cudaStream_t stream) {
+    static const int env_shape = mmvq_gcn_mc_env("GGML_CUDA_Q6K_PLANES_SHAPE", 0);
+    if (p.nrows_x < 4) {
+        mul_mat_vec_q6_k_rp_launch<ncols_dst, 1, 4, 1>(p, nb, stream);
+        return;
+    }
+    int shape = env_shape != 0 ? env_shape : mul_mat_vec_q6_k_rp_shape<ncols_dst>(p.nrows_x);
+    if (shape == 3 && ncols_dst > 1) {
+        shape = 2;
+    }
+    if (shape == 2 && ncols_dst > 4) {
+        shape = 4;
+    }
+    switch (shape) {
+        case 2:
+            if constexpr (ncols_dst <= 4) {
+                mul_mat_vec_q6_k_rp_launch<ncols_dst, 2, 4, 2>(p, nb, stream);
+            }
+            break;
+        case 3:
+            if constexpr (ncols_dst == 1) {
+                mul_mat_vec_q6_k_rp_launch<ncols_dst, 1, 4, 4>(p, nb, stream);
+            }
+            break;
+        case 4:  mul_mat_vec_q6_k_rp_launch<ncols_dst, 2, 4, 1>(p, nb, stream); break;
+        default: mul_mat_vec_q6_k_rp_launch<ncols_dst, 4, ncols_dst <= 4 ? 4 : 8, 1>(p, nb, stream); break;
+    }
+}
+
+static void mul_mat_vec_q6_k_rp_cuda(mmvq_gcn_mc_args p, const int ncols_dst, const int nb, cudaStream_t stream) {
+    for (int j0 = 0; j0 < ncols_dst; j0 += 8) {
+        switch (std::min(8, ncols_dst - j0)) {
+            case  1: mul_mat_vec_q6_k_rp_switch_shape< 1>(p, nb, stream); break;
+            case  2: mul_mat_vec_q6_k_rp_switch_shape< 2>(p, nb, stream); break;
+            case  3: mul_mat_vec_q6_k_rp_switch_shape< 3>(p, nb, stream); break;
+            case  4: mul_mat_vec_q6_k_rp_switch_shape< 4>(p, nb, stream); break;
+            case  5: mul_mat_vec_q6_k_rp_switch_shape< 5>(p, nb, stream); break;
+            case  6: mul_mat_vec_q6_k_rp_switch_shape< 6>(p, nb, stream); break;
+            case  7: mul_mat_vec_q6_k_rp_switch_shape< 7>(p, nb, stream); break;
+            default: mul_mat_vec_q6_k_rp_switch_shape< 8>(p, nb, stream); break;
+        }
+        p.vy  = (const block_q8_1 *) p.vy + 8*p.stride_col_y;
+        p.dst = p.dst + 8*p.stride_col_dst;
+    }
+}
+
+// GGML_CUDA_Q6K_PLANES: 0 off, 1 output.weight and the 2D *.weight tensors of weight buffers (only output.weight with
+// GGML_CUDA_Q6K_PLANES_ALL=0), 2 every Q6_K tensor it can take (for test-backend-ops)
+static int q6_k_planes_mode() {
+    static const int mode = mmvq_gcn_mc_env("GGML_CUDA_Q6K_PLANES", 1);
+    return mode;
+}
+
+struct q6_k_planes_range {
+    const char * lo;
+    const char * hi;
+    int64_t      ne0;
+};
+
+static std::mutex                                q6_k_planes_mutex;
+static std::map<const char *, q6_k_planes_range> q6_k_planes_ranges;
+static std::atomic<int>                          q6_k_planes_count{0};
+
 struct mmvq_gcn_wide_args {
     const void * vx;
     const block_q8_1_mmq * vy;
@@ -2506,7 +2795,175 @@ static void q8_0_planes_rw(const char * lo, char * ptr, void * host, const size_
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaFree(tmp));
 }
+
 #endif // defined(GGML_USE_HIP)
+
+bool ggml_cuda_q6_k_planes_eligible(const ggml_tensor * tensor, const int device) {
+#if defined(GGML_USE_HIP)
+    const int mode = q6_k_planes_mode();
+    if (mode == 0 || tensor->type != GGML_TYPE_Q6_K || tensor->view_src != nullptr || !ggml_is_contiguous(tensor) ||
+            tensor->ne[0] % QK_K != 0 || tensor->ne[0] / QK_K > 192 ||
+            !GGML_CUDA_CC_IS_GCN(ggml_cuda_info().devices[device].cc)) {
+        return false;
+    }
+    if (mode == 2 || strcmp(tensor->name, "output.weight") == 0) {
+        return true;
+    }
+    static const bool all = mmvq_gcn_mc_env("GGML_CUDA_Q6K_PLANES_ALL", 1) != 0;
+    const size_t len = strlen(tensor->name);
+    return all && tensor->ne[2] == 1 && tensor->ne[3] == 1 && tensor->buffer != nullptr &&
+        ggml_backend_buffer_get_usage(tensor->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+        len > 7 && strcmp(tensor->name + len - 7, ".weight") == 0;
+#else
+    GGML_UNUSED_VARS(tensor, device);
+    return false;
+#endif // defined(GGML_USE_HIP)
+}
+
+void ggml_cuda_q6_k_planes_repack(const ggml_tensor * tensor, cudaStream_t stream) {
+#if defined(GGML_USE_HIP)
+    const int nb = tensor->ne[0] / QK_K;
+    q6_k_rp_repack<<<ggml_nrows(tensor), 256, nb*sizeof(block_q6_K), stream>>>((char *) tensor->data, nb);
+    CUDA_CHECK(cudaGetLastError());
+
+    std::lock_guard<std::mutex> lock(q6_k_planes_mutex);
+    const char * lo = (const char *) tensor->data;
+    q6_k_planes_ranges[lo] = {lo, lo + ggml_nbytes(tensor), tensor->ne[0]};
+    q6_k_planes_count = (int) q6_k_planes_ranges.size();
+#else
+    GGML_UNUSED_VARS(tensor, stream);
+#endif // defined(GGML_USE_HIP)
+}
+
+#if defined(GGML_USE_HIP)
+static bool q6_k_planes_find(const void * ptr, q6_k_planes_range & out) {
+    if (q6_k_planes_count.load(std::memory_order_relaxed) == 0) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(q6_k_planes_mutex);
+    auto it = q6_k_planes_ranges.upper_bound((const char *) ptr);
+    if (it == q6_k_planes_ranges.begin()) {
+        return false;
+    }
+    --it;
+    if ((const char *) ptr >= it->second.hi) {
+        return false;
+    }
+    out = it->second;
+    return true;
+}
+
+// Reads or writes [ptr, ptr + size) of a tensor in planes in the canonical layout, through whole rows.
+static void q6_k_planes_rw(const q6_k_planes_range & r, char * ptr, void * host, const size_t size, const bool write,
+        cudaStream_t stream) {
+    const int     nb        = r.ne0 / QK_K;
+    const size_t  row_bytes = nb*sizeof(block_q6_K);
+    const size_t  off       = ptr - r.lo;
+    const int64_t r0        = off / row_bytes;
+    const int64_t r1        = (off + size + row_bytes - 1) / row_bytes;
+    char * rows = (char *) r.lo + r0*row_bytes;
+    char * tmp  = nullptr;
+    CUDA_CHECK(cudaMalloc((void **) &tmp, (r1 - r0)*row_bytes));
+    q6_k_rp_unpack<<<r1 - r0, 256, 0, stream>>>(rows, tmp, nb);
+    CUDA_CHECK(cudaGetLastError());
+    if (write) {
+        CUDA_CHECK(cudaMemcpyAsync(tmp + (off - r0*row_bytes), host, size, cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(rows, tmp, (r1 - r0)*row_bytes, cudaMemcpyDeviceToDevice, stream));
+        q6_k_rp_repack<<<r1 - r0, 256, nb*sizeof(block_q6_K), stream>>>(rows, nb);
+        CUDA_CHECK(cudaGetLastError());
+    } else {
+        CUDA_CHECK(cudaMemcpyAsync(host, tmp + (off - r0*row_bytes), size, cudaMemcpyDeviceToHost, stream));
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaFree(tmp));
+}
+#endif // defined(GGML_USE_HIP)
+
+bool ggml_cuda_q6_k_planes_get(const ggml_tensor * tensor, void * data, const size_t offset, const size_t size, cudaStream_t stream) {
+#if defined(GGML_USE_HIP)
+    q6_k_planes_range r;
+    if (!q6_k_planes_find(tensor->data, r)) {
+        return false;
+    }
+    q6_k_planes_rw(r, (char *) tensor->data + offset, data, size, false, stream);
+    return true;
+#else
+    GGML_UNUSED_VARS(tensor, data, offset, size, stream);
+    return false;
+#endif // defined(GGML_USE_HIP)
+}
+
+bool ggml_cuda_q6_k_planes_set(const ggml_tensor * tensor, const void * data, const size_t offset, const size_t size, cudaStream_t stream) {
+#if defined(GGML_USE_HIP)
+    q6_k_planes_range r;
+    if (!q6_k_planes_find(tensor->data, r) || (tensor->view_src == nullptr && offset == 0 && size == ggml_nbytes(tensor))) {
+        return false;
+    }
+    q6_k_planes_rw(r, (char *) tensor->data + offset, const_cast<void *>(data), size, true, stream);
+    return true;
+#else
+    GGML_UNUSED_VARS(tensor, data, offset, size, stream);
+    return false;
+#endif // defined(GGML_USE_HIP)
+}
+
+void ggml_cuda_q6_k_planes_forget(const void * base, const size_t size) {
+#if defined(GGML_USE_HIP)
+    if (q6_k_planes_count.load(std::memory_order_relaxed) == 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(q6_k_planes_mutex);
+    const char * lo = (const char *) base;
+    q6_k_planes_ranges.erase(q6_k_planes_ranges.lower_bound(lo), q6_k_planes_ranges.lower_bound(lo + size));
+    q6_k_planes_count = (int) q6_k_planes_ranges.size();
+#else
+    GGML_UNUSED_VARS(base, size);
+#endif // defined(GGML_USE_HIP)
+}
+
+int64_t ggml_cuda_q6_k_planes_ne0(const ggml_tensor * src0) {
+#if defined(GGML_USE_HIP)
+    q6_k_planes_range r;
+    if (src0->type != GGML_TYPE_Q6_K || !q6_k_planes_find(src0->data, r)) {
+        return 0;
+    }
+    return r.ne0;
+#else
+    GGML_UNUSED(src0);
+    return 0;
+#endif // defined(GGML_USE_HIP)
+}
+
+size_t ggml_cuda_q6_k_planes_nbytes(const ggml_tensor * src0) {
+#if defined(GGML_USE_HIP)
+    q6_k_planes_range r;
+    if (src0->type != GGML_TYPE_Q6_K || !q6_k_planes_find(src0->data, r)) {
+        return 0;
+    }
+    return r.hi - r.lo;
+#else
+    GGML_UNUSED(src0);
+    return 0;
+#endif // defined(GGML_USE_HIP)
+}
+
+char * ggml_cuda_q6_k_planes_unpack(const ggml_tensor * src0, char * dst, cudaStream_t stream) {
+#if defined(GGML_USE_HIP)
+    q6_k_planes_range r;
+    GGML_ASSERT(q6_k_planes_find(src0->data, r));
+    const int nb = r.ne0 / QK_K;
+    q6_k_rp_unpack<<<(r.hi - r.lo) / (nb*sizeof(block_q6_K)), 256, 0, stream>>>(r.lo, dst, nb);
+    CUDA_CHECK(cudaGetLastError());
+    return dst + ((const char *) src0->data - r.lo);
+#else
+    GGML_UNUSED_VARS(src0, stream);
+    return dst;
+#endif // defined(GGML_USE_HIP)
+}
+
+bool ggml_cuda_q6_k_planes(const ggml_tensor * src0) {
+    return ggml_cuda_q6_k_planes_ne0(src0) != 0;
+}
 
 bool ggml_cuda_q8_0_planes_eligible(const ggml_tensor * tensor, const int device) {
 #if defined(GGML_USE_HIP)
@@ -3375,6 +3832,20 @@ void ggml_cuda_mul_mat_vec_q(
             src0->data, src1_q8_1, ids_d, fusion_local, dst_d, ne00, ne01, ncols_dst, s01, stride_col_y, stride_col_dst,
             ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
             ne03, ne3, s03, s13, s3, ids_stride, stream);
+        return;
+    }
+#endif // defined(GGML_USE_HIP)
+
+#if defined(GGML_USE_HIP)
+    if (const int64_t ne0_planes = ids ? 0 : ggml_cuda_q6_k_planes_ne0(src0)) {
+        GGML_ASSERT(!fusion && ne00 <= ne0_planes);
+        const mmvq_gcn_mc_args p = {
+            src0->data, src1_q8_1, fusion_local, dst_d, int(ne00), int(ne01), int(s01), int(stride_col_y),
+            int(stride_col_dst), init_fastdiv_values(nchannels_dst / ne02), int(s02), int(stride_channel_y),
+            int(stride_channel_dst), init_fastdiv_values(ne3 / ne03), int(s03), int(s13), int(s3), int(nchannels_dst),
+            int(ne3),
+        };
+        mul_mat_vec_q6_k_rp_cuda(p, ncols_dst, int(ne0_planes / QK_K), stream);
         return;
     }
 #endif // defined(GGML_USE_HIP)

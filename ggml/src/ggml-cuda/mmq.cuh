@@ -1071,9 +1071,12 @@ static constexpr __device__ int ggml_cuda_mmq_get_vdr() {
 
 template <ggml_type type, int J, bool fallback, ggml_prec prec_src1, bool has_fusion, bool planes = false, bool grid_lds = false>
 static constexpr __device__ ggml_cuda_mmq_load_tiles_t ggml_cuda_mmq_get_load_tiles() {
-    if constexpr (planes) {
-        static_assert(type == GGML_TYPE_Q8_0 && !has_fusion, "planes are Q8_0 only, without fusion");
+    if constexpr (planes && type == GGML_TYPE_Q8_0) {
+        static_assert(!has_fusion, "planes without fusion");
         return ggml_cuda_mmq_load_tiles_q8_0_planes<type, J, fallback>;
+    } else if constexpr (planes) {
+        static_assert(type == GGML_TYPE_Q6_K && !has_fusion, "planes are Q8_0 and Q6_K only, without fusion");
+        return ggml_cuda_mmq_load_tiles_q6_K_planes<type, J, fallback>;
     } else if constexpr (grid_lds && type == GGML_TYPE_IQ3_XXS) {
         return ggml_cuda_mmq_load_tiles_iq3_xxs<type, J, fallback, true>;
     } else if constexpr (grid_lds && type == GGML_TYPE_IQ3_S) {
@@ -1260,7 +1263,11 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     const int nsteps_live = partial_j ? ggml_cuda_mmq_dp4a_nsteps_live<type, J, fallback, prec_src1>(tile_y_j_sup) : 0;
 
     for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
-        load_tiles(x, x_gate, tile_x, offset_x + kb0, tile_x_i_max, stride_row_x);
+        if constexpr (planes && type == GGML_TYPE_Q6_K) {
+            load_tiles(x + int64_t(offset_x)*int64_t(sizeof(block_q6_K)), x_gate, tile_x, kb0, tile_x_i_max, stride_row_x);
+        } else {
+            load_tiles(x, x_gate, tile_x, offset_x + kb0, tile_x_i_max, stride_row_x);
+        }
 
         if constexpr (y_smem) {
             const int * by0 = ggml_cuda_mmq_y_smem_ptr(y + ncols_y * (kb0 * qk / ne_block) * sz);
@@ -1772,7 +1779,7 @@ struct mmq_args {
     int64_t ntj;
     int J_best; // Tile width in ne11(dense)/ne12(MoE) direction to use for optimal performance.
     ggml_cuda_mm_fusion_args_device fusion = {}; // gate != nullptr selects the fused gate/up/GLU path
-    bool planes = false; // Q8_0 x in planes
+    bool planes = false; // Q8_0 or Q6_K x in planes
 };
 
 static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc, const bool y_smem = false) {
@@ -2134,19 +2141,22 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
 }
 
 // Entry of a translation unit built with GGML_MMQ_GCN_VARIANT == gcn_variant; the host code it reaches has internal linkage.
-template <ggml_type type, int gcn_variant>
+template <ggml_type type, int gcn_variant, bool planes = false>
 void mul_mat_q_case_gcn_variant(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     static_assert(gcn_variant == GGML_MMQ_GCN_VARIANT, "a GCN config variant needs its own translation unit");
-    mul_mat_q_case_impl<type, GGML_PREC_Q8, false>(ctx, args, stream);
+    mul_mat_q_case_impl<type, GGML_PREC_Q8, planes>(ctx, args, stream);
 }
 
 #define DECL_MMQ_CASE_GCN_VARIANT(type, gcn_variant)                               \
     template void mul_mat_q_case_gcn_variant<type, gcn_variant>(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) \
 
+#define DECL_MMQ_CASE_GCN_VARIANT_PLANES(type, gcn_variant)                        \
+    template void mul_mat_q_case_gcn_variant<type, gcn_variant, true>(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) \
+
 #define DECL_MMQ_CASE(type)                                                        \
     template void mul_mat_q_case<type, GGML_PREC_Q8>(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) \
 
-// Q8_0 weights in planes (gfx906), see ggml_cuda_q8_0_planes.
+// Q8_0 and Q6_K weights in planes (gfx906), see ggml_cuda_q8_0_planes and ggml_cuda_q6_k_planes.
 #define DECL_MMQ_CASE_PLANES(type)                                                 \
     template void mul_mat_q_case<type, GGML_PREC_Q8, true>(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) \
 
@@ -2168,6 +2178,7 @@ extern DECL_MMQ_CASE(GGML_TYPE_Q3_K);
 extern DECL_MMQ_CASE(GGML_TYPE_Q4_K);
 extern DECL_MMQ_CASE(GGML_TYPE_Q5_K);
 extern DECL_MMQ_CASE(GGML_TYPE_Q6_K);
+extern DECL_MMQ_CASE_PLANES(GGML_TYPE_Q6_K);
 // -----------------------------------------
 extern DECL_MMQ_CASE(GGML_TYPE_IQ1_S);
 extern DECL_MMQ_CASE(GGML_TYPE_IQ2_XXS);
@@ -2186,6 +2197,7 @@ extern DECL_MMQ_CASE_W4A4(GGML_TYPE_NVFP4);
 extern DECL_MMQ_CASE_GCN_VARIANT(GGML_TYPE_Q3_K,    1);
 extern DECL_MMQ_CASE_GCN_VARIANT(GGML_TYPE_Q5_K,    1);
 extern DECL_MMQ_CASE_GCN_VARIANT(GGML_TYPE_Q6_K,    1);
+extern DECL_MMQ_CASE_GCN_VARIANT_PLANES(GGML_TYPE_Q6_K, 1);
 extern DECL_MMQ_CASE_GCN_VARIANT(GGML_TYPE_IQ3_XXS, 1);
 extern DECL_MMQ_CASE_GCN_VARIANT(GGML_TYPE_IQ3_S,   1);
 extern DECL_MMQ_CASE_GCN_VARIANT(GGML_TYPE_IQ4_XS,  1);
