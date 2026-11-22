@@ -1928,10 +1928,11 @@ static void mmq_gcn_log(const ggml_type type, const ggml_cuda_mmq_config & confi
 
 // GGML_MMQ_Y_SMEM: widest column tile that reads y through the scalar cache, 0 turns it off. Wider tiles miss the
 // scalar cache (blocks running at the same time work on different columns) and wait on L2/HBM for every few dp4a.
+// At most 64: the y_smem translation units have the variant 0 configs only, without the 96/128-column tiles of variant 1.
 static int ggml_cuda_mmq_y_smem_max_j(const int cc) {
     static const int max_j = [] {
         const char * env = getenv("GGML_MMQ_Y_SMEM");
-        return env == nullptr ? 16 : atoi(env);
+        return env == nullptr ? 16 : std::min(atoi(env), 64);
     }();
     return GGML_CUDA_CC_IS_GCN(cc) ? max_j : 0;
 }
