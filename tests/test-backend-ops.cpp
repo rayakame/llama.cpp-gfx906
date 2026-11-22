@@ -6048,6 +6048,51 @@ struct test_mul_mat_big : public test_mul_mat {
     }
 };
 
+// MUL_MAT on an m x k view of a k_p x m_p matrix that starts offs blocks into it and steps s1 blocks per row
+struct test_mul_mat_view : public test_case {
+    const ggml_type type_a;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const int64_t k_p;
+    const int64_t m_p;
+    const int64_t offs;
+    const int64_t s1;
+
+    std::string vars() override {
+        return VARS_TO_STR8(type_a, m, n, k, k_p, m_p, offs, s1);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * m * n * k;
+    }
+
+    test_mul_mat_view(ggml_type type_a, int64_t m, int64_t n, int64_t k, int64_t k_p, int64_t m_p, int64_t offs, int64_t s1)
+        : type_a(type_a), m(m), n(n), k(k), k_p(k_p), m_p(m_p), offs(offs), s1(s1) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const size_t ts = ggml_type_size(type_a);
+        GGML_ASSERT(offs*ts + (m - 1)*s1*ts + ggml_row_size(type_a, k) <= ggml_row_size(type_a, k_p)*m_p);
+
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k_p, m_p);
+        ggml_set_name(a, "a");
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * a_v = ggml_view_2d(ctx, a, k, m, s1*ts, offs*ts);
+        ggml_set_name(a_v, "view_of_a");
+
+        ggml_tensor * out = ggml_mul_mat(ctx, a_v, b);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // Output head shapes: 64 random rows repeated, since quantizing a 1 GB matrix on the CPU takes longer than timing it
 struct test_mul_mat_head : public test_mul_mat {
     test_mul_mat_head(ggml_type type_a, int64_t m, int64_t n, int64_t k)
@@ -12408,6 +12453,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 1024, n, 1024, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 1000, n, 1024, {1, 1}, {1, 1}, {0, 1, 2, 3}, 1280));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 64, n, 5120, {3, 2}, {2, 1}));
+    }
+
+    // views of a Q8_0 matrix (in planes with GGML_CUDA_Q8_0_PLANES=2) that start on a group of 8 blocks or inside one,
+    // with a row or batch stride of whole groups or not
+    for (int64_t n : {1, 3, 8, 12, 32}) {
+        test_cases.emplace_back(new test_mul_mat_view(GGML_TYPE_Q8_0, 100, n, 256, 512, 110, 8, 16));
+        test_cases.emplace_back(new test_mul_mat_view(GGML_TYPE_Q8_0, 100, n, 256, 512, 110, 1, 16));
+        test_cases.emplace_back(new test_mul_mat_view(GGML_TYPE_Q8_0, 100, n, 256, 512, 110, 0, 17));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 16, n, 256, {2, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 17, 34));
     }
 
     // MMQ tile configs with whole 128-row tiles: every column tile width the tables use, stream-k (few tiles) and tiling (many)

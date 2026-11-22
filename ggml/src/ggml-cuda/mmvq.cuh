@@ -23,8 +23,11 @@ bool ggml_cuda_q8_0_planes_get(const ggml_tensor * tensor, void * data, size_t o
 bool ggml_cuda_q8_0_planes_set(const ggml_tensor * tensor, const void * data, size_t offset, size_t size, cudaStream_t stream);
 void ggml_cuda_q8_0_planes_forget(const void * base, size_t size);
 bool ggml_cuda_q8_0_planes(const ggml_tensor * tensor);
-// Writes the canonical layout of the tensor's bytes, rounded up to whole groups of 8 blocks, to dst.
-void ggml_cuda_q8_0_planes_unpack(const ggml_tensor * tensor, void * dst, cudaStream_t stream);
+// Whether the planes kernels can read the tensor in place: it starts on a group of 8 blocks and its strides are whole groups.
+bool ggml_cuda_q8_0_planes_direct(const ggml_tensor * tensor);
+// The whole groups that the tensor's bytes are in, in the canonical layout: their size, and where the tensor's data lands in dst.
+size_t ggml_cuda_q8_0_planes_nbytes(const ggml_tensor * tensor);
+char * ggml_cuda_q8_0_planes_unpack(const ggml_tensor * tensor, char * dst, cudaStream_t stream);
 // gfx906: Q6_K weights are rearranged into planes when their last bytes are uploaded; only the mat-vec and MMQ read them then.
 bool ggml_cuda_q6_k_planes_eligible(const ggml_tensor * tensor, int device);
 void ggml_cuda_q6_k_planes_repack(const ggml_tensor * tensor, cudaStream_t stream);

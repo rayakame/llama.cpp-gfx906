@@ -3237,12 +3237,52 @@ void ggml_cuda_planes_written(const ggml_tensor * tensor, const int device, cuda
     }
 }
 
-void ggml_cuda_q8_0_planes_unpack(const ggml_tensor * tensor, void * dst, cudaStream_t stream) {
+bool ggml_cuda_q8_0_planes_direct(const ggml_tensor * tensor) {
 #if defined(GGML_USE_HIP)
+    constexpr size_t gs = 8*sizeof(block_q8_0);
     const char * lo;
-    GGML_ASSERT(q8_0_planes_find(tensor->data, &lo) && ((const char *) tensor->data - lo) % (8*sizeof(block_q8_0)) == 0);
-    const int64_t ngroups = (ggml_nbytes(tensor) + 8*sizeof(block_q8_0) - 1) / (8*sizeof(block_q8_0));
-    q8_0_planes_convert_cuda((const char *) tensor->data, (char *) dst, ngroups, false, stream);
+    return tensor->type == GGML_TYPE_Q8_0 && q8_0_planes_find(tensor->data, &lo) && ((const char *) tensor->data - lo) % gs == 0 &&
+        tensor->nb[1] % gs == 0 && tensor->nb[2] % gs == 0 && tensor->nb[3] % gs == 0;
+#else
+    GGML_UNUSED(tensor);
+    return false;
+#endif // defined(GGML_USE_HIP)
+}
+
+#if defined(GGML_USE_HIP)
+// The whole groups that the tensor's bytes are in: the first one, their number and the tensor's offset in the first.
+static void q8_0_planes_span(const ggml_tensor * tensor, const char ** g0, int64_t * ngroups, size_t * off) {
+    constexpr size_t gs = 8*sizeof(block_q8_0);
+    const char * lo;
+    GGML_ASSERT(q8_0_planes_find(tensor->data, &lo));
+    const size_t rel = (const char *) tensor->data - lo;
+    *off     = rel % gs;
+    *g0      = lo + (rel - *off);
+    *ngroups = (*off + ggml_nbytes(tensor) + gs - 1) / gs;
+}
+#endif // defined(GGML_USE_HIP)
+
+size_t ggml_cuda_q8_0_planes_nbytes(const ggml_tensor * tensor) {
+#if defined(GGML_USE_HIP)
+    const char * g0;
+    int64_t ngroups;
+    size_t off;
+    q8_0_planes_span(tensor, &g0, &ngroups, &off);
+    return ngroups*8*sizeof(block_q8_0);
+#else
+    GGML_UNUSED(tensor);
+    return 0;
+#endif // defined(GGML_USE_HIP)
+}
+
+char * ggml_cuda_q8_0_planes_unpack(const ggml_tensor * tensor, char * dst, cudaStream_t stream) {
+#if defined(GGML_USE_HIP)
+    const char * g0;
+    int64_t ngroups;
+    size_t off;
+    q8_0_planes_span(tensor, &g0, &ngroups, &off);
+    q8_0_planes_convert_cuda(g0, dst, ngroups, false, stream);
+    return dst + off;
 #else
     GGML_UNUSED_VARS(tensor, dst, stream);
     GGML_ABORT("Q8_0 planes need HIP");
@@ -3917,23 +3957,25 @@ void ggml_cuda_mul_mat_vec_q(
     GGML_ASSERT(!ids || ne12 <= MMVQ_MAX_BATCH_SIZE);
 
 #if defined(GGML_USE_HIP)
-    // only the dense kernels read Q8_0 planes; the others get canonical copies
+    // only the dense kernels read Q8_0 planes, from a group on; the others get canonical copies
+    bool src0_planes = false;
     {
         const ggml_tensor * w[4] = { src0, fusion ? fusion->gate : nullptr, fusion ? fusion->shared_up : nullptr, fusion ? fusion->shared_gate : nullptr };
         bool p[4];
+        bool direct = true;
         for (int k = 0; k < 4; ++k) {
             p[k] = w[k] && ggml_cuda_q8_0_planes(w[k]);
+            direct = direct && (!p[k] || ggml_cuda_q8_0_planes_direct(w[k]));
         }
         const bool dense = !ids && !w[2];
-        if ((!dense && (p[0] || p[1] || p[2] || p[3])) || (w[1] && p[0] != p[1])) {
+        if (!direct || (!dense && (p[0] || p[1] || p[2] || p[3])) || (w[1] && p[0] != p[1])) {
             ggml_cuda_pool_alloc<char> buf[4];
             ggml_tensor                canonical[4];
             for (int k = 0; k < 4; ++k) {
                 if (p[k]) {
-                    buf[k].alloc(ctx.pool(), GGML_PAD(ggml_nbytes(w[k]), 8*sizeof(block_q8_0)));
-                    ggml_cuda_q8_0_planes_unpack(w[k], buf[k].get(), stream);
+                    buf[k].alloc(ctx.pool(), ggml_cuda_q8_0_planes_nbytes(w[k]));
                     canonical[k]      = *w[k];
-                    canonical[k].data = buf[k].get();
+                    canonical[k].data = ggml_cuda_q8_0_planes_unpack(w[k], buf[k].get(), stream);
                     w[k]              = &canonical[k];
                 }
             }
@@ -3948,6 +3990,7 @@ void ggml_cuda_mul_mat_vec_q(
             }
             return;
         }
+        src0_planes = p[0];
     }
 #endif // defined(GGML_USE_HIP)
 
@@ -4075,7 +4118,7 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
 #if defined(GGML_USE_HIP)
-    if (ggml_cuda_q8_0_planes(src0)) {
+    if (src0_planes) {
         mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q8_0, false, true>(
             src0->data, src1_q8_1, ids_d, fusion_local, dst_d, ne00, ne01, ncols_dst, s01, stride_col_y, stride_col_dst,
             ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,

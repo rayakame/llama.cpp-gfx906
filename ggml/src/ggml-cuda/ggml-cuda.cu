@@ -2325,10 +2325,10 @@ static bool ggml_cuda_should_fuse_mul_mat_q(const ggml_tensor * up, const ggml_t
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
-// Q8_0 weights in planes: the paths that do not read planes get a canonical copy.
+// Q8_0 weights in planes: the paths that do not read planes, and views that do not start on a group, get a canonical copy.
 static void ggml_cuda_mul_mat_q8_0_planes(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
-    if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && dst->op != GGML_OP_MUL_MAT_ID) {
+    if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && dst->op != GGML_OP_MUL_MAT_ID && ggml_cuda_q8_0_planes_direct(src0)) {
         // the wide 9..16 column mat-vec reads the canonical layout
         if (src1->ne[1] <= MMVQ_MAX_BATCH_SIZE && ggml_cuda_should_use_mmvq(src0->type, cc, src1->ne[1], src0->ne[1])) {
             ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
@@ -2352,10 +2352,12 @@ static void ggml_cuda_mul_mat_q8_0_planes(ggml_backend_cuda_context & ctx, const
             return;
         }
     }
-    ggml_cuda_pool_alloc<char> canonical(ctx.pool(), GGML_PAD(ggml_nbytes(src0), 8*sizeof(block_q8_0)));
-    ggml_cuda_q8_0_planes_unpack(src0, canonical.get(), ctx.stream());
+    const size_t nbytes = ggml_cuda_q8_0_planes_nbytes(src0);
+    const size_t npad   = ggml_row_size(GGML_TYPE_Q8_0, MATRIX_ROW_PADDING);
+    ggml_cuda_pool_alloc<char> canonical(ctx.pool(), nbytes + npad);
+    CUDA_CHECK(cudaMemsetAsync(canonical.get() + nbytes, 0, npad, ctx.stream()));
     ggml_tensor src0_c = *src0;
-    src0_c.data = canonical.get();
+    src0_c.data = ggml_cuda_q8_0_planes_unpack(src0, canonical.get(), ctx.stream());
     if (dst->op == GGML_OP_MUL_MAT_ID) {
         ggml_tensor dst_c = *dst;
         dst_c.src[0] = &src0_c;
