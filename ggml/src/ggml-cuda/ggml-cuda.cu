@@ -4191,7 +4191,8 @@ static bool ggml_cuda_add_rms_norm_mul_matches(const ggml_cgraph * cgraph, int n
     const ggml_tensor * a        = add->src[0];
     const ggml_tensor * b        = add->src[1];
 
-    if (rms_norm->src[0] != add || (mul->src[0] != rms_norm && mul->src[1] != rms_norm)) {
+    // exactly one operand is the norm: in MUL(norm, norm) w would be the norm output, which the fused kernel never writes
+    if (rms_norm->src[0] != add || (mul->src[0] == rms_norm) == (mul->src[1] == rms_norm)) {
         return false;
     }
     const ggml_tensor * w = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];

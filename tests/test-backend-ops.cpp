@@ -4296,6 +4296,7 @@ struct test_add_rms_norm_mul : public test_case {
     const std::array<int64_t, 4> ne;
     const bool inplace;
     const ggml_type type_mm; // GGML_TYPE_COUNT: no mat-mul on the result
+    const bool norm_sq;      // MUL(norm, norm) instead of MUL(norm, w)
     ggml_tensor * sum = nullptr;
     ggml_tensor * out = nullptr;
 
@@ -4309,28 +4310,34 @@ struct test_add_rms_norm_mul : public test_case {
     std::vector<ggml_tensor *> fusion_test_nodes() override { return { sum, out }; }
 
     std::string vars() override {
-        return VARS_TO_STR2(ne, inplace) + ",type_mm=" + (type_mm == GGML_TYPE_COUNT ? "none" : ggml_type_name(type_mm));
+        return VARS_TO_STR2(ne, inplace) + ",type_mm=" + (type_mm == GGML_TYPE_COUNT ? "none" : ggml_type_name(type_mm)) +
+            (norm_sq ? ",norm_sq=1" : "");
     }
 
     double max_nmse_err() override {
         return type_mm == GGML_TYPE_COUNT ? 1e-7 : 5e-4;
     }
 
-    test_add_rms_norm_mul(std::array<int64_t, 4> ne = {64, 5, 4, 3}, bool inplace = false, ggml_type type_mm = GGML_TYPE_COUNT)
-        : ne(ne), inplace(inplace), type_mm(type_mm) {}
+    test_add_rms_norm_mul(std::array<int64_t, 4> ne = {64, 5, 4, 3}, bool inplace = false, ggml_type type_mm = GGML_TYPE_COUNT,
+            bool norm_sq = false)
+        : ne(ne), inplace(inplace), type_mm(type_mm), norm_sq(norm_sq) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
         ggml_tensor * b = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
-        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
         ggml_set_name(a, "a");
         ggml_set_name(b, "b");
-        ggml_set_name(w, "w");
 
         sum = inplace ? ggml_add_inplace(ctx, a, b) : ggml_add(ctx, a, b);
         ggml_set_name(sum, "sum");
 
-        out = ggml_mul(ctx, ggml_rms_norm(ctx, sum, 1e-6f), w);
+        ggml_tensor * norm = ggml_rms_norm(ctx, sum, 1e-6f);
+        ggml_tensor * w    = norm;
+        if (!norm_sq) {
+            w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+            ggml_set_name(w, "w");
+        }
+        out = ggml_mul(ctx, norm, w);
         if (type_mm != GGML_TYPE_COUNT) {
             ggml_tensor * m = ggml_new_tensor_2d(ctx, type_mm, ne[0], 256);
             ggml_set_name(m, "m");
@@ -11975,6 +11982,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_add_rms_norm_mul({64, 5, 4, 3}, inplace));
         test_cases.emplace_back(new test_add_rms_norm_mul({1025, 3, 2, 1}, inplace));
         test_cases.emplace_back(new test_add_rms_norm_mul({20480, 2, 1, 1}, inplace));
+        test_cases.emplace_back(new test_add_rms_norm_mul({5120, 4, 1, 1}, inplace, GGML_TYPE_COUNT, true));
     }
     for (ggml_type type_mm : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
         for (int64_t n : {1, 2, 4, 8, 16}) {
