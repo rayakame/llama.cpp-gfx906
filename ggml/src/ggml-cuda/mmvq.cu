@@ -99,6 +99,25 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda_gcn_kvdr4(ggml_t
     return type == GGML_TYPE_Q4_K ? vec_dot_q4_K_q8_1_gcn : type == GGML_TYPE_Q5_K ? vec_dot_q5_K_q8_1_gcn : nullptr;
 }
 
+// GCN: Q4_K/Q5_K mat-vec lanes read dm and the scales with one dwordx4 (vecdotq.cuh); GGML_MMVQ_GCN_KHDR=0 keeps the ushort loads.
+static constexpr __host__ __device__ bool mmvq_gcn_khdr_type(ggml_type type) {
+    return type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K;
+}
+
+static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda_gcn_khdr(ggml_type type) {
+    return type == GGML_TYPE_Q4_K ? vec_dot_q4_K_q8_1_hdr : type == GGML_TYPE_Q5_K ? vec_dot_q5_K_q8_1_hdr : get_vec_dot_q_cuda(type);
+}
+
+#if defined(GGML_USE_HIP)
+static bool mmvq_gcn_khdr_enabled() {
+    static const bool enabled = [] {
+        const char * s = getenv("GGML_MMVQ_GCN_KHDR");
+        return s == nullptr || atoi(s) != 0;
+    }();
+    return enabled;
+}
+#endif // defined(GGML_USE_HIP)
+
 static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q1_0:    return VDR_Q1_0_Q8_1_MMVQ;
@@ -767,7 +786,7 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
     return 1;
 }
 
-template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, bool aligned_b2 = false, bool planes = false, bool iq_signs = false, bool grid_lds = false, bool kvdr4 = false, int shape = 0>
+template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, bool aligned_b2 = false, bool planes = false, bool iq_signs = false, bool grid_lds = false, bool kvdr4 = false, int shape = 0, bool khdr = false>
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters, shape)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
@@ -791,7 +810,8 @@ static __global__ void mul_mat_vec_q(
     constexpr int rows_per_cuda_block = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps, shape);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
-    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = kvdr4 ? get_vec_dot_q_cuda_gcn_kvdr4(type) : get_vec_dot_q_cuda(type, aligned_b2, iq_signs, grid_lds);
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = kvdr4 ? get_vec_dot_q_cuda_gcn_kvdr4(type) :
+        khdr && table_id == MMVQ_PARAMETERS_GCN ? get_vec_dot_q_cuda_gcn_khdr(type) : get_vec_dot_q_cuda(type, aligned_b2, iq_signs, grid_lds);
 
     const     int tid = warp_size*threadIdx.y + threadIdx.x;
     const     int row0 = rows_per_cuda_block*blockIdx.x;
@@ -1594,7 +1614,7 @@ static __device__ __forceinline__ void mmvq_gcn_grp_tile_load(mmvq_gcn_i32x4 * b
     }
 }
 
-template <ggml_type type, int ncols_dst, int ngroups, int nwarps, int waves_per_eu, int rows, bool lds, bool iq_signs = false, bool kf = false>
+template <ggml_type type, int ncols_dst, int ngroups, int nwarps, int waves_per_eu, int rows, bool lds, bool iq_signs = false, bool kf = false, bool khdr = false>
 __launch_bounds__(nwarps*64, waves_per_eu)
 static __global__ void mul_mat_vec_q_gcn_grp(
         const void * __restrict__ vx, const void * __restrict__ vy, const ggml_cuda_mm_fusion_args_device fusion,
@@ -1612,7 +1632,7 @@ static __global__ void mul_mat_vec_q_gcn_grp(
     constexpr int lpb    = qi/vdr;
     static_assert(nlanes % lpb == 0, "a group must cover whole blocks");
     constexpr int nvals  = mmvq_gcn_mc_ncols_p2(ncols_dst)*rows;
-    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type, false, iq_signs);
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = khdr ? get_vec_dot_q_cuda_gcn_khdr(type) : get_vec_dot_q_cuda(type, false, iq_signs);
 
     const int lane  = threadIdx.x;
     const int lg    = lane % nlanes;
@@ -2361,6 +2381,14 @@ static void mul_mat_vec_q_gcn_grp_launch(const mmvq_gcn_mc_args & p, cudaStream_
     if constexpr (type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S) {
         if (p.iq_signs) {
             kernel = mul_mat_vec_q_gcn_grp<type, c_ncols_dst, ngroups, nwarps, waves_per_eu, rows, false, true>;
+        }
+    }
+    // the per-row scale step of Q5_K reads the header itself
+    if constexpr (mmvq_gcn_khdr_type(type)) {
+        if (mmvq_gcn_khdr_enabled() && !(kf_ok && kf)) {
+            constexpr bool lds_ok = c_ncols_dst > 1 && type == GGML_TYPE_Q5_K;
+            kernel = lds_ok && lds ? mul_mat_vec_q_gcn_grp<type, c_ncols_dst, ngroups, nwarps, waves_per_eu, rows, lds_ok, false, false, true> :
+                mul_mat_vec_q_gcn_grp<type, c_ncols_dst, ngroups, nwarps, waves_per_eu, rows, false, false, false, true>;
         }
     }
     kernel<<<block_nums, block_dims, 0, stream>>>(
@@ -3116,7 +3144,7 @@ void ggml_cuda_q8_0_planes_unpack(const ggml_tensor * tensor, void * dst, cudaSt
 #endif // defined(GGML_USE_HIP)
 }
 
-template<ggml_type type, int c_ncols_dst, bool small_k = false, bool halve_iters = false, bool aligned_b2 = false, bool planes = false, bool iq_signs = false, bool grid_lds = false, int shape = 0>
+template<ggml_type type, int c_ncols_dst, bool small_k = false, bool halve_iters = false, bool aligned_b2 = false, bool planes = false, bool iq_signs = false, bool grid_lds = false, int shape = 0, bool khdr = false>
 static void mul_mat_vec_q_switch_fusion(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
@@ -3150,13 +3178,22 @@ static void mul_mat_vec_q_switch_fusion(
             return;
         }
     }
+    if constexpr (!khdr && mmvq_gcn_khdr_type(type)) {
+        if (mmvq_gcn_khdr_enabled()) {
+            mul_mat_vec_q_switch_fusion<type, c_ncols_dst, small_k, halve_iters, aligned_b2, planes, iq_signs, grid_lds, shape, true>(vx, vy, ids,
+                fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst, channel_ratio, stride_channel_x,
+                stride_channel_y, stride_channel_dst, sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, block_nums,
+                block_dims, nbytes_shared, ids_stride, stream, kvdr4);
+            return;
+        }
+    }
 #else
     GGML_UNUSED(kvdr4);
 #endif // defined(GGML_USE_HIP)
     if constexpr (c_ncols_dst == 1) {
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters, aligned_b2, planes, iq_signs, grid_lds, false, shape>, launch_params,
+            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters, aligned_b2, planes, iq_signs, grid_lds, false, shape, khdr>, launch_params,
                  vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
@@ -3167,7 +3204,7 @@ static void mul_mat_vec_q_switch_fusion(
     GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, aligned_b2, planes, iq_signs, grid_lds, false, shape>, launch_params,
+    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, aligned_b2, planes, iq_signs, grid_lds, false, shape, khdr>, launch_params,
         vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);

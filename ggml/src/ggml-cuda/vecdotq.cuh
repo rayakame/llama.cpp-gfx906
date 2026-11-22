@@ -1381,6 +1381,87 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_gcn(
     return dm5f.x*sumf_d - dm5f.y*sumf_m;
 }
 
+#if defined(GGML_USE_HIP)
+// sc and m of sub-blocks 2j, 2j+1 as 4 bytes from the 16-byte block header (dm, scales), see get_scale_min_k4.
+static __device__ __forceinline__ uint32_t vec_dot_q4_K_q5_K_hdr_scales(const int4 & hdr, const int j) {
+    const uint32_t sel = 0x05040100 + 0x02020202*(j & 1);
+    const bool     hi  = j >= 2;
+    const uint32_t m6  = hi ? 0x30303030 : 0x3F3F3F3F;
+    const uint32_t q6  = ggml_hip_perm(hdr.z, hdr.y, sel) >> (hi ? 2 : 0);
+    const uint32_t q4  = ggml_hip_perm((uint32_t) hdr.w >> 4, hdr.w, sel) & 0x0F0F0F0F;
+    return (q6 & m6) | (q4 & ~m6);
+}
+#endif // defined(GGML_USE_HIP)
+
+static __device__ __forceinline__ float vec_dot_q4_K_q8_1_hdr(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+#if defined(GGML_USE_HIP)
+    const block_q4_K * bq4_K = (const block_q4_K *) vbq + kbx;
+
+    const int bq8_offset = QR4_K * ((iqs/2) / (QI8_1/2));
+    const int * q4 = (const int *)(bq4_K->qs + 16 * bq8_offset + 4 * ((iqs/2)%4));
+    const int v[2] = {q4[0], q4[4]};
+
+    const int4     hdr = *(const int4 *) bq4_K;
+    const uint32_t scm = vec_dot_q4_K_q5_K_hdr_scales(hdr, bq8_offset/2);
+    const uint8_t * sc = (const uint8_t *) &scm;
+    half2 dm;
+    memcpy(&dm, &hdr.x, sizeof(dm));
+
+    int    u[2*QR4_K];
+    float d8[QR4_K];
+#pragma unroll
+    for (int i = 0; i < QR4_K; ++i) {
+        const block_q8_1 * bq8i = bq8_1 + bq8_offset + i;
+        d8[i] = __low2float(bq8i->ds);
+
+        const int * q8 = (const int *)bq8i->qs + ((iqs/2)%4);
+        u[2*i+0] = q8[0];
+        u[2*i+1] = q8[4];
+    }
+
+    return vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, sc + 2, dm, d8);
+#else
+    return vec_dot_q4_K_q8_1(vbq, bq8_1, kbx, iqs);
+#endif // defined(GGML_USE_HIP)
+}
+
+static __device__ __forceinline__ float vec_dot_q5_K_q8_1_hdr(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+#if defined(GGML_USE_HIP)
+    const block_q5_K * bq5_K = (const block_q5_K *) vbq + kbx;
+
+    const int bq8_offset = QR5_K * ((iqs/2) / (QI8_1/2));
+    const int * ql = (const int *)(bq5_K->qs + 16 * bq8_offset + 4 * ((iqs/2)%4));
+    const int * qh = (const int *)(bq5_K->qh + 4 * ((iqs/2)%4));
+
+    const int vl[2] = {ql[0], ql[4]};
+    const int vh[2] = {qh[0] >> bq8_offset, qh[4] >> bq8_offset};
+
+    const int4     hdr = *(const int4 *) bq5_K;
+    const uint32_t scm = vec_dot_q4_K_q5_K_hdr_scales(hdr, bq8_offset/2);
+    const uint8_t * sc = (const uint8_t *) &scm;
+    half2 dm;
+    memcpy(&dm, &hdr.x, sizeof(dm));
+
+    int    u[2*QR5_K];
+    float d8[QR5_K];
+#pragma unroll
+    for (int i = 0; i < QR5_K; ++i) {
+        const block_q8_1 * bq8i = bq8_1 + bq8_offset + i;
+        d8[i] = __low2float(bq8i->ds);
+
+        const int * q8 = (const int *)bq8i->qs + ((iqs/2)%4);
+        u[2*i+0] = q8[0];
+        u[2*i+1] = q8[4];
+    }
+
+    return vec_dot_q5_K_q8_1_impl_vmmq(vl, vh, u, sc, sc + 2, dm, d8);
+#else
+    return vec_dot_q5_K_q8_1(vbq, bq8_1, kbx, iqs);
+#endif // defined(GGML_USE_HIP)
+}
+
 static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
