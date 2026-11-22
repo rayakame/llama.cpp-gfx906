@@ -958,6 +958,7 @@ void llama_context::synchronize() {
     }
 
     ggml_backend_sched_synchronize(sched.get());
+    logits_top_pending = false;
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -2510,6 +2511,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                             t_top, logits_top_ids.data + n_outputs_prev*logits_top_n, 0, n_outputs*logits_top_n*sizeof(llama_token));
                     ggml_backend_tensor_get_async(ggml_backend_sched_get_tensor_backend(sched.get(), t_top_val),
                             t_top_val, logits_top_val.data + n_outputs_prev*logits_top_n, 0, n_outputs*logits_top_n*sizeof(float));
+                    logits_top_pending = true;
                 }
 
                 // the next ubatch overwrites the graph, so only the last one can keep its rows on the device
@@ -2789,6 +2791,8 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
             // TODO: not needed?
             buf_output = nullptr;
             logits.data = nullptr;
+            logits_top_ids = {nullptr, 0};
+            logits_top_val = {nullptr, 0};
             embd.data = nullptr;
             embd_nextn.data = nullptr;
             for (auto & layer_inp : embd_layer_inp) {
@@ -2825,6 +2829,11 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     logits_top_ids = {top_count ? (llama_token *) (base + offset) : nullptr, top_count};
     offset += top_count * sizeof(llama_token);
 
+    // a copy of the previous batch still in flight would land after the fill
+    if (logits_top_pending) {
+        ggml_backend_sched_synchronize(sched.get());
+        logits_top_pending = false;
+    }
     std::fill_n(logits_top_ids.data, top_count, -1);
 
     logits_dev = nullptr;

@@ -345,6 +345,7 @@ private:
     int64_t                  logits_top_n   = 0;
     buffer_view<llama_token> logits_top_ids = {nullptr, 0};
     buffer_view<float>       logits_top_val = {nullptr, 0};
+    bool                     logits_top_pending = false; // async copies into logits_top_ids/val not synchronized yet
 
     // the logits rows of the last ubatch stay in its graph until they are read
     ggml_tensor *        logits_dev         = nullptr;
