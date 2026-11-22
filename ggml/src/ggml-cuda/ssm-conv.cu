@@ -205,7 +205,7 @@ static __global__ void __launch_bounds__(256) ssm_conv_tile_f32(const float * __
     const int stride_y = dst_nb1 / sizeof(float);
 
     const float * x = (const float *) ((const char *) src0 + blockIdx.x * src0_nb2) + blockIdx.y * n_ch * stride_x + t0;
-    float *       y = (float *) ((char *) dst + blockIdx.x * dst_nb2) + t0 * stride_y + ch;
+    float *       y = (float *) ((char *) dst + blockIdx.x * dst_nb2) + (int64_t) t0 * stride_y + ch;
 
     ggml_cuda_pdl_sync();
     // clamped, unguarded loads: all of them are in flight before the first LDS write
