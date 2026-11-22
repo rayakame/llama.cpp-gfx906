@@ -792,7 +792,7 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                     return ggml_cuda_mmq_util_funcs(
                         VDR_Q8_0_Q8_1_MMQ,
                         ggml_cuda_mmq_load_tiles_q8_0<type, J, fallback, false>,
-                        ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a_grid<type, J, fallback>,
+                        ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a_grid<type, J, fallback, JL>,
                         ggml_cuda_mmq_write_back_dp4a_grid<type, J, fallback, prec_src1>);
                 }
                 return ggml_cuda_mmq_util_funcs(
@@ -830,7 +830,7 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                     return ggml_cuda_mmq_util_funcs(
                         VDR_Q6_K_Q8_1_MMQ,
                         ggml_cuda_mmq_load_tiles_q6_K<type, J, fallback, false>,
-                        ggml_cuda_mmq_vec_dot_q6_K_q8_1_dp4a_grid<type, J, fallback>,
+                        ggml_cuda_mmq_vec_dot_q6_K_q8_1_dp4a_grid<type, J, fallback, JL>,
                         ggml_cuda_mmq_write_back_dp4a_grid<type, J, fallback, prec_src1>);
                 }
                 return ggml_cuda_mmq_util_funcs(
@@ -849,7 +849,7 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                 return ggml_cuda_mmq_util_funcs(
                     VDR_IQ1_M_Q8_1_MMQ,
                     ggml_cuda_mmq_load_tiles_iq1_m<type, J, fallback>,
-                    ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_dp4a<type, J, fallback>,
+                    ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_dp4a<type, J, fallback, JL, y_smem>,
                     ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1>);
             case GGML_TYPE_IQ2_XXS:
                 return ggml_cuda_mmq_util_funcs(
@@ -874,7 +874,7 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                     return ggml_cuda_mmq_util_funcs(
                         VDR_IQ3_XXS_Q8_1_MMQ,
                         ggml_cuda_mmq_load_tiles_iq3_xxs<type, J, fallback>,
-                        ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a_grid<type, J, fallback>,
+                        ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a_grid<type, J, fallback, JL>,
                         ggml_cuda_mmq_write_back_dp4a_grid<type, J, fallback, prec_src1>);
                 }
                 return ggml_cuda_mmq_util_funcs(
@@ -887,7 +887,7 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                     return ggml_cuda_mmq_util_funcs(
                         VDR_IQ3_S_Q8_1_MMQ,
                         ggml_cuda_mmq_load_tiles_iq3_s<type, J, fallback>,
-                        ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a_grid<type, J, fallback>,
+                        ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a_grid<type, J, fallback, JL>,
                         ggml_cuda_mmq_write_back_dp4a_grid<type, J, fallback, prec_src1>);
                 }
                 return ggml_cuda_mmq_util_funcs(
@@ -900,7 +900,7 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                     return ggml_cuda_mmq_util_funcs(
                         VDR_IQ4_XS_Q8_1_MMQ,
                         ggml_cuda_mmq_load_tiles_iq4_xs<type, J, fallback, false>,
-                        ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a_grid<type, J, fallback>,
+                        ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a_grid<type, J, fallback, JL>,
                         ggml_cuda_mmq_write_back_dp4a_grid<type, J, fallback, prec_src1>);
                 }
                 return ggml_cuda_mmq_util_funcs(
@@ -913,7 +913,7 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                     return ggml_cuda_mmq_util_funcs(
                         VDR_IQ4_NL_Q8_1_MMQ,
                         ggml_cuda_mmq_load_tiles_iq4_nl<type, J, fallback>,
-                        ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a_grid<type, J, fallback>,
+                        ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a_grid<type, J, fallback, JL>,
                         ggml_cuda_mmq_write_back_dp4a_grid<type, J, fallback, prec_src1>);
                 }
                 return ggml_cuda_mmq_util_funcs(
@@ -2173,11 +2173,18 @@ static void launch_mul_mat_q_impl(ggml_backend_cuda_context & ctx, const mmq_arg
 
 // A partial column tile gets its own kernel, so that the code of the full tiles stays as it is.
 // Not for Q4_0/Q4_1: their partial kernel drops from occupancy 3 to 2 and was not faster at 12 columns.
+// Not for 24..31 columns in the 32-column Q8_0-layout tile: its gfx906 lane grid steps over 16 columns (8 warps x 2),
+// so no warp can skip a step there, and the full-tile kernel (Q8_0: with the register prefetch) is faster.
 static bool ggml_cuda_mmq_partial_tile(const ggml_type type, const int J, const bool has_fusion, const mmq_args & args) {
 #if defined(GGML_USE_HIP)
     static const bool skip_dead_cols = [] { const char * e = getenv("GGML_MMQ_SKIP_DEAD_COLS"); return !e || atoi(e) != 0; }();
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (J == 32 && args.ncols_dst % J >= 24 && type != GGML_TYPE_Q6_K && ggml_cuda_mmq_dp4a_grid_switchable(type) &&
+            cc == GGML_CUDA_CC_VEGA20) {
+        return false;
+    }
     return skip_dead_cols && J <= 32 && !has_fusion && type != GGML_TYPE_Q4_0 && type != GGML_TYPE_Q4_1 && !args.ids_dst &&
-        args.ncols_dst % J != 0 && GGML_CUDA_CC_IS_GCN(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
+        args.ncols_dst % J != 0 && GGML_CUDA_CC_IS_GCN(cc);
 #else
     GGML_UNUSED_VARS(type, J, has_fusion, args);
     return false;

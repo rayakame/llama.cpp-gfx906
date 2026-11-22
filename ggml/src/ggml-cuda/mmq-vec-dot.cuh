@@ -360,7 +360,7 @@ template <ggml_type type, int J, bool fallback, int JL = J, bool y_smem = false,
 }
 
 // Same sums as ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a in the lane grid of ggml_cuda_mmq_write_back_dp4a_grid.
-template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a_grid(
+template <ggml_type type, int J, bool fallback, int JL = J> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a_grid(
         const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback, GGML_PREC_Q8) / warp_size;
@@ -369,7 +369,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     constexpr int LI        = warp_size / LJ;
     constexpr int RI        = I / LI;
     constexpr int RJ        = J / (nwarps*LJ);
-    static_assert(RI*LI == I && RJ*nwarps*LJ == J, "bad dp4a lane grid");
+    constexpr int RJL       = JL / (nwarps*LJ);
+    static_assert(RI*LI == I && RJ*nwarps*LJ == J && RJL*nwarps*LJ == JL, "bad dp4a lane grid");
     static_assert(VDR_Q8_0_Q8_1_MMQ == 8, "bad VDR_Q8_0_Q8_1_MMQ");
 
     constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q8_0, I);
@@ -398,7 +399,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         }
 
 #pragma unroll
-        for (int c = 0; c < RJ; ++c) {
+        for (int c = 0; c < RJL; ++c) {
             const int j = threadIdx.y + nwarps*(lj + c*LJ);
 
             int u[VDR_Q8_0_Q8_1_MMQ];
@@ -1420,7 +1421,7 @@ template <ggml_type type, int J, bool fallback, int JL = J, bool y_smem = false>
 }
 
 // Same sums as ggml_cuda_mmq_vec_dot_q6_K_q8_1_dp4a in the lane grid of ggml_cuda_mmq_write_back_dp4a_grid.
-template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q6_K_q8_1_dp4a_grid(
+template <ggml_type type, int J, bool fallback, int JL = J> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q6_K_q8_1_dp4a_grid(
         const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback, GGML_PREC_Q8) / warp_size;
@@ -1429,8 +1430,9 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     constexpr int LI        = warp_size / LJ;
     constexpr int RI        = I / LI;
     constexpr int RJ        = J / (nwarps*LJ);
+    constexpr int RJL       = JL / (nwarps*LJ);
     constexpr int NV        = QR6_K*VDR_Q6_K_Q8_1_MMQ;
-    static_assert(RI*LI == I && RJ*nwarps*LJ == J, "bad dp4a lane grid");
+    static_assert(RI*LI == I && RJ*nwarps*LJ == J && RJL*nwarps*LJ == JL, "bad dp4a lane grid");
 
     constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q6_K, I);
     const int   * x_qs = (const int   *) x;
@@ -1462,7 +1464,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         }
 
 #pragma unroll
-        for (int c = 0; c < RJ; ++c) {
+        for (int c = 0; c < RJL; ++c) {
             const int j = threadIdx.y + nwarps*(lj + c*LJ);
 
             int u[NV];

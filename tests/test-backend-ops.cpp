@@ -12494,11 +12494,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // partial MMQ column tiles with whole 128-row tiles: 9..15 columns in the 16-column tile, 17..31 in the 24/32-column tiles
     for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K,
-                             GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS}) {
-        for (int64_t n : {10, 12, 15, 20, 30}) {
+                             GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ1_M, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S,
+                             GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS}) {
+        for (int64_t n : {9, 10, 12, 15, 17, 20, 25, 30}) {
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1024, n, 2048, {1, 1}, {1, 1}));
         }
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 17408, 12, 1024, {1, 1}, {1, 1}));
+    }
+    // the lane grid of the Q8_0-layout dot in a partial 32-column tile with partial row tiles (Q8_0 has no 24-column tile there)
+    for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS}) {
+        for (int64_t n : {17, 20}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1000, n, 1024, {1, 1}, {1, 1}));
+        }
     }
     // 1-column mat-vec of Q4_K/Q5_K from 4096 rows, where GGML_MMVQ_GCN_1COL_SHAPE and the VDR 4 kernels meet
     for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
