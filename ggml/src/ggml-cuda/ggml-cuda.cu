@@ -2353,7 +2353,7 @@ static void ggml_cuda_mul_mat_q8_0_planes(ggml_backend_cuda_context & ctx, const
         }
     }
     const size_t nbytes = ggml_cuda_q8_0_planes_nbytes(src0);
-    const size_t npad   = ggml_row_size(GGML_TYPE_Q8_0, MATRIX_ROW_PADDING);
+    const size_t npad   = ggml_cuda_planes_copy_pad(src0);
     ggml_cuda_pool_alloc<char> canonical(ctx.pool(), nbytes + npad);
     CUDA_CHECK(cudaMemsetAsync(canonical.get() + nbytes, 0, npad, ctx.stream()));
     ggml_tensor src0_c = *src0;
@@ -2385,7 +2385,7 @@ static void ggml_cuda_mul_mat_q6_k_planes(ggml_backend_cuda_context & ctx, const
         }
     }
     const size_t nbytes = ggml_cuda_q6_k_planes_nbytes(src0);
-    const size_t npad   = ggml_row_size(GGML_TYPE_Q6_K, MATRIX_ROW_PADDING);
+    const size_t npad   = ggml_cuda_planes_copy_pad(src0);
     ggml_cuda_pool_alloc<char> canonical(ctx.pool(), nbytes + npad);
     CUDA_CHECK(cudaMemsetAsync(canonical.get() + nbytes, 0, npad, ctx.stream()));
     ggml_tensor src0_c = *src0;

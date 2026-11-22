@@ -2,6 +2,13 @@
 
 #define MMVQ_MAX_BATCH_SIZE 8 // Max. batch size for which to use MMVQ kernels.
 #define MMVQ_GCN_WIDE_MAX_BATCH 16 // GCN: Q4_0/Q4_1/Q8_0 up to this batch size.
+#define MMVQ_MAX_ROWS_PER_BLOCK 4 // The last block of mul_mat_vec_q reads its rows past the matrix too.
+
+// Zeroed bytes behind a canonical copy of a tensor in planes: MMQ reads up to MATRIX_ROW_PADDING values past a row,
+// the mat-vec whole rows past the last one.
+static inline size_t ggml_cuda_planes_copy_pad(const ggml_tensor * tensor) {
+    return std::max(ggml_row_size(tensor->type, MATRIX_ROW_PADDING), (MMVQ_MAX_ROWS_PER_BLOCK - 1)*tensor->nb[1]);
+}
 
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11, int64_t nrows_x);
 

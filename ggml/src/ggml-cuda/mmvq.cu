@@ -808,6 +808,7 @@ static __global__ void mul_mat_vec_q(
         mmvq_gcn_q4_multicol(type, ncols_dst, table_id) && ncols_dst > 4 ? GCN_MMVQ_Q4_VDR8 : get_vdr_mmvq(type);
     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters, shape);
     constexpr int rows_per_cuda_block = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps, shape);
+    static_assert(rows_per_cuda_block <= MMVQ_MAX_ROWS_PER_BLOCK, "the copies of planes need more padding");
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = kvdr4 ? get_vec_dot_q_cuda_gcn_kvdr4(type) :
@@ -3989,7 +3990,7 @@ void ggml_cuda_mul_mat_vec_q(
             ggml_tensor                canonical[4];
             for (int k = 0; k < 4; ++k) {
                 if (p[k]) {
-                    buf[k].alloc(ctx.pool(), ggml_cuda_q8_0_planes_nbytes(w[k]));
+                    buf[k].alloc(ctx.pool(), ggml_cuda_q8_0_planes_nbytes(w[k]) + ggml_cuda_planes_copy_pad(w[k]));
                     canonical[k]      = *w[k];
                     canonical[k].data = ggml_cuda_q8_0_planes_unpack(w[k], buf[k].get(), stream);
                     w[k]              = &canonical[k];

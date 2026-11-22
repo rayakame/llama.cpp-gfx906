@@ -12456,11 +12456,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // views of a Q8_0 matrix (in planes with GGML_CUDA_Q8_0_PLANES=2) that start on a group of 8 blocks or inside one,
-    // with a row or batch stride of whole groups or not
+    // with a row or batch stride of whole groups or not; one row of one block, whose copy is a single group
     for (int64_t n : {1, 3, 8, 12, 32}) {
         test_cases.emplace_back(new test_mul_mat_view(GGML_TYPE_Q8_0, 100, n, 256, 512, 110, 8, 16));
         test_cases.emplace_back(new test_mul_mat_view(GGML_TYPE_Q8_0, 100, n, 256, 512, 110, 1, 16));
         test_cases.emplace_back(new test_mul_mat_view(GGML_TYPE_Q8_0, 100, n, 256, 512, 110, 0, 17));
+        test_cases.emplace_back(new test_mul_mat_view(GGML_TYPE_Q8_0, 1, n, 32, 4096, 4, 1, 128));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 16, n, 256, {2, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 17, 34));
     }
     // the same for Q6_K (GGML_CUDA_Q6K_PLANES=2) with rows instead of groups; two rows per step for the mat-vec only,
