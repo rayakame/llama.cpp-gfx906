@@ -8499,19 +8499,23 @@ struct test_mul_mat_vec_fusion : public test_case {
     const bool with_lane_scale;
     std::array<int64_t, 2> batch_dims;
     const bool skip; // set some ids to a negative value (only for use_id)
+    const std::array<float, 2> oai; // alpha and limit of SWIGLU_OAI
 
     test_mul_mat_vec_fusion(ggml_type type, ggml_glu_op op, int64_t m, int64_t n, int64_t k,
                         bool use_id = false, int n_mats = 1, int n_used = 1, bool b = false, bool with_bias = false, bool with_gate = true,
-                        bool with_lane_scale = false, std::array<int64_t, 2> batch_dims = {4, 2}, bool skip = false)
+                        bool with_lane_scale = false, std::array<int64_t, 2> batch_dims = {4, 2}, bool skip = false,
+                        std::array<float, 2> oai = {1.702f, 7.0f})
     : type(type), glu_op(op), m(m), n(n), k(k), use_id(use_id), n_mats(n_mats), n_used(n_used), b(b), with_bias(with_bias),
-        with_gate(with_gate), with_lane_scale(with_lane_scale), batch_dims(batch_dims), skip(skip) {
+        with_gate(with_gate), with_lane_scale(with_lane_scale), batch_dims(batch_dims), skip(skip), oai(oai) {
         if (use_id) {
             GGML_ASSERT(n_used <= n_mats);
         }
     }
 
     std::string vars() override {
-        return VARS_TO_STR14(type, glu_op, m, n, k, use_id, n_mats, n_used, b, with_bias, with_gate, with_lane_scale, batch_dims, skip);
+        const bool oai_default = oai[0] == 1.702f && oai[1] == 7.0f;
+        return VARS_TO_STR14(type, glu_op, m, n, k, use_id, n_mats, n_used, b, with_bias, with_gate, with_lane_scale, batch_dims, skip) +
+            (oai_default ? "" : "," + VAR_TO_STR(oai));
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -8526,9 +8530,7 @@ struct test_mul_mat_vec_fusion : public test_case {
         ggml_tensor * out = nullptr;
         if (with_gate) {
             if (glu_op == GGML_GLU_OP_SWIGLU_OAI) {
-                constexpr float alpha = 1.702f;
-                constexpr float limit = 7.0f;
-                out = ggml_swiglu_oai(ctx, ffn_gate, ffn_up, alpha, limit);
+                out = ggml_swiglu_oai(ctx, ffn_gate, ffn_up, oai[0], oai[1]);
             } else if (glu_op == GGML_GLU_OP_SWIGLU_CLAMP) {
                 constexpr float limit = 10.0f;
                 out                   = ggml_swiglu_clamp(ctx, ffn_gate, ffn_up, limit);
@@ -13680,6 +13682,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
             test_cases.emplace_back(new test_mul_mat_vec_fusion(type, glu_op, 4, 100, 1024,
                 false, 16, 8, false, false, true, false, { 4, 2 }));
+        }
+    }
+
+    // SWIGLU_OAI with its own alpha and limit, which the fused mat-vec epilogues do not take
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1}) {
+        for (int64_t m_batch = 1; m_batch <= (type == GGML_TYPE_F16 ? 1 : 8); ++m_batch) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU_OAI, m_batch, 100, 1024,
+                false, 16, 8, false, false, true, false, { 1, 1 }, false, { 0.5f, 2.0f }));
         }
     }
 
