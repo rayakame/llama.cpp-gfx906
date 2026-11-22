@@ -12463,6 +12463,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_view(GGML_TYPE_Q8_0, 100, n, 256, 512, 110, 0, 17));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 16, n, 256, {2, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 17, 34));
     }
+    // the same for Q6_K (GGML_CUDA_Q6K_PLANES=2) with rows instead of groups; two rows per step for the mat-vec only
+    for (int64_t n : {1, 3, 8, 12, 32}) {
+        test_cases.emplace_back(new test_mul_mat_view(GGML_TYPE_Q6_K, 100, n, 768, 1024, 200, 4, 4));
+        test_cases.emplace_back(new test_mul_mat_view(GGML_TYPE_Q6_K, 100, n, 768, 1024, 200, 1, 4));
+        test_cases.emplace_back(new test_mul_mat_view(GGML_TYPE_Q6_K, 100, n, 768, 1024, 200, 0, 5));
+        test_cases.emplace_back(new test_mul_mat_view(GGML_TYPE_Q6_K, 100, n, 768, 1024, 200, 0, 8));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 16, n, 1024, {2, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 17, 210));
+    }
 
     // MMQ tile configs with whole 128-row tiles: every column tile width the tables use, stream-k (few tiles) and tiling (many)
     for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,

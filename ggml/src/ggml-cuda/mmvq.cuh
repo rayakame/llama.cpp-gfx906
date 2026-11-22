@@ -36,6 +36,8 @@ bool ggml_cuda_q6_k_planes_set(const ggml_tensor * tensor, const void * data, si
 void ggml_cuda_q6_k_planes_forget(const void * base, size_t size);
 int64_t ggml_cuda_q6_k_planes_ne0(const ggml_tensor * src0);
 bool ggml_cuda_q6_k_planes(const ggml_tensor * src0);
+// Whether the planes kernels can read src0 in place: it starts on a row of the tensor in planes and its strides are whole rows.
+bool ggml_cuda_q6_k_planes_direct(const ggml_tensor * src0);
 // The whole tensor in planes that src0 points into, in the canonical layout: its size, and where src0's data lands in dst.
 size_t ggml_cuda_q6_k_planes_nbytes(const ggml_tensor * src0);
 char * ggml_cuda_q6_k_planes_unpack(const ggml_tensor * src0, char * dst, cudaStream_t stream);

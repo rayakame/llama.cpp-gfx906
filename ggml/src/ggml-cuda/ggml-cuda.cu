@@ -2368,17 +2368,17 @@ static void ggml_cuda_mul_mat_q8_0_planes(ggml_backend_cuda_context & ctx, const
 }
 
 // Q6_K weights in planes: the mat-vec up to 8 columns (16 with GGML_CUDA_Q6K_PLANES_MV16=1), MMQ above, a canonical
-// copy for the paths that read neither.
+// copy for the paths that read neither and for views that do not start on a row.
 static void ggml_cuda_mul_mat_q6_k_planes(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
-    if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && dst->op != GGML_OP_MUL_MAT_ID) {
+    if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && dst->op != GGML_OP_MUL_MAT_ID && ggml_cuda_q6_k_planes_direct(src0)) {
         static const int64_t mv_max = ggml_cuda_env_int("GGML_CUDA_Q6K_PLANES_MV16", 0) != 0 ? 2*MMVQ_MAX_BATCH_SIZE : MMVQ_MAX_BATCH_SIZE;
         if (src1->ne[1] <= mv_max) {
             ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
             return;
         }
-        const size_t row_bytes = ggml_row_size(GGML_TYPE_Q6_K, ggml_cuda_q6_k_planes_ne0(src0));
-        if (src0->nb[1] == row_bytes && src0->nb[2] % row_bytes == 0 && src0->nb[3] % row_bytes == 0 &&
+        // the MMQ loader takes the row stride as the row length of the planes
+        if (src0->nb[1] == ggml_row_size(GGML_TYPE_Q6_K, ggml_cuda_q6_k_planes_ne0(src0)) &&
                 ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[1], /*n_experts =*/ 0)) {
             ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
             return;

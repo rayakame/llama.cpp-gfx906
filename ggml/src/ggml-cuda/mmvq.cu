@@ -3129,6 +3129,21 @@ bool ggml_cuda_q6_k_planes(const ggml_tensor * src0) {
     return ggml_cuda_q6_k_planes_ne0(src0) != 0;
 }
 
+bool ggml_cuda_q6_k_planes_direct(const ggml_tensor * src0) {
+#if defined(GGML_USE_HIP)
+    q6_k_planes_range r;
+    if (src0->type != GGML_TYPE_Q6_K || !q6_k_planes_find(src0->data, r)) {
+        return false;
+    }
+    const size_t row_bytes = ggml_row_size(GGML_TYPE_Q6_K, r.ne0);
+    return ((const char *) src0->data - r.lo) % row_bytes == 0 && src0->nb[1] % row_bytes == 0 && src0->nb[2] % row_bytes == 0 &&
+        src0->nb[3] % row_bytes == 0;
+#else
+    GGML_UNUSED(src0);
+    return false;
+#endif // defined(GGML_USE_HIP)
+}
+
 bool ggml_cuda_q8_0_planes_eligible(const ggml_tensor * tensor, const int device) {
 #if defined(GGML_USE_HIP)
     const int mode = q8_0_planes_mode();
