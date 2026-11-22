@@ -2886,8 +2886,9 @@ uint64_t ggml_cuda_planes_epoch() {
 bool ggml_cuda_q6_k_planes_eligible(const ggml_tensor * tensor, const int device) {
 #if defined(GGML_USE_HIP)
     const int mode = q6_k_planes_mode();
+    // 4 blocks per row and a 16-byte base put the int4 loads of every row on 16 bytes (q6_k_rp_d_first)
     if (mode == 0 || tensor->type != GGML_TYPE_Q6_K || tensor->view_src != nullptr || !ggml_is_contiguous(tensor) ||
-            tensor->ne[0] % QK_K != 0 || tensor->ne[0] / QK_K > 192 ||
+            tensor->ne[0] % (4*QK_K) != 0 || tensor->ne[0] / QK_K > 192 || (uintptr_t) tensor->data % 16 != 0 ||
             !GGML_CUDA_CC_IS_GCN(ggml_cuda_info().devices[device].cc)) {
         return false;
     }
