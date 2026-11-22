@@ -1579,7 +1579,7 @@ static __device__ __forceinline__ void mmvq_gcn_grp_tile_load(mmvq_gcn_i32x4 * b
     }
 }
 
-template <ggml_type type, int ncols_dst, int ngroups, int nwarps, int waves_per_eu, bool lds, bool iq_signs = false, bool kf = false>
+template <ggml_type type, int ncols_dst, int ngroups, int nwarps, int waves_per_eu, int rows, bool lds, bool iq_signs = false, bool kf = false>
 __launch_bounds__(nwarps*64, waves_per_eu)
 static __global__ void mul_mat_vec_q_gcn_grp(
         const void * __restrict__ vx, const void * __restrict__ vy, const ggml_cuda_mm_fusion_args_device fusion,
@@ -1593,7 +1593,6 @@ static __global__ void mul_mat_vec_q_gcn_grp(
     constexpr int qk     = ggml_cuda_type_traits<type>::qk;
     constexpr int qi     = ggml_cuda_type_traits<type>::qi;
     constexpr int vdr    = get_vdr_mmvq(type);
-    constexpr int rows   = mmvq_gcn_mc_rows(type, ncols_dst);
     constexpr int nlanes = 64/ngroups;
     constexpr int lpb    = qi/vdr;
     static_assert(nlanes % lpb == 0, "a group must cover whole blocks");
@@ -2073,7 +2072,85 @@ struct mmvq_gcn_mc_args {
     int nchannels_dst, nsamples_dst;
     bool planes;
     bool iq_signs;
+    bool rows4; // K-quant row groups of 4 rows from mmvq_gcn_mc_table
 };
+
+// The column counts that compile K-quant row groups of 4 rows; keep in step with mmvq_gcn_mc_table.
+static constexpr bool mmvq_gcn_mc_rows4(const ggml_type type, const int ncols_dst) {
+    return ncols_dst >= 2 && (type == GGML_TYPE_Q6_K ? ncols_dst != 7 && ncols_dst <= 8 : type == GGML_TYPE_Q5_K && ncols_dst <= 4);
+}
+
+struct mmvq_gcn_mc_shape {
+    int rows;
+    int ngroups;
+    int nwarps;
+};
+
+// Shapes measured on the MI50 at the Qwen3.8 27B layer matrices (Q4_0, Q4_1, Q5_K, Q6_K); rows 0 = the generic rule in
+// mul_mat_vec_q_gcn_mc_try.
+static mmvq_gcn_mc_shape mmvq_gcn_mc_table(const ggml_type type, const int ncols_dst, const int nrows_x, const int ncols_x) {
+    const bool q4 = type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_1;
+    if (!(q4 || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K) || ncols_dst < 2 || nrows_x > 65536 || ncols_x < 4096) {
+        return {0, 0, 0};
+    }
+    if (nrows_x <= 2048) {
+        // attn_k/attn_v: 64 row groups of 16 Q4 rows leave most CUs with one wave
+        if (q4) {
+            return ncols_dst <= 4 ? mmvq_gcn_mc_shape{4, 2, 2} : mmvq_gcn_mc_shape{0, 0, 0};
+        }
+        return {2, 2, 4};
+    }
+    if (q4) {
+        // 4 warps split the 10 K steps of K = 5120 into 2.5 iterations; at 3..4 columns other shapes gain nothing
+        if (ncols_dst >= 5 && ncols_x == 5120) {
+            if (nrows_x == 6144) {
+                return {4, 4, 1};
+            }
+            if (nrows_x == 10240 || nrows_x == 12288) {
+                return {4, 4, 2};
+            }
+        }
+        return {0, 0, 0};
+    }
+    if (mmvq_gcn_mc_rows4(type, ncols_dst) && (ncols_dst <= 4 || ncols_x <= 5120)) {
+        // 4 rows per group: each activation load serves twice the rows
+        return {4, 4, ncols_dst <= 4 ? 4 : 1};
+    }
+    return {0, 0, 0};
+}
+
+template <ggml_type type, int c_ncols_dst, int ngroups, int nwarps, int waves_per_eu, int rows>
+static void mul_mat_vec_q_gcn_grp_launch(const mmvq_gcn_mc_args & p, cudaStream_t stream) {
+    const int64_t nblocks = (p.nrows_x + rows*ngroups - 1) / (rows*ngroups);
+    const dim3 block_nums(nblocks, p.nchannels_dst, p.nsamples_dst);
+    const dim3 block_dims(64, nwarps, 1);
+    static const bool lds = mmvq_gcn_mc_env("GGML_MMVQ_GCN_MC_LDS", 1) != 0;
+    static const bool kf  = mmvq_gcn_mc_env("GGML_MMVQ_GCN_MC_KF", 1) != 0;
+    // Q5_K at 1 column (only with _1COL=1) spills at 6 waves per SIMD with the scales held per row
+    constexpr bool kf_ok = (type == GGML_TYPE_Q5_K && c_ncols_dst > 1) || type == GGML_TYPE_Q6_K;
+    auto kernel = mul_mat_vec_q_gcn_grp<type, c_ncols_dst, ngroups, nwarps, waves_per_eu, rows, false>;
+    if constexpr (kf_ok) {
+        if (kf) {
+            kernel = mul_mat_vec_q_gcn_grp<type, c_ncols_dst, ngroups, nwarps, waves_per_eu, rows, false, false, true>;
+        }
+    }
+    // measured for Q5_K/Q6_K only
+    if constexpr (c_ncols_dst > 1 && (type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K)) {
+        if (lds) {
+            kernel = kf ? mul_mat_vec_q_gcn_grp<type, c_ncols_dst, ngroups, nwarps, waves_per_eu, rows, true, false, true> :
+                mul_mat_vec_q_gcn_grp<type, c_ncols_dst, ngroups, nwarps, waves_per_eu, rows, true>;
+        }
+    }
+    if constexpr (type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S) {
+        if (p.iq_signs) {
+            kernel = mul_mat_vec_q_gcn_grp<type, c_ncols_dst, ngroups, nwarps, waves_per_eu, rows, false, true>;
+        }
+    }
+    kernel<<<block_nums, block_dims, 0, stream>>>(
+        p.vx, p.vy, p.fusion, p.dst, p.ncols_x, p.nrows_x, p.stride_row_x, p.stride_col_y, p.stride_col_dst,
+        p.channel_ratio, p.stride_channel_x, p.stride_channel_y, p.stride_channel_dst, p.sample_ratio,
+        p.stride_sample_x, p.stride_sample_y, p.stride_sample_dst);
+}
 
 template <ggml_type type, int c_ncols_dst, int ngroups, int nwarps, int waves_per_eu, bool gate, bool aligned_b2, bool planes = false>
 static void mul_mat_vec_q_gcn_mc_launch(const mmvq_gcn_mc_args & p, cudaStream_t stream) {
@@ -2088,32 +2165,13 @@ static void mul_mat_vec_q_gcn_mc_launch(const mmvq_gcn_mc_args & p, cudaStream_t
             p.stride_sample_x, p.stride_sample_y, p.stride_sample_dst);
     } else {
         static_assert(!gate, "gate fusion is Q4 only");
-        static const bool lds = mmvq_gcn_mc_env("GGML_MMVQ_GCN_MC_LDS", 1) != 0;
-        static const bool kf  = mmvq_gcn_mc_env("GGML_MMVQ_GCN_MC_KF", 1) != 0;
-        // Q5_K at 1 column (only with _1COL=1) spills at 6 waves per SIMD with the scales held per row
-        constexpr bool kf_ok = (type == GGML_TYPE_Q5_K && c_ncols_dst > 1) || type == GGML_TYPE_Q6_K;
-        auto kernel = mul_mat_vec_q_gcn_grp<type, c_ncols_dst, ngroups, nwarps, waves_per_eu, false>;
-        if constexpr (kf_ok) {
-            if (kf) {
-                kernel = mul_mat_vec_q_gcn_grp<type, c_ncols_dst, ngroups, nwarps, waves_per_eu, false, false, true>;
+        if constexpr (mmvq_gcn_mc_rows4(type, c_ncols_dst)) {
+            if (p.rows4) {
+                mul_mat_vec_q_gcn_grp_launch<type, c_ncols_dst, ngroups, nwarps, c_ncols_dst <= 4 ? 2 : 1, 4>(p, stream);
+                return;
             }
         }
-        // measured for Q5_K/Q6_K only
-        if constexpr (c_ncols_dst > 1 && (type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K)) {
-            if (lds) {
-                kernel = kf ? mul_mat_vec_q_gcn_grp<type, c_ncols_dst, ngroups, nwarps, waves_per_eu, true, false, true> :
-                    mul_mat_vec_q_gcn_grp<type, c_ncols_dst, ngroups, nwarps, waves_per_eu, true>;
-            }
-        }
-        if constexpr (type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S) {
-            if (p.iq_signs) {
-                kernel = mul_mat_vec_q_gcn_grp<type, c_ncols_dst, ngroups, nwarps, waves_per_eu, false, true>;
-            }
-        }
-        kernel<<<block_nums, block_dims, 0, stream>>>(
-            p.vx, p.vy, p.fusion, p.dst, p.ncols_x, p.nrows_x, p.stride_row_x, p.stride_col_y, p.stride_col_dst,
-            p.channel_ratio, p.stride_channel_x, p.stride_channel_y, p.stride_channel_dst, p.sample_ratio,
-            p.stride_sample_x, p.stride_sample_y, p.stride_sample_dst);
+        mul_mat_vec_q_gcn_grp_launch<type, c_ncols_dst, ngroups, nwarps, waves_per_eu, rows>(p, stream);
     }
 }
 
@@ -2194,6 +2252,8 @@ static bool mul_mat_vec_q_gcn_mc_try(const int ncols_dst, const mmvq_gcn_mc_args
     static const int  env_ngroups = mmvq_gcn_mc_env("GGML_MMVQ_GCN_MC_GROUPS", 0);
     static const int  env_nwarps  = mmvq_gcn_mc_env("GGML_MMVQ_GCN_MC_WARPS", 0);
     static const int  env_wpe     = mmvq_gcn_mc_env("GGML_MMVQ_GCN_MC_WPE", 0);
+    static const bool table       = mmvq_gcn_mc_env("GGML_MMVQ_GCN_MC_TABLE", 1) != 0 &&
+        env_ngroups == 0 && env_nwarps == 0 && env_wpe == 0;
 
     const ggml_cuda_mm_fusion_args_device & f = p.fusion;
     const bool has_fusion = f.gate || f.x_bias || f.gate_bias || f.x_scale || f.gate_scale || f.shared_up;
@@ -2205,9 +2265,18 @@ static bool mul_mat_vec_q_gcn_mc_try(const int ncols_dst, const mmvq_gcn_mc_args
     }
 
     const int waves_per_eu = env_wpe == 3 ? 3 : 2;
-    const int ngroups      = env_ngroups == 2 && !gate ? 2 : 4;
-    int nwarps = env_nwarps;
-    if (nwarps != 1 && nwarps != 2 && nwarps != 4) {
+    int ngroups = env_ngroups == 2 && !gate ? 2 : 4;
+    int nwarps  = env_nwarps;
+    mmvq_gcn_mc_shape s = {0, 0, 0};
+    if (table && !has_fusion && p.nchannels_dst == 1 && p.nsamples_dst == 1) {
+        s = mmvq_gcn_mc_table(type, ncols_dst, p.nrows_x, p.ncols_x);
+    }
+    mmvq_gcn_mc_args pt = p;
+    if (s.rows != 0) {
+        ngroups  = s.ngroups;
+        nwarps   = s.nwarps;
+        pt.rows4 = s.rows == 4 && !mmvq_gcn_mc_whole(type);
+    } else if (nwarps != 1 && nwarps != 2 && nwarps != 4) {
         // enough waves to fill the card, but at least two K iterations per wave
         constexpr int lpb = mmvq_gcn_mc_whole(type) ? 1 : ggml_cuda_type_traits<type>::qi / get_vdr_mmvq(type);
         const int     rows        = mmvq_gcn_mc_rows(type, ncols_dst, gate);
@@ -2222,21 +2291,21 @@ static bool mul_mat_vec_q_gcn_mc_try(const int ncols_dst, const mmvq_gcn_mc_args
     if constexpr (type == GGML_TYPE_Q4_0) {
         static const bool aligned_b2 = mmvq_gcn_mc_env("GGML_MMVQ_ALIGNED_B2", 1) != 0;
         if (aligned_b2) {
-            return gate ? mul_mat_vec_q_gcn_mc_switch_ncols<type, true, true>(ncols_dst, waves_per_eu, ngroups, nwarps, p, stream) :
-                mul_mat_vec_q_gcn_mc_switch_ncols<type, false, true>(ncols_dst, waves_per_eu, ngroups, nwarps, p, stream);
+            return gate ? mul_mat_vec_q_gcn_mc_switch_ncols<type, true, true>(ncols_dst, waves_per_eu, ngroups, nwarps, pt, stream) :
+                mul_mat_vec_q_gcn_mc_switch_ncols<type, false, true>(ncols_dst, waves_per_eu, ngroups, nwarps, pt, stream);
         }
     }
     if constexpr (mmvq_gcn_mc_q4(type)) {
         if (gate) {
-            return mul_mat_vec_q_gcn_mc_switch_ncols<type, true, false>(ncols_dst, waves_per_eu, ngroups, nwarps, p, stream);
+            return mul_mat_vec_q_gcn_mc_switch_ncols<type, true, false>(ncols_dst, waves_per_eu, ngroups, nwarps, pt, stream);
         }
     }
     if constexpr (type == GGML_TYPE_Q8_0) {
         if (p.planes) {
-            return mul_mat_vec_q_gcn_mc_switch_ncols<type, false, false, true>(ncols_dst, waves_per_eu, ngroups, nwarps, p, stream);
+            return mul_mat_vec_q_gcn_mc_switch_ncols<type, false, false, true>(ncols_dst, waves_per_eu, ngroups, nwarps, pt, stream);
         }
     }
-    return mul_mat_vec_q_gcn_mc_switch_ncols<type, false, false>(ncols_dst, waves_per_eu, ngroups, nwarps, p, stream);
+    return mul_mat_vec_q_gcn_mc_switch_ncols<type, false, false>(ncols_dst, waves_per_eu, ngroups, nwarps, pt, stream);
 }
 
 struct mmvq_gcn_wide_args {

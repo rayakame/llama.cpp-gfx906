@@ -11843,6 +11843,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // GCN row-group shapes of the Qwen3.8 27B layer matrices, and odd row counts on both sides of the small-matrix limit
+    for (int n = 2; n <= 8; ++n) {
+        for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{10240, 5120}, {12288, 5120}}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+        }
+        for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{1023, 4096}, {6144, 5120}, {10240, 5120}, {12288, 5120}}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_1, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+        }
+        for (ggml_type type_a : {GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+            for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{1021, 4096}, {4099, 4096}, {5123, 6144}}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+            }
+        }
+    }
+
     // The SYCL backend picks between one and two output rows per subgroup by row count when there
     // are two destination columns (Q4_K_MMVQ_ROW_PAIR_MIN_NROWS in ggml-sycl/mmvq.cpp). Cover both
     // sides of that boundary, including an odd row count above it for the row-pair tail.
@@ -13674,6 +13689,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int bs : {64, 512}) {
         for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{17408, 5120}, {5120, 17408}, {10240, 5120}, {5120, 6144}}) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, m, bs, k, {1, 1}, {1, 1}));
+        }
+    }
+
+    // Qwen3.8 27B layer matrices (m x k): attn_k/v, attn_gate, attn_qkv, attn_q, ffn_gate/up, attn_output and ssm_out, ffn_down
+    for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+        for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{1024, 5120}, {6144, 5120}, {10240, 5120}, {12288, 5120},
+                                                                  {17408, 5120}, {5120, 6144}, {5120, 17408}}) {
+            for (int64_t n = 1; n <= 8; ++n) {
+                test_cases.emplace_back(new test_mul_mat_big(type_a, m, n, k));
+            }
         }
     }
 
