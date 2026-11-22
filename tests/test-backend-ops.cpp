@@ -13273,6 +13273,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Gate and up in the GCN row-group mat-vec at 2..8 columns: 100 rows end on a part block, K 5120 as the FFN
+    for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+        for (ggml_glu_op glu_op : {GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU}) {
+            for (int64_t m_batch : {2, 3, 4, 5, 6, 7, 8}) {
+                test_cases.emplace_back(new test_mul_mat_vec_fusion(type, glu_op, m_batch, 100, 1024,
+                    false, 16, 8, false, false, true, false, { 1, 1 }));
+                test_cases.emplace_back(new test_mul_mat_vec_fusion(type, glu_op, m_batch, 1000, 5120,
+                    false, 16, 8, false, false, true, false, { 1, 1 }));
+            }
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, glu_op, 4, 100, 1024,
+                false, 16, 8, false, false, true, false, { 4, 2 }));
+        }
+    }
+
     for (int64_t k : {96, 896, 1024, 2880}) {
         for (ggml_glu_op glu_op : {GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU}) {
             test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q8_0, glu_op, 1, 32, k,

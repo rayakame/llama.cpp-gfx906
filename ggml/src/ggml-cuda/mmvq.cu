@@ -2558,7 +2558,8 @@ static bool mul_mat_vec_q_gcn_mc_try(const int ncols_dst, const mmvq_gcn_mc_args
     } else if (nwarps != 1 && nwarps != 2 && nwarps != 4) {
         // enough waves to fill the card, but at least two K iterations per wave
         constexpr int lpb = mmvq_gcn_mc_whole(type) ? 1 : ggml_cuda_type_traits<type>::qi / get_vdr_mmvq(type);
-        const int     rows        = mmvq_gcn_mc_rows(type, ncols_dst, gate);
+        // a fused gate counts groups as the two unfused calls do, so K splits the same way
+        const int     rows        = mmvq_gcn_mc_rows(type, ncols_dst);
         const int64_t nrow_groups = int64_t((p.nrows_x + rows*ngroups - 1) / (rows*ngroups)) * p.nchannels_dst * p.nsamples_dst;
         const int     nchunks_k   = p.ncols_x / ggml_blck_size(type) / ((64/ngroups)/lpb);
         nwarps = 1;
@@ -3749,6 +3750,24 @@ char * ggml_cuda_q8_1_cache_begin(ggml_backend_cuda_context & ctx, const ggml_cg
 #endif // defined(GGML_USE_VMM)
 }
 
+// GGML_MMVQ_GCN_MC_GATE: bit n = fuse up, gate and GLU at n columns, 0 = off; default Q4_0/Q4_1 at 2..7 (8 lost 1 %).
+// The K-quant gate variant of the row-group kernel is not here: their row groups run the LDS and per-row scale steps.
+bool ggml_cuda_mmvq_gcn_mc_gate(const ggml_type type, const int cc, const int64_t ncols_dst, const int64_t nrows_x) {
+#if defined(GGML_USE_HIP)
+    static const int cols = [] {
+        const char * s = getenv("GGML_MMVQ_GCN_MC_GATE");
+        const bool on = mmvq_gcn_mc_env("GGML_MMVQ_GCN_MC", 1) != 0 && mmvq_gcn_mc_env("GGML_MMVQ_GCN_MC_FUSED", 1) != 0;
+        return on ? (s ? int(strtol(s, nullptr, 0)) : 0xfc) : 0;
+    }();
+    const bool q4 = type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_1;
+    return GGML_CUDA_CC_IS_GCN(cc) && q4 && ncols_dst >= 2 && ncols_dst <= 8 &&
+        nrows_x >= mmvq_gcn_mc_rows(type, int(ncols_dst), true) && ((cols >> ncols_dst) & 1);
+#else
+    GGML_UNUSED_VARS(type, cc, ncols_dst, nrows_x);
+    return false;
+#endif // defined(GGML_USE_HIP)
+}
+
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
@@ -3815,7 +3834,8 @@ void ggml_cuda_mul_mat_vec_q(
     if (fusion) {
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         GGML_ASSERT( !ids || dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc));
-        GGML_ASSERT(  ids || dst->ne[1] == 1);
+        GGML_ASSERT(  ids || dst->ne[1] == 1 || (fusion->gate && !fusion->x_bias && !fusion->gate_bias &&
+                                                 ggml_cuda_mmvq_gcn_mc_gate(src0->type, cc, dst->ne[1], src0->ne[1])));
         // Scale fusion is only allowed for NVFP4 currently as the cost of checking this at run-time in the prologue is
         // non-negligible for some models such as gpt-oss-20b
         GGML_ASSERT((fusion->x_scale == nullptr && fusion->gate_scale == nullptr) || src0->type == GGML_TYPE_NVFP4);
