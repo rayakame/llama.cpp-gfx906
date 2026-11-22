@@ -36,6 +36,9 @@ bool ggml_cuda_q6_k_planes(const ggml_tensor * src0);
 // The whole tensor in planes that src0 points into, in the canonical layout: its size, and where src0's data lands in dst.
 size_t ggml_cuda_q6_k_planes_nbytes(const ggml_tensor * src0);
 char * ggml_cuda_q6_k_planes_unpack(const ggml_tensor * src0, char * dst, cudaStream_t stream);
+// After all bytes of the tensor were written in the canonical layout: puts them in planes if the tensor takes them,
+// else forgets the planes that were there.
+void ggml_cuda_planes_written(const ggml_tensor * tensor, int device, cudaStream_t stream);
 // Changes when memory goes into or out of planes; a graph captured before reads it with the wrong kernels.
 uint64_t ggml_cuda_planes_epoch();
 // The q8_1 copy of src1 that an earlier MUL_MAT of the graph left, if src1 did not change since; nullptr otherwise.

@@ -825,9 +825,16 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
     return GGML_STATUS_SUCCESS;
 }
 
+static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size);
+
 static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
+    if (ggml_cuda_q8_0_planes(tensor) || ggml_cuda_q6_k_planes(tensor)) {
+        const std::vector<uint8_t> fill(size, value);
+        ggml_backend_cuda_buffer_set_tensor(buffer, tensor, fill.data(), offset, size);
+        return;
+    }
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemsetAsync((char *) tensor->data + offset, value, size, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
@@ -841,10 +848,8 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
         return;
     }
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
-    if (offset + size == ggml_nbytes(tensor) && ggml_cuda_q8_0_planes_eligible(tensor, ctx->device)) {
-        ggml_cuda_q8_0_planes_repack(tensor, cudaStreamPerThread);
-    } else if (offset + size == ggml_nbytes(tensor) && ggml_cuda_q6_k_planes_eligible(tensor, ctx->device)) {
-        ggml_cuda_q6_k_planes_repack(tensor, cudaStreamPerThread);
+    if (offset + size == ggml_nbytes(tensor)) {
+        ggml_cuda_planes_written(tensor, ctx->device, cudaStreamPerThread);
     }
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -907,10 +912,8 @@ static void ggml_backend_cuda_buffer_set_tensor_n(ggml_backend_buffer_t buffer, 
             sizes[i],
             cudaMemcpyHostToDevice,
             cudaStreamPerThread));
-        if (offsets[i] + sizes[i] == ggml_nbytes(tensors[i]) && ggml_cuda_q8_0_planes_eligible(tensors[i], ctx->device)) {
-            ggml_cuda_q8_0_planes_repack(tensors[i], cudaStreamPerThread);
-        } else if (offsets[i] + sizes[i] == ggml_nbytes(tensors[i]) && ggml_cuda_q6_k_planes_eligible(tensors[i], ctx->device)) {
-            ggml_cuda_q6_k_planes_repack(tensors[i], cudaStreamPerThread);
+        if (offsets[i] + sizes[i] == ggml_nbytes(tensors[i])) {
+            ggml_cuda_planes_written(tensors[i], ctx->device, cudaStreamPerThread);
         }
     }
 
@@ -1031,6 +1034,8 @@ static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    ggml_cuda_q8_0_planes_forget(ctx->dev_ptr, buffer->size);
+    ggml_cuda_q6_k_planes_forget(ctx->dev_ptr, buffer->size);
 }
 
 static const ggml_backend_buffer_i ggml_backend_cuda_buffer_interface = {
@@ -3056,10 +3061,8 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
         return;
     }
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
-    if (offset + size == ggml_nbytes(tensor) && ggml_cuda_q8_0_planes_eligible(tensor, cuda_ctx->device)) {
-        ggml_cuda_q8_0_planes_repack(tensor, cuda_ctx->stream());
-    } else if (offset + size == ggml_nbytes(tensor) && ggml_cuda_q6_k_planes_eligible(tensor, cuda_ctx->device)) {
-        ggml_cuda_q6_k_planes_repack(tensor, cuda_ctx->stream());
+    if (offset + size == ggml_nbytes(tensor)) {
+        ggml_cuda_planes_written(tensor, cuda_ctx->device, cuda_ctx->stream());
     }
 }
 

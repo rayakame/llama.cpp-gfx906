@@ -2943,6 +2943,9 @@ static bool q6_k_planes_find(const void * ptr, q6_k_planes_range & out) {
 // Reads or writes [ptr, ptr + size) of a tensor in planes in the canonical layout, through whole rows.
 static void q6_k_planes_rw(const q6_k_planes_range & r, char * ptr, void * host, const size_t size, const bool write,
         cudaStream_t stream) {
+    if (size == 0) {
+        return;
+    }
     const int     nb        = r.ne0 / QK_K;
     const size_t  row_bytes = nb*sizeof(block_q6_K);
     const size_t  off       = ptr - r.lo;
@@ -3222,6 +3225,16 @@ bool ggml_cuda_q8_0_planes(const ggml_tensor * tensor) {
     GGML_UNUSED(tensor);
     return false;
 #endif // defined(GGML_USE_HIP)
+}
+
+void ggml_cuda_planes_written(const ggml_tensor * tensor, const int device, cudaStream_t stream) {
+    ggml_cuda_q8_0_planes_forget(tensor->data, ggml_nbytes(tensor));
+    ggml_cuda_q6_k_planes_forget(tensor->data, ggml_nbytes(tensor));
+    if (ggml_cuda_q8_0_planes_eligible(tensor, device)) {
+        ggml_cuda_q8_0_planes_repack(tensor, stream);
+    } else if (ggml_cuda_q6_k_planes_eligible(tensor, device)) {
+        ggml_cuda_q6_k_planes_repack(tensor, stream);
+    }
 }
 
 void ggml_cuda_q8_0_planes_unpack(const ggml_tensor * tensor, void * dst, cudaStream_t stream) {
