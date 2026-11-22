@@ -170,6 +170,87 @@ template <ggml_type type, int J, bool fallback, int JL = J> static __device__ __
     }
 }
 
+// ggml_cuda_mmq_vec_dot_q4_1_q8_1_dp4a_grid with the y of column c + 1 read from LDS during the dp4a of column c; same sums.
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q4_1_q8_1_dp4a_grid_pf(
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback, GGML_PREC_Q8) / warp_size;
+    constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback, GGML_PREC_Q8);
+    constexpr int LJ        = ggml_cuda_mmq_dp4a_lanes_j(type, J, fallback, GGML_PREC_Q8);
+    constexpr int LI        = warp_size / LJ;
+    constexpr int RI        = I / LI;
+    constexpr int RJ        = J / (nwarps*LJ);
+    static_assert(RI*LI == I && RJ*nwarps*LJ == J, "bad dp4a lane grid");
+    static_assert(VDR_Q4_1_Q8_1_MMQ == 4, "bad VDR_Q4_1_Q8_1_MMQ");
+
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q4_1, I);
+    const int   * x_qs = (const int   *) x;
+    const half2 * x_dm = (const half2 *) x_qs + txs.qs;
+    const int   * y_qs = (const int   *) y + 4;
+    const half2 * y_ds = (const half2 *) y;
+
+    const int li = threadIdx.x % LI;
+    const int lj = threadIdx.x / LI;
+
+    // Reading x of the next k01 step ahead too drops J = 64 from 3 to 2 blocks per CU (95 VGPRs).
+#pragma unroll 1
+    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QR4_1*VDR_Q4_1_Q8_1_MMQ) {
+        const int k0   = k00 + k01;
+        const int kyqs = QI8_1 * ((k01/2) / (QI8_1/2)) + (k01/2) % (QI8_1/2);
+
+        int   v[RI][VDR_Q4_1_Q8_1_MMQ];
+        half2 dm4[RI];
+#pragma unroll
+        for (int r = 0; r < RI; ++r) {
+            const int i = li + r*LI;
+#pragma unroll
+            for (int l = 0; l < VDR_Q4_1_Q8_1_MMQ; ++l) {
+                v[r][l] = x_qs[i*(MMQ_TILE_NE_K + 1) + k0/QR4_1 + l];
+            }
+            dm4[r] = x_dm[i*(MMQ_TILE_NE_K/QI4_1) + i/QI4_1 + k0/(QR4_1*QI4_1)];
+        }
+
+        int   u[2][2*VDR_Q4_1_Q8_1_MMQ];
+        half2 ds8[2];
+        auto load_u = [&](const int c, int * uc) {
+            const int j = threadIdx.y + nwarps*(lj + c*LJ);
+
+            int tmp0[4], tmp1[4];
+            ggml_cuda_memcpy_1<16>(tmp0, &y_qs[j*MMQ_TILE_Y_K + kyqs]);
+            ggml_cuda_memcpy_1<16>(tmp1, &y_qs[j*MMQ_TILE_Y_K + kyqs + QI4_1]);
+
+            uc[0]=tmp0[0]; uc[2]=tmp0[1]; uc[4]=tmp0[2]; uc[6]=tmp0[3];
+            uc[1]=tmp1[0]; uc[3]=tmp1[1]; uc[5]=tmp1[2]; uc[7]=tmp1[3];
+        };
+        auto load_ds8 = [&](const int c) {
+            return y_ds[(threadIdx.y + nwarps*(lj + c*LJ))*MMQ_TILE_Y_K + k01/QI8_1];
+        };
+
+        load_u(0, u[0]);
+        ds8[0] = load_ds8(0);
+
+#pragma unroll
+        for (int c = 0; c < RJ; ++c) {
+            if (c + 1 < RJ) {
+                load_u(c + 1, u[(c + 1) % 2]);
+            }
+#if defined(GGML_USE_HIP)
+            // Without it ROCm 10.1 issues the reads only half a column ahead.
+            __builtin_amdgcn_sched_barrier(0);
+#endif // defined(GGML_USE_HIP)
+            // The scale is read after the barrier: before it, the J = 64 tiled kernel needs 85 VGPRs (2 blocks per CU).
+            if (c + 1 < RJ) {
+                ds8[(c + 1) % 2] = load_ds8(c + 1);
+            }
+
+#pragma unroll
+            for (int r = 0; r < RI; ++r) {
+                sum[c*RI + r] += vec_dot_q4_1_q8_1_impl<VDR_Q4_1_Q8_1_MMQ>(v[r], u[c % 2], dm4[r], ds8[c % 2]);
+            }
+        }
+    }
+}
+
 // Same sums as ggml_cuda_mmq_vec_dot_q4_0_q8_1_dp4a in the lane grid of ggml_cuda_mmq_write_back_dp4a_grid.
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q4_0_q8_1_dp4a_grid(
         const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
