@@ -3137,8 +3137,8 @@ bool ggml_cuda_q6_k_planes_direct(const ggml_tensor * src0) {
         return false;
     }
     const size_t row_bytes = ggml_row_size(GGML_TYPE_Q6_K, r.ne0);
-    return ((const char *) src0->data - r.lo) % row_bytes == 0 && src0->nb[1] % row_bytes == 0 && src0->nb[2] % row_bytes == 0 &&
-        src0->nb[3] % row_bytes == 0;
+    return src0->ne[0] <= r.ne0 && ((const char *) src0->data - r.lo) % row_bytes == 0 && src0->nb[1] % row_bytes == 0 &&
+        src0->nb[2] % row_bytes == 0 && src0->nb[3] % row_bytes == 0;
 #else
     GGML_UNUSED(src0);
     return false;
