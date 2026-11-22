@@ -12011,6 +12011,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_ssm_conv_l2_norm(10240, 16, 2, 16));
     test_cases.emplace_back(new test_ssm_conv_l2_norm(512, 4, 1, 1));
 
+    // Qwen3.8 27B: d_conv 4, 10240 channels, the edges of every token tile
+    for (int64_t n_t : {1, 3, 4, 5, 8, 13, 16, 17, 32, 33, 64, 100, 512}) {
+        for (int64_t n_s : {1, 4}) {
+            test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {3 + n_t, 10240, n_s, 1}, {4, 10240, 1, 1}));
+            test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, {3 + n_t, 10240, n_s, 1}, {4, 10240, 1, 1}, false));
+        }
+    }
+
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 16, 1, 1024, 1, 32, 4)); // Mamba-1
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 64, 64, 112, 2, 32, 4)); // Zamba2 (real hparams: d_inner=7168, dt_rank=112, n_group=2 -> head_dim=7168/112=64)
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 64, 64, 112, 2, 1, 1)); // Zamba2 decode (single-token, matches real per-token decode workload)
@@ -14422,6 +14430,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {4,   3328, 1, 1}, {4, 3328, 1, 1})); // generate
     test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, {515, 3328, 1, 1}, {4, 3328, 1, 1}, true));  // prefill
     test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, {4,   3328, 1, 1}, {4, 3328, 1, 1}, true));  // generate
+    for (int64_t n_t : {1, 4, 8, 16, 512, 2048}) {
+        test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {3 + n_t, 10240, 1, 1}, {4, 10240, 1, 1})); // Qwen3.8 27B
+    }
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 48, 1, 512, 1)); // prefill
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 48, 1, 1,   1)); // generate
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 80, 128, 1, 512, 1)); // Nemotron-9B prefill
