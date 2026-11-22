@@ -544,7 +544,7 @@ static constexpr __host__ __device__ bool ggml_cuda_mmq_dp4a_grid_small_j(ggml_t
 
 // Lane grid tiles with the column-pipelined Q4_1 dot, which GGML_MMQ_Q4_1_PF=0 turns off.
 static constexpr __host__ __device__ bool ggml_cuda_mmq_dp4a_grid_pf(ggml_type type, int J) {
-    return type == GGML_TYPE_Q4_1 && J >= 32;
+    return type == GGML_TYPE_Q4_1 && J >= 16;
 }
 
 #include "mmq-load-tiles.cuh"
@@ -1988,7 +1988,7 @@ static void launch_mul_mat_q_impl(ggml_backend_cuda_context & ctx, const mmq_arg
         }
     }
 
-    if constexpr (dp4a_pf && ggml_cuda_mmq_dp4a_grid_pf(type, J)) {
+    if constexpr (dp4a_pf && dp4a_grid && !y_smem && ggml_cuda_mmq_dp4a_grid_pf(type, J)) {
         static const bool pf = [] { const char * e = getenv("GGML_MMQ_Q4_1_PF"); return !e || atoi(e) != 0; }();
         if (!pf) {
             launch_mul_mat_q_impl<type, J, fallback, prec_src1, has_fusion, planes, partial_j, y_smem, unroll_k, dp4a_grid, grid_lds, pipeline, y_b128, false, gcn_loader>(ctx, args, stream);
