@@ -652,17 +652,28 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llm_graph_params & params)
         // a draft only proposes, so its head reads the first head_rows rows and the tail; the rows between get -inf
         ggml_tensor * x = build_hadamard_input(head_w, cur);
 
+        // as build_lora_mm does for head_w; the policy is keyed by head_w, not by the views, and the scale comes before the -inf rows
+        auto head_mm = [&](ggml_tensor * w) {
+            ggml_tensor * r = ggml_mul_mat(ctx0, w, x);
+            if (prec_policy) {
+                const auto it = prec_policy->prec_src1.find(head_w);
+                if (it != prec_policy->prec_src1.end()) {
+                    ggml_prec_set_src(r, it->second, 1);
+                }
+            }
+            if (head_w->type == GGML_TYPE_NVFP4) {
+                ggml_prec_set_acc(r, GGML_PREC_BF16);
+            }
+            return head_s ? ggml_mul(ctx0, r, head_s) : r;
+        };
+
         ggml_tensor * w_lo = ggml_view_2d(ctx0, head_w, head_w->ne[0], head_rows, head_w->nb[1], 0);
-        cur = ggml_mul_mat(ctx0, w_lo, x);
+        cur = head_mm(w_lo);
         cur = ggml_concat(ctx0, cur, ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, i_tail - head_rows, x->ne[1]), -INFINITY), 0);
 
         if (i_tail < n_head_rows) {
             ggml_tensor * w_hi = ggml_view_2d(ctx0, head_w, head_w->ne[0], n_head_rows - i_tail, head_w->nb[1], i_tail * head_w->nb[1]);
-            cur = ggml_concat(ctx0, cur, ggml_mul_mat(ctx0, w_hi, x), 0);
-        }
-
-        if (head_s) {
-            cur = ggml_mul(ctx0, cur, head_s);
+            cur = ggml_concat(ctx0, cur, head_mm(w_hi), 0);
         }
     } else {
         cur = build_lora_mm(head_w, cur, head_s);
