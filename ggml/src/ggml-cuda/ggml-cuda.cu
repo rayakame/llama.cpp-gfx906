@@ -3249,7 +3249,14 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     const void * graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
-    if (cgraph->uid != 0 &&
+    // a weight that went into or out of planes since the capture needs other kernels
+    const uint64_t planes_epoch = ggml_cuda_planes_epoch();
+    if (graph->planes_epoch != planes_epoch) {
+        graph->planes_epoch = planes_epoch;
+        res = true;
+    }
+
+    if (!res && cgraph->uid != 0 &&
         cgraph->uid == graph->uid) {
         if (ggml_cuda_graph_debug_enabled()) {
             GGML_LOG_DEBUG("CUDA Graph id %zu reused\n", cgraph->uid);

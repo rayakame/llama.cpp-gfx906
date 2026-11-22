@@ -2877,6 +2877,12 @@ static void q8_0_planes_rw(const char * lo, char * ptr, void * host, const size_
 
 #endif // defined(GGML_USE_HIP)
 
+static std::atomic<uint64_t> planes_epoch{0};
+
+uint64_t ggml_cuda_planes_epoch() {
+    return planes_epoch.load(std::memory_order_relaxed);
+}
+
 bool ggml_cuda_q6_k_planes_eligible(const ggml_tensor * tensor, const int device) {
 #if defined(GGML_USE_HIP)
     const int mode = q6_k_planes_mode();
@@ -2910,6 +2916,7 @@ void ggml_cuda_q6_k_planes_repack(const ggml_tensor * tensor, cudaStream_t strea
     const char * lo = (const char *) tensor->data;
     q6_k_planes_ranges[lo] = {lo, lo + ggml_nbytes(tensor), tensor->ne[0]};
     q6_k_planes_count = (int) q6_k_planes_ranges.size();
+    planes_epoch.fetch_add(1, std::memory_order_relaxed);
 #else
     GGML_UNUSED_VARS(tensor, stream);
 #endif // defined(GGML_USE_HIP)
@@ -3055,13 +3062,21 @@ bool ggml_cuda_q6_k_planes_set(const ggml_tensor * tensor, const void * data, co
 
 void ggml_cuda_q6_k_planes_forget(const void * base, const size_t size) {
 #if defined(GGML_USE_HIP)
-    if (q6_k_planes_count.load(std::memory_order_relaxed) == 0) {
+    if (size == 0 || q6_k_planes_count.load(std::memory_order_relaxed) == 0) {
         return;
     }
     std::lock_guard<std::mutex> lock(q6_k_planes_mutex);
     const char * lo = (const char *) base;
-    q6_k_planes_ranges.erase(q6_k_planes_ranges.lower_bound(lo), q6_k_planes_ranges.lower_bound(lo + size));
-    q6_k_planes_count = (int) q6_k_planes_ranges.size();
+    auto first = q6_k_planes_ranges.lower_bound(lo);
+    if (first != q6_k_planes_ranges.begin() && std::prev(first)->second.hi > lo) {
+        --first;
+    }
+    const auto last = q6_k_planes_ranges.lower_bound(lo + size);
+    if (first != last) {
+        q6_k_planes_ranges.erase(first, last);
+        q6_k_planes_count = (int) q6_k_planes_ranges.size();
+        planes_epoch.fetch_add(1, std::memory_order_relaxed);
+    }
 #else
     GGML_UNUSED_VARS(base, size);
 #endif // defined(GGML_USE_HIP)
@@ -3143,6 +3158,7 @@ void ggml_cuda_q8_0_planes_repack(const ggml_tensor * tensor, cudaStream_t strea
     std::lock_guard<std::mutex> lock(q8_0_planes_mutex);
     q8_0_planes_ranges[lo] = lo + nbytes;
     q8_0_planes_count = (int) q8_0_planes_ranges.size();
+    planes_epoch.fetch_add(1, std::memory_order_relaxed);
 #else
     GGML_UNUSED_VARS(tensor, stream);
 #endif // defined(GGML_USE_HIP)
@@ -3178,13 +3194,21 @@ bool ggml_cuda_q8_0_planes_set(const ggml_tensor * tensor, const void * data, co
 
 void ggml_cuda_q8_0_planes_forget(const void * base, const size_t size) {
 #if defined(GGML_USE_HIP)
-    if (q8_0_planes_count.load(std::memory_order_relaxed) == 0) {
+    if (size == 0 || q8_0_planes_count.load(std::memory_order_relaxed) == 0) {
         return;
     }
     std::lock_guard<std::mutex> lock(q8_0_planes_mutex);
     const char * lo = (const char *) base;
-    q8_0_planes_ranges.erase(q8_0_planes_ranges.lower_bound(lo), q8_0_planes_ranges.lower_bound(lo + size));
-    q8_0_planes_count = (int) q8_0_planes_ranges.size();
+    auto first = q8_0_planes_ranges.lower_bound(lo);
+    if (first != q8_0_planes_ranges.begin() && std::prev(first)->second > lo) {
+        --first;
+    }
+    const auto last = q8_0_planes_ranges.lower_bound(lo + size);
+    if (first != last) {
+        q8_0_planes_ranges.erase(first, last);
+        q8_0_planes_count = (int) q8_0_planes_ranges.size();
+        planes_epoch.fetch_add(1, std::memory_order_relaxed);
+    }
 #else
     GGML_UNUSED_VARS(base, size);
 #endif // defined(GGML_USE_HIP)

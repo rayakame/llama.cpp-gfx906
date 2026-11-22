@@ -1285,6 +1285,7 @@ struct ggml_cuda_graph {
     bool disable_due_to_gpu_arch = false;
     bool warmup_complete = false;
     uint64_t uid = 0;
+    uint64_t planes_epoch = 0; // ggml_cuda_planes_epoch() at the last check
     int64_t last_used_time = 0;
     struct node_properties {
         ggml_tensor node;

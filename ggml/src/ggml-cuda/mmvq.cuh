@@ -36,6 +36,8 @@ bool ggml_cuda_q6_k_planes(const ggml_tensor * src0);
 // The whole tensor in planes that src0 points into, in the canonical layout: its size, and where src0's data lands in dst.
 size_t ggml_cuda_q6_k_planes_nbytes(const ggml_tensor * src0);
 char * ggml_cuda_q6_k_planes_unpack(const ggml_tensor * src0, char * dst, cudaStream_t stream);
+// Changes when memory goes into or out of planes; a graph captured before reads it with the wrong kernels.
+uint64_t ggml_cuda_planes_epoch();
 // The q8_1 copy of src1 that an earlier MUL_MAT of the graph left, if src1 did not change since; nullptr otherwise.
 // layout: 0 for quantize_q8_1, 1 + mmq_q8_1_ds_layout for quantize_mmq_q8_1. size: bytes of quantized data.
 char * ggml_cuda_q8_1_cache_find(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, int layout, size_t size, size_t size_alloc);
