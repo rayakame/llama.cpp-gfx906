@@ -4681,7 +4681,10 @@ static bool ggml_cuda_match_conv_step(ggml_backend_cuda_context * cuda_ctx, cons
     const char * s_hi = s_lo + ggml_nbytes(states);
     const size_t row_size = states->nb[1];
     const size_t win_size = n_old*nr*sizeof(float);
-    // each window is a whole state row, so a thread reads and writes only the elements of its own channel
+    // each window is a whole state row and the rows do not overlap, so a thread reads and writes only the elements of its own channel
+    if (row_size < win_size) {
+        return false;
+    }
     auto row_ok = [&](const char * p) {
         return p >= s_lo && p + win_size <= s_hi && (size_t) (p - s_lo) % row_size == 0;
     };
@@ -4775,9 +4778,18 @@ static bool ggml_cuda_match_conv_step(ggml_backend_cuda_context * cuda_ctx, cons
             ggml_cuda_overlaps(x, s_lo, s_hi) || (!y_is_x && ggml_cuda_overlaps(x, y_lo, y_hi))) {
         return false;
     }
+    // the weights are read at the concat too, so no node after it may write them
+    const char * w_lo = (const char *) w->data;
+    const char * w_hi = w_lo + ggml_nbytes(w);
     for (int j = ci + 1; j < conv_idx; ++j) {
         const ggml_tensor * n = cgraph->nodes[j];
-        if (ggml_cuda_is_view_or_noop(n) || j == store_idx || (arange_idx >= 0 && j >= arange_idx && j <= arange_idx + 2)) {
+        if (ggml_cuda_is_view_or_noop(n)) {
+            continue;
+        }
+        if (ggml_cuda_node_touches(n, w_lo, w_hi)) {
+            return false;
+        }
+        if (j == store_idx || (arange_idx >= 0 && j >= arange_idx && j <= arange_idx + 2)) {
             continue;
         }
         if (ggml_cuda_node_touches(n, y_lo, y_hi) || (j < store_idx && ggml_cuda_node_touches(n, s_lo, s_hi))) {

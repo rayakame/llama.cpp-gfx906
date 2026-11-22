@@ -5021,6 +5021,7 @@ struct test_ssm_conv_step : public test_case {
     const int64_t mem_size;
     const int64_t head;
     const int32_t src_row;
+    const bool    w_scale; // the weights come from a SCALE that runs after the store
 
     ggml_tensor * store_node = nullptr;
     ggml_tensor * y_node     = nullptr;
@@ -5031,14 +5032,15 @@ struct test_ssm_conv_step : public test_case {
     }
 
     std::string vars() override {
-        return VARS_TO_STR6(nr, n_t, K, mem_size, head, src_row);
+        return VARS_TO_STR6(nr, n_t, K, mem_size, head, src_row) + (w_scale ? ",w_scale=1" : "");
     }
 
     bool run_whole_graph() override { return true; }
     std::vector<ggml_tensor *> fusion_test_nodes() override { return { y_node, store_node }; }
 
-    test_ssm_conv_step(int64_t nr = 10240, int64_t n_t = 4, int64_t K = 1, int64_t mem_size = 3, int64_t head = 1, int32_t src_row = 1)
-        : nr(nr), n_t(n_t), K(K), mem_size(mem_size), head(head), src_row(src_row) {}
+    test_ssm_conv_step(int64_t nr = 10240, int64_t n_t = 4, int64_t K = 1, int64_t mem_size = 3, int64_t head = 1, int32_t src_row = 1,
+            bool w_scale = false)
+        : nr(nr), n_t(n_t), K(K), mem_size(mem_size), head(head), src_row(src_row), w_scale(w_scale) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t d_conv = 4;
@@ -5080,7 +5082,7 @@ struct test_ssm_conv_step : public test_case {
         }
         ggml_set_name(store_node, "store");
 
-        y_node = ggml_silu(ctx, ggml_ssm_conv(ctx, conv_x, w));
+        y_node = ggml_silu(ctx, ggml_ssm_conv(ctx, conv_x, w_scale ? ggml_scale(ctx, w, 0.5f) : w));
         ggml_set_name(y_node, "y");
 
         // the store comes before the ssm_conv in the graph, as in the model
@@ -12103,6 +12105,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_ssm_conv_step(128, 4, 1, 3, 1, 1));
     test_cases.emplace_back(new test_ssm_conv_step(128, 4, 4, 3, 1, 7));
+    test_cases.emplace_back(new test_ssm_conv_step(10240, 4, 1, 3, 1, 1, true));
+    test_cases.emplace_back(new test_ssm_conv_step(10240, 4, 4, 3, 1, 7, true));
 
     for (int64_t n_t : {1, 2, 4, 5, 8, 16, 32, 33}) {
         test_cases.emplace_back(new test_ssm_conv_l2_norm(10240, n_t, 1, 16));
