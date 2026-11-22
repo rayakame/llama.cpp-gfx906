@@ -451,6 +451,10 @@ struct gdn_ct_shape {
 };
 
 static bool gdn_ct_supported(const gdn_ct_shape sh) {
+    // lpc * 100 + cols names one pair only for these lane and column counts ("1x132" would be 232)
+    if ((sh.lpc != 2 && sh.lpc != 4 && sh.lpc != 8 && sh.lpc != 16) || (sh.cols != 8 && sh.cols != 16 && sh.cols != 32 && sh.cols != 64)) {
+        return false;
+    }
     switch (sh.lpc * 100 + sh.cols) {
         case 232: case 264:
         case 416: case 432: case 464:
