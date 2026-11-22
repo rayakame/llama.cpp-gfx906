@@ -807,6 +807,9 @@ void llama_context::sched_reserve() {
 
     synchronize();
 
+    // the graph results and the scheduler that hold the device rows are freed below
+    logits_fetch();
+
     const int64_t t_start_us = ggml_time_us();
 
     const uint32_t n_seqs = cparams.n_seq_max;
@@ -2319,9 +2322,6 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     output_swaps.clear();
     embd_batch_idxs.clear();
 
-    // the new batch replaces the outputs, so rows still on the device are not needed
-    logits_dev = nullptr;
-
     sched_reserve();
 
     bool did_optimize = false;
@@ -2793,6 +2793,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
             logits.data = nullptr;
             logits_top_ids = {nullptr, 0};
             logits_top_val = {nullptr, 0};
+            logits_dev = nullptr;
             embd.data = nullptr;
             embd_nextn.data = nullptr;
             for (auto & layer_inp : embd_layer_inp) {
