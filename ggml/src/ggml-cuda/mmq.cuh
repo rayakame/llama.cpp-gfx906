@@ -1069,13 +1069,18 @@ static constexpr __device__ int ggml_cuda_mmq_get_vdr() {
     return ggml_cuda_mmq_get_util_funcs<type, J, fallback, prec_src1, false>().vdr;
 }
 
-template <ggml_type type, int J, bool fallback, ggml_prec prec_src1, bool has_fusion, bool planes = false>
+template <ggml_type type, int J, bool fallback, ggml_prec prec_src1, bool has_fusion, bool planes = false, bool grid_lds = false>
 static constexpr __device__ ggml_cuda_mmq_load_tiles_t ggml_cuda_mmq_get_load_tiles() {
     if constexpr (planes) {
         static_assert(type == GGML_TYPE_Q8_0 && !has_fusion, "planes are Q8_0 only, without fusion");
         return ggml_cuda_mmq_load_tiles_q8_0_planes<type, J, fallback>;
+    } else if constexpr (grid_lds && type == GGML_TYPE_IQ3_XXS) {
+        return ggml_cuda_mmq_load_tiles_iq3_xxs<type, J, fallback, true>;
+    } else if constexpr (grid_lds && type == GGML_TYPE_IQ3_S) {
+        return ggml_cuda_mmq_load_tiles_iq3_s<type, J, fallback, true>;
+    } else {
+        return ggml_cuda_mmq_get_util_funcs<type, J, fallback, prec_src1, has_fusion>().load_tiles;
     }
-    return ggml_cuda_mmq_get_util_funcs<type, J, fallback, prec_src1, has_fusion>().load_tiles;
 }
 
 template <ggml_type type, int J, bool fallback, ggml_prec prec_src1, int JL = J, bool y_smem = false, bool unroll_k = true, bool dp4a_grid = true>
@@ -1145,7 +1150,7 @@ static constexpr __host__ __device__ bool ggml_cuda_mmq_pipeline_available(const
 }
 
 // has_fusion: x and x_gate are the up and gate weights. partial_j: the dot skips the column steps past tile_y_j_sup.
-template <ggml_type type, int J, bool fallback, bool fixup, ggml_prec prec_src1, bool has_fusion, bool planes, bool partial_j, bool y_smem = false, bool unroll_k = true, bool dp4a_grid = true, bool pipeline = false>
+template <ggml_type type, int J, bool fallback, bool fixup, ggml_prec prec_src1, bool has_fusion, bool planes, bool partial_j, bool y_smem = false, bool unroll_k = true, bool dp4a_grid = true, bool grid_lds = false, bool pipeline = false>
 static __device__ __forceinline__ void mul_mat_q_process_tile(
         const char * __restrict__ x, const char * __restrict__ x_gate, const int offset_x, const int * __restrict__ y,
         const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
@@ -1160,7 +1165,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     constexpr int              nwarps     = ggml_cuda_mmq_get_nthreads(type, J, fallback, prec_src1) / warp_size;
     constexpr int              qk         = ggml_cuda_type_traits<type>::qk;
     constexpr int              I          = ggml_cuda_mmq_get_I(type, J, fallback, prec_src1);
-    constexpr ggml_cuda_mmq_load_tiles_t load_tiles = ggml_cuda_mmq_get_load_tiles<type, J, fallback, prec_src1, has_fusion, planes>();
+    constexpr ggml_cuda_mmq_load_tiles_t load_tiles = ggml_cuda_mmq_get_load_tiles<type, J, fallback, prec_src1, has_fusion, planes, grid_lds>();
     constexpr ggml_cuda_mmq_vec_dot_t    vec_dot    = ggml_cuda_mmq_get_vec_dot<type, J, fallback, prec_src1, J, y_smem, unroll_k, dp4a_grid>();
     constexpr ggml_cuda_mmq_write_back_t write_back = ggml_cuda_mmq_get_write_back<type, J, fallback, prec_src1, has_fusion, y_smem, dp4a_grid>();
 
@@ -1324,8 +1329,9 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
 // The mul_mat_q kernel implements "stream-k" work partitioning as described in https://arxiv.org/abs/2301.03598
 // force_tiling lets the host use the native tiled path for configs that normally use Stream-K.
+// grid_lds: the IQ3 loaders read their grid from a copy in LDS (ggml_cuda_iq_grid_lds).
 
-template <ggml_type type, int J, bool fallback, ggml_prec prec_src1, bool has_fusion, bool force_tiling = false, bool planes = false, bool partial_j = false, bool y_smem = false, bool unroll_k = true, bool dp4a_grid = true, bool pipeline = false>
+template <ggml_type type, int J, bool fallback, ggml_prec prec_src1, bool has_fusion, bool force_tiling = false, bool planes = false, bool partial_j = false, bool y_smem = false, bool unroll_k = true, bool dp4a_grid = true, bool grid_lds = false, bool pipeline = false>
 __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback, prec_src1), ggml_cuda_mmq_get_occupancy(type, J, fallback, prec_src1))
 static __global__ void mul_mat_q(
         const char * __restrict__ x, const char * __restrict__ x_gate, const int * __restrict__ y, const int32_t * __restrict__ ids_dst,
@@ -1376,6 +1382,9 @@ static __global__ void mul_mat_q(
         }
 
         ids_dst_shared[j] = j;
+    }
+    if constexpr (grid_lds) {
+        ggml_cuda_iq_grid_lds_fill<type, nwarps*warp_size>(threadIdx.y*warp_size + threadIdx.x);
     }
     __syncthreads();
 
@@ -1440,7 +1449,7 @@ static __global__ void mul_mat_q(
         const float * gate_scale_tile = gate_scale && ids_dst ? gate_scale + zt : gate_scale;
 
         constexpr bool fixup = false;
-        mul_mat_q_process_tile<type, J, fallback, fixup, prec_src1, has_fusion, planes, partial_j, y_smem, unroll_k, dp4a_grid, pipeline>
+        mul_mat_q_process_tile<type, J, fallback, fixup, prec_src1, has_fusion, planes, partial_j, y_smem, unroll_k, dp4a_grid, grid_lds, pipeline>
             (x, x_gate, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
              glu_op, glu_limit, x_scale_tile, gate_scale_tile, stride_row_x, ncols_y, stride_col_dst,
              tile_x_i_max, col_high - col_low, 0, blocks_per_ne00.z);
@@ -1524,7 +1533,7 @@ static __global__ void mul_mat_q(
         const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*I*stride_row_x;
 
         constexpr bool fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
-        mul_mat_q_process_tile<type, J, fallback, fixup, prec_src1, false, planes, partial_j, y_smem, unroll_k, dp4a_grid, pipeline>
+        mul_mat_q_process_tile<type, J, fallback, fixup, prec_src1, false, planes, partial_j, y_smem, unroll_k, dp4a_grid, grid_lds, pipeline>
             (x, x_gate, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
              glu_op, glu_limit, x_scale, gate_scale, stride_row_x, ncols_y, stride_col_dst,
              tile_x_i_max, col_high - col_low, kb0_start, kb0_stop);
@@ -1598,7 +1607,7 @@ static __global__ void mul_mat_q(
     const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*I*stride_row_x;
 
     constexpr bool fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
-    mul_mat_q_process_tile<type, J, fallback, fixup, prec_src1, false, planes, partial_j, y_smem, unroll_k, dp4a_grid, pipeline>
+    mul_mat_q_process_tile<type, J, fallback, fixup, prec_src1, false, planes, partial_j, y_smem, unroll_k, dp4a_grid, grid_lds, pipeline>
         (x, x_gate, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
          glu_op, glu_limit, x_scale, gate_scale, stride_row_x, ncols_y, stride_col_dst,
          tile_x_i_max, col_high - col_low, kb0_start, kb0_stop);
@@ -1788,14 +1797,24 @@ static bool ggml_cuda_mmq_pipeline_enabled() {
     return enabled;
 }
 
-template <ggml_type type, int J, bool fallback, ggml_prec prec_src1, bool has_fusion, bool planes, bool partial_j, bool y_smem, bool unroll_k, bool dp4a_grid, bool pipeline = false>
+template <ggml_type type, int J, bool fallback, ggml_prec prec_src1, bool has_fusion, bool planes, bool partial_j, bool y_smem, bool unroll_k, bool dp4a_grid, bool grid_lds = false, bool pipeline = false>
 static void launch_mul_mat_q_impl(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     const int id = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[id].cc;
 
+#if defined(GGML_USE_HIP)
+    if constexpr (!grid_lds && ggml_cuda_iq_grid_lds_type(type)) {
+        static const bool use_grid_lds = ggml_cuda_iq_grid_lds_enabled("GGML_MMQ_IQ_GRID_LDS", type);
+        if (use_grid_lds && GGML_CUDA_CC_IS_GCN(cc)) {
+            launch_mul_mat_q_impl<type, J, fallback, prec_src1, has_fusion, planes, partial_j, y_smem, unroll_k, dp4a_grid, true, pipeline>(ctx, args, stream);
+            return;
+        }
+    }
+#endif // defined(GGML_USE_HIP)
+
     if constexpr (!pipeline && !planes && !partial_j && !y_smem && ggml_cuda_mmq_pipeline_available(type, J, fallback, has_fusion, unroll_k)) {
         if (GGML_CUDA_CC_IS_GCN(cc) && ggml_cuda_mmq_pipeline_enabled()) {
-            launch_mul_mat_q_impl<type, J, fallback, prec_src1, has_fusion, planes, partial_j, y_smem, unroll_k, true>(ctx, args, stream);
+            launch_mul_mat_q_impl<type, J, fallback, prec_src1, has_fusion, planes, partial_j, y_smem, unroll_k, dp4a_grid, grid_lds, true>(ctx, args, stream);
             return;
         }
     }
@@ -1810,9 +1829,9 @@ static void launch_mul_mat_q_impl(ggml_backend_cuda_context & ctx, const mmq_arg
 
     const dim3 block_dims(warp_size, nwarps, 1);
 
-    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, /*fallback =*/ false, prec_src1, has_fusion, false, planes, partial_j, y_smem, unroll_k, dp4a_grid, pipeline>), nbytes_shared);
+    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, /*fallback =*/ false, prec_src1, has_fusion, false, planes, partial_j, y_smem, unroll_k, dp4a_grid, grid_lds, pipeline>), nbytes_shared);
     if constexpr (!has_fusion) {
-        CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, /*fallback =*/ true, prec_src1, false, false, planes, partial_j, y_smem, unroll_k, dp4a_grid, pipeline>), nbytes_shared);
+        CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, /*fallback =*/ true, prec_src1, false, false, planes, partial_j, y_smem, unroll_k, dp4a_grid, grid_lds, pipeline>), nbytes_shared);
     }
 
     const int I_dst = has_fusion ? config.I/2 : config.I; // Rows of dst per tile, see mul_mat_q.
@@ -1835,7 +1854,7 @@ static void launch_mul_mat_q_impl(ggml_backend_cuda_context & ctx, const mmq_arg
 
     if (has_fusion || !config.stream_k) {
         GGML_ASSERT(nti <= 65535); // gridDim.y limit
-        mul_mat_q<type, J, fallback, prec_src1, has_fusion, false, planes, partial_j, y_smem, unroll_k, dp4a_grid, pipeline><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
+        mul_mat_q<type, J, fallback, prec_src1, has_fusion, false, planes, partial_j, y_smem, unroll_k, dp4a_grid, grid_lds, pipeline><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
             (args.x, (const char *) args.fusion.gate, args.y, args.ids_dst, args.tile_spec, args.dst, nullptr,
              args.y_scale, args.fusion.glu_op, args.fusion.glu_limit, (const float *) args.fusion.x_scale, (const float *) args.fusion.gate_scale,
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
@@ -1861,8 +1880,8 @@ static void launch_mul_mat_q_impl(ggml_backend_cuda_context & ctx, const mmq_arg
 
     if (force_tiling) {
         GGML_ASSERT(nti <= 65535);
-        CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, fallback, prec_src1, has_fusion, true, planes, partial_j, y_smem, unroll_k, dp4a_grid, pipeline>), nbytes_shared);
-        mul_mat_q<type, J, fallback, prec_src1, has_fusion, true, planes, partial_j, y_smem, unroll_k, dp4a_grid, pipeline><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
+        CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, fallback, prec_src1, has_fusion, true, planes, partial_j, y_smem, unroll_k, dp4a_grid, grid_lds, pipeline>), nbytes_shared);
+        mul_mat_q<type, J, fallback, prec_src1, has_fusion, true, planes, partial_j, y_smem, unroll_k, dp4a_grid, grid_lds, pipeline><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
             (args.x, (const char *) args.fusion.gate, args.y, args.ids_dst, args.tile_spec, args.dst, nullptr,
              args.y_scale, args.fusion.glu_op, args.fusion.glu_limit, (const float *) args.fusion.x_scale, (const float *) args.fusion.gate_scale,
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
@@ -1896,7 +1915,7 @@ static void launch_mul_mat_q_impl(ggml_backend_cuda_context & ctx, const mmq_arg
     const int nwarps_fixup = GGML_CUDA_CC_IS_GCN(cc) ? nwarps : nwarps/2;
     const dim3 block_dims_fixup(block_dims.x, nwarps_fixup, block_dims.z);
 
-    mul_mat_q<type, J, fallback, prec_src1, has_fusion, false, planes, partial_j, y_smem, unroll_k, dp4a_grid, pipeline><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
+    mul_mat_q<type, J, fallback, prec_src1, has_fusion, false, planes, partial_j, y_smem, unroll_k, dp4a_grid, grid_lds, pipeline><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
         (args.x, (const char *) args.fusion.gate, args.y, args.ids_dst, args.tile_spec, args.dst, tmp_fixup.ptr,
          args.y_scale, args.fusion.glu_op, args.fusion.glu_limit, (const float *) args.fusion.x_scale, (const float *) args.fusion.gate_scale,
          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,

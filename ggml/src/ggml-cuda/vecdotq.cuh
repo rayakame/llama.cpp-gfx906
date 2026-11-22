@@ -157,6 +157,59 @@ static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
     return s * 0x01010101;
 }
 
+// IQ3 grid lookups are divergent global loads; on GCN they share the vector memory pipe and the 16 KB L1 with the
+// weight loads. Kernels with grid_lds copy the grid into LDS once per block and read it from there.
+static constexpr __host__ __device__ bool ggml_cuda_iq_grid_lds_type(const ggml_type type) {
+    return type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S;
+}
+
+template <ggml_type type>
+static __device__ __forceinline__ uint32_t * ggml_cuda_iq_grid_lds() {
+    static_assert(ggml_cuda_iq_grid_lds_type(type), "no LDS grid for this type");
+    __shared__ uint32_t grid[type == GGML_TYPE_IQ3_XXS ? 256 : 512];
+    return grid;
+}
+
+template <ggml_type type, bool grid_lds>
+static __device__ __forceinline__ const uint32_t * ggml_cuda_iq_grid() {
+    if constexpr (grid_lds) {
+        return ggml_cuda_iq_grid_lds<type>();
+    } else {
+        return type == GGML_TYPE_IQ3_XXS ? iq3xxs_grid : iq3s_grid;
+    }
+}
+
+// mask_env: bit 0 IQ3_XXS, bit 1 IQ3_S; unset = both, 0 = the global grid.
+static inline bool ggml_cuda_iq_grid_lds_enabled(const char * mask_env, const ggml_type type) {
+    const char * s = getenv(mask_env);
+    const int mask = s ? atoi(s) : 3;
+    return (mask & (type == GGML_TYPE_IQ3_XXS ? 1 : 2)) != 0;
+}
+
+// All threads of the block call it; a __syncthreads() must follow before the first lookup.
+template <ggml_type type, int nthreads>
+static __device__ __forceinline__ void ggml_cuda_iq_grid_lds_fill(const int tid) {
+    constexpr int n    = type == GGML_TYPE_IQ3_XXS ? 256 : 512;
+    constexpr int nper = (n + nthreads - 1) / nthreads;
+    const uint32_t * src = ggml_cuda_iq_grid<type, false>();
+    uint32_t * dst = ggml_cuda_iq_grid_lds<type>();
+
+    // Guarded loads each wait before the next one is issued; clamped loads all go out at once.
+    uint32_t v[nper];
+#pragma unroll
+    for (int k = 0; k < nper; ++k) {
+        const int i = k*nthreads + tid;
+        v[k] = src[n % nthreads == 0 || i < n ? i : n - 1];
+    }
+#pragma unroll
+    for (int k = 0; k < nper; ++k) {
+        const int i = k*nthreads + tid;
+        if (n % nthreads == 0 || i < n) {
+            dst[i] = v[k];
+        }
+    }
+}
+
 // VDR = vec dot ratio, how many contiguous integers each thread processes when the vec dot kernel is called
 // MMVQ = mul_mat_vec_q, MMQ = mul_mat_q
 
@@ -1358,10 +1411,12 @@ static __device__ __forceinline__ float vec_dot_iq2_s_q8_1(
 #define VDR_IQ3_XXS_Q8_1_MMVQ 2
 #define VDR_IQ3_XXS_Q8_1_MMQ  2
 
+template <bool grid_lds = false>
 static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
     const block_iq3_xxs * bq3 = (const block_iq3_xxs *) vbq + kbx;
+    const uint32_t * grid = ggml_cuda_iq_grid<GGML_TYPE_IQ3_XXS, grid_lds>();
 
     const int2 q3_packed = make_int2(get_int_b2(bq3->qs, iqs), get_int_b2(bq3->qs, iqs+1));
     const uint8_t * q3 = (const uint8_t *) &q3_packed;
@@ -1370,7 +1425,7 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
     int sumi = 0;
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
-        const int2 grid_pos = make_int2(iq3xxs_grid[q3[l0 + 0]], iq3xxs_grid[q3[l0 + 1]]);
+        const int2 grid_pos = make_int2(grid[q3[l0 + 0]], grid[q3[l0 + 1]]);
         const uint32_t signs = unpack_ksigns(aux32 >> (7*l0/2));
 
         const int signs0 = __vcmpne4(signs & 0x08040201, 0);
@@ -1397,10 +1452,12 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
 #define VDR_IQ3_S_Q8_1_MMQ  2
 
 // TODO: don't use lookup table for signs
+template <bool grid_lds = false>
 static __device__ __forceinline__ float vec_dot_iq3_s_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
     const block_iq3_s * bq3 = (const block_iq3_s *) vbq + kbx;
+    const uint32_t * grid = ggml_cuda_iq_grid<GGML_TYPE_IQ3_S, grid_lds>();
 
     const int2      qs_packed = make_int2(get_int_b2(bq3->qs, iqs + 0), get_int_b2(bq3->qs, iqs + 1));
     const uint8_t * qs        = (const uint8_t *) &qs_packed;
@@ -1414,8 +1471,8 @@ static __device__ __forceinline__ float vec_dot_iq3_s_q8_1(
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const int2 grid_pos = make_int2(
-            iq3s_grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
-            iq3s_grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
+            grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
+            grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
 
         const int signs0 = __vcmpne4(((signs_packed_8[l0/2] & 0x03) << 7) | ((signs_packed_8[l0/2] & 0x0C) << 21), 0x00000000);
         const int signs1 = __vcmpne4(((signs_packed_8[l0/2] & 0x30) << 3) | ((signs_packed_8[l0/2] & 0xC0) << 17), 0x00000000);
@@ -1485,8 +1542,10 @@ static __device__ __forceinline__ float vec_dot_iq2_s_q8_1_gcn(
     return d * sumi;
 }
 
+template <bool grid_lds = false>
 static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1_gcn(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    const uint32_t * grid = ggml_cuda_iq_grid<GGML_TYPE_IQ3_XXS, grid_lds>();
 
     const block_iq3_xxs * bq3 = (const block_iq3_xxs *) vbq + kbx;
 
@@ -1497,7 +1556,7 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1_gcn(
     int sumi = 0;
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
-        const int2 grid_pos = make_int2(iq3xxs_grid[q3[l0 + 0]], iq3xxs_grid[q3[l0 + 1]]);
+        const int2 grid_pos = make_int2(grid[q3[l0 + 0]], grid[q3[l0 + 1]]);
 
         // 7 stored sign bits, the 8th (bit 0 of the popcount) makes the parity even
         const uint32_t ks    = (aux32 >> (7*l0/2)) & 0x7F;
@@ -1519,8 +1578,10 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1_gcn(
     return d * sumi;
 }
 
+template <bool grid_lds = false>
 static __device__ __forceinline__ float vec_dot_iq3_s_q8_1_gcn(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    const uint32_t * grid = ggml_cuda_iq_grid<GGML_TYPE_IQ3_S, grid_lds>();
 
     const block_iq3_s * bq3 = (const block_iq3_s *) vbq + kbx;
 
@@ -1535,8 +1596,8 @@ static __device__ __forceinline__ float vec_dot_iq3_s_q8_1_gcn(
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const int2 grid_pos = make_int2(
-            iq3s_grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
-            iq3s_grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
+            grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
+            grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
 
         const int grid_l = iq_grid_signed_gcn(grid_pos.x, (signs >> (4*l0 + 0)) & 0x0F);
         const int grid_h = iq_grid_signed_gcn(grid_pos.y, (signs >> (4*l0 + 4)) & 0x0F);
