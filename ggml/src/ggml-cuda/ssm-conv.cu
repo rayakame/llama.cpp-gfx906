@@ -175,13 +175,103 @@ static __global__ void ssm_conv_long_token_f32(const float * __restrict__ src0, 
     }
 }
 
+// x is token-contiguous per channel and y channel-contiguous per token: the LDS tile keeps both sides coalesced.
+template <bool apply_silu, int d_conv, int n_tok>
+static __global__ void __launch_bounds__(256) ssm_conv_tile_f32(const float * __restrict__ src0, const float * __restrict__ src1,
+                                                                const float * __restrict__ bias,
+                                                                const int src0_nb1, const int src0_nb2, const int src1_nb1,
+                                                                float * __restrict__ dst, const int dst_nb1, const int dst_nb2,
+                                                                const int n_t) {
+    constexpr int n_ch       = 64;
+    constexpr int n_threads  = 256;
+    constexpr int n_cols     = d_conv - 1 + n_tok;
+    // odd row stride: no bank conflicts when every lane reads its own channel row
+    constexpr int row_stride = n_cols | 1;
+    constexpr int n_iter     = (n_ch * n_cols + n_threads - 1) / n_threads;
+
+    __shared__ float tile[(n_iter * n_threads + n_cols - 1) / n_cols * row_stride];
+
+    ggml_cuda_pdl_lc();
+    const int tid  = threadIdx.x;
+    const int lane = tid % n_ch;
+    const int t0   = blockIdx.z * n_tok;
+    const int ch   = blockIdx.y * n_ch + lane;
+
+    const int local_n_t  = min(n_tok, n_t - t0);
+    const int local_cols = local_n_t + d_conv - 1;
+
+    const int stride_x = src0_nb1 / sizeof(float);
+    const int stride_w = src1_nb1 / sizeof(float);
+    const int stride_y = dst_nb1 / sizeof(float);
+
+    const float * x = (const float *) ((const char *) src0 + blockIdx.x * src0_nb2) + blockIdx.y * n_ch * stride_x + t0;
+    float *       y = (float *) ((char *) dst + blockIdx.x * dst_nb2) + t0 * stride_y + ch;
+
+    ggml_cuda_pdl_sync();
+    // clamped, unguarded loads: all of them are in flight before the first LDS write
+    float v[n_iter];
+#pragma unroll
+    for (int k = 0; k < n_iter; k++) {
+        const unsigned e = k * n_threads + tid;
+        const unsigned r = e / n_cols;
+        const unsigned c = e - r * n_cols;
+        v[k] = x[min(r, (unsigned) n_ch - 1) * stride_x + min(c, (unsigned) local_cols - 1)];
+    }
+
+    float w[d_conv];
+#pragma unroll
+    for (int j = 0; j < d_conv; j++) {
+        w[j] = src1[ch * stride_w + j];
+    }
+    const float b = bias != nullptr ? bias[ch] : 0.0f;
+
+#pragma unroll
+    for (int k = 0; k < n_iter; k++) {
+        const unsigned e = k * n_threads + tid;
+        const unsigned r = e / n_cols;
+        const unsigned c = e - r * n_cols;
+        tile[r * row_stride + c] = v[k];
+    }
+    __syncthreads();
+
+    const float * row = tile + lane * row_stride;
+#pragma unroll
+    for (int k = 0; k < n_tok * n_ch / n_threads; k++) {
+        const int t = k * (n_threads / n_ch) + tid / n_ch;
+        float sumf = 0.0f;
+#pragma unroll
+        for (int j = 0; j < d_conv; j++) {
+            sumf += row[t + j] * w[j];
+        }
+        sumf += b;
+        const float out = apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
+        if (t < local_n_t) {
+            y[t * stride_y] = out;
+        }
+    }
+}
+
+template <bool apply_silu, int d_conv, int n_tok>
+static void ssm_conv_tile_f32_cuda(const float * src0, const float * src1, const float * bias, const int src0_nb1, const int src0_nb2,
+                                   const int src1_nb1, float * dst, const int dst_nb1, const int dst_nb2, const int64_t nr,
+                                   const int64_t n_t, const int64_t n_s, cudaStream_t stream) {
+    const dim3 blocks(n_s, nr / 64, (n_t + n_tok - 1) / n_tok);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks, 256, 0, stream);
+    ggml_cuda_kernel_launch(ssm_conv_tile_f32<apply_silu, d_conv, n_tok>, launch_params, src0, src1, bias, src0_nb1, src0_nb2,
+                            src1_nb1, dst, dst_nb1, dst_nb2, (int) n_t);
+}
+
+static bool ssm_conv_tile_enabled() {
+    static const bool enabled = [] { const char * e = getenv("GGML_SSM_CONV_TILE"); return !e || atoi(e) != 0; }();
+    return enabled;
+}
+
 template <bool apply_silu>
 static void ssm_conv_f32_cuda(const float * src0, const float * src1, const float * bias, const int src0_nb0, const int src0_nb1,
                               const int src0_nb2, const int src1_nb1, float * dst, const int dst_nb0, const int dst_nb1,
                               const int dst_nb2, const int64_t nc, const int64_t nr, const int64_t n_t,
                               const int64_t n_s, cudaStream_t stream, const ggml_cuda_ssm_conv_l2_args * l2 = nullptr) {
     const int threads = 128;
-    GGML_ASSERT(nr % threads == 0);
 
     auto launch_kernel = [&](auto NC) {
         constexpr int kNC = decltype(NC)::value;
@@ -196,6 +286,21 @@ static void ssm_conv_f32_cuda(const float * src0, const float * src1, const floa
                 return;
             }
         }
+        if (ssm_conv_tile_enabled() && nr % 64 == 0 && n_t > 1) {
+            if (n_t <= 4) {
+                ssm_conv_tile_f32_cuda<apply_silu, kNC, 4>(src0, src1, bias, src0_nb1, src0_nb2, src1_nb1, dst, dst_nb1, dst_nb2, nr, n_t, n_s, stream);
+            } else if (n_t <= 8) {
+                ssm_conv_tile_f32_cuda<apply_silu, kNC, 8>(src0, src1, bias, src0_nb1, src0_nb2, src1_nb1, dst, dst_nb1, dst_nb2, nr, n_t, n_s, stream);
+            } else if (n_t <= 16) {
+                ssm_conv_tile_f32_cuda<apply_silu, kNC, 16>(src0, src1, bias, src0_nb1, src0_nb2, src1_nb1, dst, dst_nb1, dst_nb2, nr, n_t, n_s, stream);
+            } else if (n_t <= 32) {
+                ssm_conv_tile_f32_cuda<apply_silu, kNC, 32>(src0, src1, bias, src0_nb1, src0_nb2, src1_nb1, dst, dst_nb1, dst_nb2, nr, n_t, n_s, stream);
+            } else {
+                ssm_conv_tile_f32_cuda<apply_silu, kNC, 64>(src0, src1, bias, src0_nb1, src0_nb2, src1_nb1, dst, dst_nb1, dst_nb2, nr, n_t, n_s, stream);
+            }
+            return;
+        }
+        GGML_ASSERT(nr % threads == 0);
         if (n_t <= 32) {
             const dim3 blocks(n_s, (nr + threads - 1) / threads, 1);
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks, threads, 0, stream);
