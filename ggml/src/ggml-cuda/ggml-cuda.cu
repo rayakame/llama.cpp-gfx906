@@ -6984,14 +6984,16 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 return false;
             }
         }
-        // only MUL_MAT and MUL_MAT_ID read a Q8_0 weight in planes; the other ops get it through the canonical get_tensor
+        // only MUL_MAT and MUL_MAT_ID read a Q8_0 weight in planes; the other ops get it through the canonical get_tensor.
+        // Views read nothing: the MTP draft head is a row view of output.weight (LLAMA_MTP_HEAD_ROWS).
         if (op->src[i] && op->src[i]->type == GGML_TYPE_Q8_0 && !(i == 0 && (op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID)) &&
+                !ggml_op_is_empty(op->op) &&
                 ggml_cuda_q8_0_planes(op->src[i])) {
             return false;
         }
         // only MUL_MAT and MUL_MAT_ID read a Q6_K weight in planes; the other ops get it through the canonical get_tensor
         if (op->src[i] && op->src[i]->type == GGML_TYPE_Q6_K && !(i == 0 && (op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID)) &&
-                ggml_cuda_q6_k_planes(op->src[i])) {
+                !ggml_op_is_empty(op->op) && ggml_cuda_q6_k_planes(op->src[i])) {
             return false;
         }
     }
