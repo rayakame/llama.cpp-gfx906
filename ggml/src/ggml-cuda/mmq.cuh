@@ -4,6 +4,7 @@
 #include "mmid.cuh"
 #include "unary.cuh"
 
+#include <atomic>
 #include <climits>
 #include <cinttypes>
 #include <cstdint>
@@ -1874,13 +1875,15 @@ static int mmq_stream_k_resident_blocks(const int id, const int nthreads, const 
     if (!enabled) {
         return 0;
     }
-    static int resident[GGML_CUDA_MAX_DEVICES] = { 0 };
-    if (resident[id] == 0) {
-        int n = 0;
+    // backend contexts of one device can launch from several host threads
+    static std::atomic<int> resident[GGML_CUDA_MAX_DEVICES] = {};
+    int n = resident[id].load(std::memory_order_relaxed);
+    if (n == 0) {
         CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, kernel, nthreads, nbytes_shared));
-        resident[id] = std::max(n, 1);
+        n = std::max(n, 1);
+        resident[id].store(n, std::memory_order_relaxed);
     }
-    return resident[id];
+    return n;
 }
 
 struct mmq_gcn_fit {
@@ -1890,15 +1893,19 @@ struct mmq_gcn_fit {
 
 template <auto kernel>
 static mmq_gcn_fit mmq_gcn_get_fit(const int id, const int nthreads, const int nbytes_shared) {
-    static mmq_gcn_fit fit[GGML_CUDA_MAX_DEVICES] = {};
-    if (fit[id].resident == 0) {
-        int n = 0;
+    // backend contexts of one device can launch from several host threads; resident != 0 publishes scratch
+    static std::atomic<int>    resident[GGML_CUDA_MAX_DEVICES] = {};
+    static std::atomic<size_t> scratch[GGML_CUDA_MAX_DEVICES]  = {};
+    int n = resident[id].load(std::memory_order_acquire);
+    if (n == 0) {
         CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, kernel, nthreads, nbytes_shared));
+        n = std::max(n, 1);
         cudaFuncAttributes attr = {};
         CUDA_CHECK(cudaFuncGetAttributes(&attr, (const void *) kernel));
-        fit[id] = { std::max(n, 1), attr.localSizeBytes };
+        scratch[id].store(attr.localSizeBytes, std::memory_order_relaxed);
+        resident[id].store(n, std::memory_order_release);
     }
-    return fit[id];
+    return { n, scratch[id].load(std::memory_order_relaxed) };
 }
 
 // GGML_MMQ_GCN_SK_EFF: on GCN, tile when the tiles fill at least this percentage of the resident block slots, else stream-k; 0 = upstream's rule.
