@@ -2888,7 +2888,8 @@ bool ggml_cuda_q6_k_planes_eligible(const ggml_tensor * tensor, const int device
     if (mode == 2 || strcmp(tensor->name, "output.weight") == 0) {
         return true;
     }
-    static const bool all = mmvq_gcn_mc_env("GGML_CUDA_Q6K_PLANES_ALL", 1) != 0;
+    // the row groups of the layer matrices are faster from 4 columns on; the planes only win at 1 column
+    static const bool all = mmvq_gcn_mc_env("GGML_CUDA_Q6K_PLANES_ALL", 0) != 0;
     const size_t len = strlen(tensor->name);
     return all && tensor->ne[2] == 1 && tensor->ne[3] == 1 && tensor->buffer != nullptr &&
         ggml_backend_buffer_get_usage(tensor->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
