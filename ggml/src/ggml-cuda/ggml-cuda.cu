@@ -2324,8 +2324,8 @@ static void ggml_cuda_mul_mat_q8_0_planes(ggml_backend_cuda_context & ctx, const
             ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
             return;
         }
-        // 9..16 columns: two mat-vec passes are faster than the J = 16 MMQ tile, which spills
-        static const bool mv16 = ggml_cuda_env_int("GGML_CUDA_Q8_0_PLANES_MV16", 1) != 0;
+        // 9..16 columns as two mat-vec passes; the J = 16 MMQ tile is faster
+        static const bool mv16 = ggml_cuda_env_int("GGML_CUDA_Q8_0_PLANES_MV16", 0) != 0;
         if (mv16 && src1->ne[1] <= 2*MMVQ_MAX_BATCH_SIZE && src1->ne[2] == 1 && src1->ne[3] == 1) {
             for (int64_t c0 = 0; c0 < src1->ne[1]; c0 += MMVQ_MAX_BATCH_SIZE) {
                 ggml_tensor src1_c = *src1;
