@@ -4085,7 +4085,7 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
 #if defined(GGML_USE_HIP)
-    if (!ids && ne11 > MMVQ_MAX_BATCH_SIZE) {
+    if (!ids && ne11 > MMVQ_MAX_BATCH_SIZE && mmvq_gcn_wide_type(src0->type)) {
         GGML_ASSERT(!fusion);
         mul_mat_vec_q_gcn_wide_cuda(ctx, src0, src1, dst);
         return;
