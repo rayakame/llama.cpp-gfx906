@@ -36,7 +36,7 @@ def server(run):
     if not os.path.exists(run + ".server.json"):
         return None
     d = json.load(open(run + ".server.json"))
-    return [r["predicted_per_second"] for r in d["one"]], d["four_total_per_second"]
+    return [(r["request"], r["predicted_per_second"]) for r in d["one"]], d["four_total_per_second"]
 
 
 def lead(ours, others):
@@ -59,18 +59,20 @@ def main():
     one, four, bench = {}, {}, {}
     for q in files:
         for label in labels:
-            singles, totals, samples = [], [], {}
+            singles, totals, samples = {}, [], {}
             for run, flagged in runs(out, q, label):
                 if flagged:
                     left_out.append(f"{os.path.relpath(run, out)}: " + " ".join(sorted(set(open(run + ".flags").read().split("\n")) - {""})))
                     continue
                 s = server(run)
                 if s:
-                    singles.extend(s[0])
+                    for request, v in s[0]:
+                        singles.setdefault(request, []).append(v)
                     totals.append(s[1])
                 for name, v in bench_samples(run).items():
                     samples.setdefault(name, []).extend(v)
-            one[q, label] = statistics.median(singles) if singles else None
+            # The requests differ in speed by up to a third, so one median over all of them picks one request.
+            one[q, label] = statistics.mean(statistics.median(v) for v in singles.values()) if singles else None
             four[q, label] = statistics.median(totals) if totals else None
             for name, v in samples.items():
                 bench[q, label, name] = statistics.median(v)
@@ -81,7 +83,7 @@ def main():
     w(f"Measured {meta['date'][:10]}, {cap}, {meta['reps']} repetition{'s' if meta['reps'] != 1 else ''} per run, both passes (A B C C B A), median.\n\n")
     for i in meta["images"]:
         w(f"- `{i['label']}`: `{i['image']}` ({i['version'] or 'no version'})\n")
-    w("\n### Writing with MTP, tokens/s\n\nOne user: fixed, prose and code at temperature 0. Four users: four requests at once, total.\n\n")
+    w("\n### Writing with MTP, tokens/s\n\nOne user: fixed, prose and code at temperature 0, the mean of their medians. Four users: four requests at once, total.\n\n")
     w("| File | " + " | ".join(f"{label}, 1 user" for label in labels) + f" | {base} ahead | "
       + " | ".join(f"{label}, 4 users" for label in labels) + f" | {base} ahead |\n")
     w("| --- " * (2 * len(labels) + 3) + "|\n")
