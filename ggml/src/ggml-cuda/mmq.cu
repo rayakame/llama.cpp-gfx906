@@ -3,6 +3,7 @@
 #include "quantize.cuh"
 #include "mmid.cuh"
 #include "mmvq.cuh"
+#include "mmq-q8-0-planes-gemm.cuh"
 
 #include <cstdint>
 
@@ -377,6 +378,18 @@ void ggml_cuda_mul_mat_q(
                                 ne11 * ne10_padded * sizeof(block_fp4_mmq) / (QK_FP4_MMQ * sizeof(int)) :
                                 ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
         const int64_t s13 = ne12*s12;
+
+        if (!fusion && !use_native_fp4 && ggml_cuda_q8_0_planes_direct(src0) && ggml_cuda_q8_0_planes_gemm_use(ne11)) {
+            const int64_t r2 = ne12/ne02;
+            const int64_t r3 = ne13/ne03;
+            for (int64_t i13 = 0; i13 < ne13; ++i13) {
+                for (int64_t i12 = 0; i12 < ne12; ++i12) {
+                    ggml_cuda_q8_0_planes_gemm(src0_d + (i13/r3)*nb03 + (i12/r2)*nb02, src1_q8_1_d + (i13*s13 + i12*s12)*sizeof(int),
+                        dst_d + i13*s3 + i12*s2, ne00, ne01, nb01, ne11, s1, stream);
+                }
+            }
+            return;
+        }
 
         const mmq_args args = {
             src0_d, src0->type, (const int *) src1_q8_1_d, nullptr, nullptr, dst_d,

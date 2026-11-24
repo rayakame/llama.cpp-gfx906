@@ -12455,6 +12455,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 64, n, 5120, {3, 2}, {2, 1}));
     }
 
+    // the Q8_0 planes GEMM from 128 columns (GGML_CUDA_Q8_0_PLANES=2): partial row and column tiles, one group of K,
+    // batches of src0 and broadcast src1, src1 rows padded in memory, and a view that does not start on a group
+    for (int64_t n : {128, 129, 300}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 1000, n, 256,  {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4160, n, 5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  192, n, 512,  {2, 1}, {2, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  100, n, 1024, {1, 1}, {1, 1}, {0, 1, 2, 3}, 1280));
+        test_cases.emplace_back(new test_mul_mat_view(GGML_TYPE_Q8_0, 100, n, 256, 512, 110, 1, 16));
+    }
+
     // views of a Q8_0 matrix (in planes with GGML_CUDA_Q8_0_PLANES=2) that start on a group of 8 blocks or inside one,
     // with a row or batch stride of whole groups or not; one row of one block, whose copy is a single group
     for (int64_t n : {1, 3, 8, 12, 32}) {
