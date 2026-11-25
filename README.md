@@ -4,7 +4,7 @@
 
 This is a fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) for one card and one model: the MI50 32 GB (gfx906, the chip of the MI60, Radeon VII and Radeon Pro VII as well) and Qwen3.8 27B with its built-in MTP draft head. Every change here was written for that pair and measured on the card, and nothing lands that makes a quantization or a workload slower.
 
-Against upstream's newest release, v1.0.0, on the same card at the same 205 W, v0.7.0 writes faster on all six files tested: +53 % to +102 % with one user and +105 % to +123 % with four users at once. It is ahead of [mx-llama.cpp](https://github.com/mxxm-t/mx-llama.cpp) on every file as well, from +15 % with one user on Q8_0 up; mx-llama.cpp keeps only the prefill of long prompts on Q8_0 (pp512 and pp2048, 3 to 8 % faster).
+Against upstream's newest release, v1.0.0, on the same card at the same 205 W, v0.7.1 writes faster on all six files tested: +50 % to +102 % with one user and +85 % to +122 % with four users at once. It is ahead of [mx-llama.cpp](https://github.com/mxxm-t/mx-llama.cpp) on every file and in every test as well, from +17 % with one user on Q8_0 up; the prefill of long Q8_0 prompts, the one place mx-llama.cpp led in v0.7.0, is now 1 to 2 % ahead.
 
 ## Contents
 
@@ -17,20 +17,20 @@ Against upstream's newest release, v1.0.0, on the same card at the same 205 W, v
 
 ## Results
 
-Every release is measured against upstream's newest release and against [mx-llama.cpp](https://github.com/mxxm-t/mx-llama.cpp), a llama.cpp fork tuned for gfx906, all three built from the same Dockerfile with the same ROCm and flags, on the same card in one session. The order is A B C C B A per file, every run starts from a 50 °C chip, and the card's power cap is held at 205 W with its fans at full speed for the whole run, so that only the source differs.
+Every release is measured against upstream's newest release and against [mx-llama.cpp](https://github.com/mxxm-t/mx-llama.cpp), a llama.cpp fork tuned for gfx906, all three built from the same Dockerfile with the same ROCm and flags, on the same card in one session. The order is A B C C B A per file, every run starts from a 50 °C chip, and the card's power cap is held at 205 W with its fans at full speed for the whole run (from v0.7.1 also its memory clock at 1180 MHz), so that only the source differs.
 
-v0.7.0 against upstream v1.0.0 and mx-llama.cpp at commit 557a6068f, tokens/s, the best of each group in bold:
+v0.7.1 against upstream v1.0.0 and mx-llama.cpp at commit 557a6068f, tokens/s, the best of each group in bold:
 
 | File | 1 user: fork | upstream | mx | 4 users: fork | upstream | mx |
 | --- | --- | --- | --- | --- | --- | --- |
-| Q4_1 | **76.2** | 37.7 | 37.2 | **122.5** | 55.8 | 45.2 |
-| Q4_K_M | **55.1** | 35.3 | 42.9 | **109.5** | 49.1 | 16.1 |
-| Q8_0 | **49.6** | 32.4 | 43.3 | **92.7** | 45.2 | 55.3 |
-| UD-IQ3_XXS | **45.9** | 26.6 | 27.0 | **79.5** | 37.0 | 43.1 |
-| UD-Q4_K_XL | **60.7** | 35.8 | 39.4 | **102.6** | 46.2 | 17.0 |
-| UD-Q6_K | **58.6** | 37.3 | 41.7 | **107.2** | 52.3 | 23.5 |
+| Q4_1 | **77.6** | 38.5 | 37.8 | **119.9** | 57.8 | 46.3 |
+| Q4_K_M | **55.0** | 36.0 | 43.9 | **105.3** | 50.2 | 15.7 |
+| Q8_0 | **50.3** | 33.6 | 42.9 | **91.4** | 49.5 | 56.5 |
+| UD-IQ3_XXS | **45.5** | 26.9 | 26.9 | **80.5** | 36.9 | 43.3 |
+| UD-Q4_K_XL | **58.9** | 36.0 | 39.7 | **100.7** | 45.3 | 17.2 |
+| UD-Q6_K | **57.0** | 36.3 | 41.8 | **104.2** | 50.2 | 24.0 |
 
-One user is the speed of a single chat: three prompts (a short answer, prose and code), each the median of both passes, and the mean of the three; four users is the total of four requests at once. Both with MTP (`--spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.3`), 32k context, four slots. The full tables, with `llama-bench` prefill and the verify-pass shapes for every file, are in [docs/benchmarks/v0.7.0.md](docs/benchmarks/v0.7.0.md); earlier releases are in [docs/benchmarks](docs/benchmarks/).
+One user is the speed of a single chat: three prompts (a short answer, prose and code), each the median of both passes, and the mean of the three; four users is the total of four requests at once. Both with MTP (`--spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.3`), 32k context, four slots. The full tables, with `llama-bench` prefill and the verify-pass shapes for every file, are in [docs/benchmarks/v0.7.1.md](docs/benchmarks/v0.7.1.md); earlier releases are in [docs/benchmarks](docs/benchmarks/).
 
 ## Quick start
 
@@ -38,7 +38,7 @@ The image `ghcr.io/rayakame/llama.cpp-gfx906` runs `llama-server` and needs only
 
 ```sh
 docker run -d --device /dev/kfd --device /dev/dri -v /path/to/models:/models -p 8080:8080 \
-  ghcr.io/rayakame/llama.cpp-gfx906:b12230-v0.7.0 \
+  ghcr.io/rayakame/llama.cpp-gfx906:b12230-v0.7.1 \
   -m /models/Qwen3.8-27B-Q4_1.gguf -ngl 99 -fa on -lm dio \
   -c 131072 -np 4 --kv-unified -b 2048 -ub 2048 \
   --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.3 \
@@ -58,7 +58,7 @@ The same with Docker Compose:
 ```yaml
 services:
   llama:
-    image: ghcr.io/rayakame/llama.cpp-gfx906:b12230-v0.7.0
+    image: ghcr.io/rayakame/llama.cpp-gfx906:b12230-v0.7.1
     command: [-m, /models/Qwen3.8-27B-Q4_1.gguf, -ngl, "99", -fa, "on", -lm, dio, -c, "131072", -np, "4",
               --kv-unified, -b, "2048", -ub, "2048", --spec-type, draft-mtp, --spec-draft-n-max, "3",
               --spec-draft-p-min, "0.3", --jinja, --host, 0.0.0.0, --port, "8080"]
